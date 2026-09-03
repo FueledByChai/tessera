@@ -1807,6 +1807,7 @@ const SDK_PLATFORM_KEYS: &[&str] = &[
     "initial_capital",
     "max_entries_per_day",
     "max_open_positions",
+    "max_gross_exposure",
     "tie_break",
     "random_seed",
 ];
@@ -2034,6 +2035,15 @@ fn validate_sdk_platform_parameters(parameters: &serde_json::Value) -> Result<()
     if let Some(resolution) = object.get("resolution").and_then(serde_json::Value::as_str) {
         SdkResolution::parse(resolution)?;
     }
+    if let Some(exposure) = object.get("max_gross_exposure") {
+        let value = exposure
+            .as_f64()
+            .context("max_gross_exposure must be a number")?;
+        anyhow::ensure!(
+            value.is_finite() && value > 0.0,
+            "max gross exposure must be a positive multiple of equity"
+        );
+    }
     if let Some(min_price) = object.get("min_price") {
         let value = min_price.as_f64().context("min_price must be a number")?;
         anyhow::ensure!(
@@ -2119,6 +2129,10 @@ fn build_sdk_run_config(
             .and_then(serde_json::Value::as_u64)
             .map(|value| value as usize)
             .filter(|value| *value > 0),
+        max_gross_exposure: object
+            .get("max_gross_exposure")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0),
         tie_break: object
             .get("tie_break")
             .and_then(serde_json::Value::as_str)
@@ -2164,6 +2178,7 @@ fn build_sdk_run_config(
             exit_slippage_ticks: 1,
             commission_per_unit_per_fill: 0.005,
             all_in_round_trip_bps: None,
+            max_commission_percent_of_notional: Some(1.0),
         },
         Some(profile) if profile.model == "none" => SdkCostConfig::default(),
         Some(profile) if profile.model == "fixed_tick_per_unit" => SdkCostConfig {
@@ -2174,6 +2189,7 @@ fn build_sdk_run_config(
                 .entry_commission_per_unit
                 .max(profile.exit_commission_per_unit),
             all_in_round_trip_bps: None,
+            max_commission_percent_of_notional: Some(1.0),
         },
         Some(profile) => SdkCostConfig {
             tick_size: if profile.tick_size > 0.0 {
@@ -2185,6 +2201,7 @@ fn build_sdk_run_config(
             exit_slippage_ticks: 0,
             commission_per_unit_per_fill: 0.0,
             all_in_round_trip_bps: Some(profile.entry_bps + profile.exit_bps),
+            max_commission_percent_of_notional: Some(1.0),
         },
     };
     let config = SdkRunConfig {
@@ -3352,6 +3369,9 @@ async fn strategy_detail(
             defaults["max_entries_per_day"] =
                 serde_json::json!(manifest.default_max_entries_per_day.unwrap_or(0));
             defaults["max_open_positions"] = serde_json::json!(0);
+            if let Some(exposure) = manifest.default_max_gross_exposure {
+                defaults["max_gross_exposure"] = serde_json::json!(exposure);
+            }
             defaults["tie_break"] = serde_json::json!(
                 manifest
                     .default_tie_break

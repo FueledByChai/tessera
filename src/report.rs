@@ -463,7 +463,7 @@ pub fn load_report_view(results_dir: &Path) -> Result<ReportView> {
                 fills: row.fills,
             })
             .collect(),
-        trades: trades
+        trades: sort_trades_chronologically(trades)
             .into_iter()
             .map(|trade| ReportTradeView {
                 symbol: trade.symbol,
@@ -504,6 +504,19 @@ fn load_daily_equity(path: &Path, starting_equity: f64) -> Result<Vec<DailyPoint
         previous = row.equity;
     }
     Ok(rows)
+}
+
+/// Completed trades arrive in exit order (the broker records a trade when it closes), which
+/// reads as roughly-but-not-quite chronological. Present them by entry time instead.
+fn sort_trades_chronologically(mut trades: Vec<TradePoint>) -> Vec<TradePoint> {
+    trades.sort_by(|a, b| {
+        a.trade_date
+            .cmp(&b.trade_date)
+            .then_with(|| a.entry_time.cmp(&b.entry_time))
+            .then_with(|| a.exit_time.cmp(&b.exit_time))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+    trades
 }
 
 fn load_trades(path: &Path) -> Result<Vec<TradePoint>> {
@@ -1424,6 +1437,29 @@ mod tests {
     fn non_usd_reports_label_currency_without_a_dollar_sign() {
         assert_eq!(currency(1_000.0, "CNY"), "CNY 1000.00");
         assert_eq!(currency(-15.0, "CNY"), "-CNY 15.00");
+    }
+
+    #[test]
+    fn trades_are_presented_in_entry_order_not_exit_order() {
+        let point = |symbol: &str, date: &str, entry: &str, exit: &str| TradePoint {
+            symbol: symbol.to_owned(),
+            direction: Some("long".to_owned()),
+            trade_date: date.to_owned(),
+            entry_time: format!("{date}T{entry}-04:00"),
+            exit_time: exit.to_owned(),
+            pnl: 0.0,
+            return_percent: 0.0,
+            leverage: None,
+        };
+        // Exit order: the long hold closes last even though it was entered first.
+        let by_exit = vec![
+            point("BBB", "2021-03-02", "09:30:00", "2021-03-03T09:30:00-04:00"),
+            point("CCC", "2021-03-02", "09:35:00", "2021-03-04T09:30:00-04:00"),
+            point("AAA", "2021-01-04", "09:30:00", "2022-05-04T09:30:00-04:00"),
+        ];
+        let ordered = sort_trades_chronologically(by_exit);
+        let symbols: Vec<&str> = ordered.iter().map(|t| t.symbol.as_str()).collect();
+        assert_eq!(symbols, ["AAA", "BBB", "CCC"]);
     }
 
     #[test]

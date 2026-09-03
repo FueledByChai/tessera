@@ -63,11 +63,28 @@ not permitted for a standard UI strategy.
 
 ## Platform sizing and price guards
 
-`Size::Default` uses the run's `position_percent` (fraction of equity). Entries are skipped when the
-reference price is below the run's `min_price` (default $1.00, set 0 to disable): sub-dollar prints
-make fixed-tick slippage and per-share commission meaningless, and a $0.0001 bar can otherwise turn a
-small allocation into tens of millions of shares. Fill prices are also floored at one tick so a
-slippage tick can never produce a zero or negative price.
+`Size::Default` uses the run's `position_percent` (fraction of equity). The simulated broker then
+applies account guards at fill time, because the fill price can differ from the price the strategy
+sized against:
+
+- **Minimum price.** Entries are skipped when the reference price is below the run's `min_price`
+  (default $1.00, set 0 to disable). Sub-dollar prints make fixed-tick slippage and per-share
+  commission meaningless.
+- **Buying power.** Open entry notional may not exceed `max_gross_exposure` times total equity. A
+  fill that would breach it is cut to the remaining buying power, or rejected when nothing fits.
+  Runs default to the manifest's `.max_gross_exposure(x)` declaration, else to
+  `max(1, position_percent x max_open_positions)`, so ten 10% slots mean a cash account and a
+  volatility-targeted strategy declares the leverage it needs.
+- **Solvency.** No entry fills once total equity is zero or negative.
+- **Commission cap.** Per-unit commission is capped at `max_commission_percent_of_notional`
+  (default 1% of the fill's value, the usual broker rule) so a 173-million-share position in a
+  $0.0001 stock cannot pay more in commission than it is worth.
+- **Tick floor.** Fill prices never round below one tick, so a slippage tick cannot produce a zero
+  or negative price.
+
+The all-US-stocks RSI run that motivated these guards sized 10% of equity at a $0.0001 reference
+price, filled at the $0.01 tick (8.7x equity), paid $1.7M in commission, and kept trading with
+negative equity. Rejected fills appear as `OrderRejected` events with the reason.
 
 ## Event-driven strategy checklist
 

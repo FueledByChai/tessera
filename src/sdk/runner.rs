@@ -142,6 +142,14 @@ pub struct SdkCostConfig {
     /// When set, replaces ticks and per-unit commission with a notional charge.
     #[serde(default)]
     pub all_in_round_trip_bps: Option<f64>,
+    /// Caps per-unit commission at this percent of a fill's notional (default 1%, the
+    /// common broker rule). `None` disables the cap.
+    #[serde(default = "default_commission_cap")]
+    pub max_commission_percent_of_notional: Option<f64>,
+}
+
+fn default_commission_cap() -> Option<f64> {
+    Some(1.0)
 }
 
 fn default_tick() -> f64 {
@@ -156,6 +164,7 @@ impl Default for SdkCostConfig {
             exit_slippage_ticks: 0,
             commission_per_unit_per_fill: 0.0,
             all_in_round_trip_bps: None,
+            max_commission_percent_of_notional: default_commission_cap(),
         }
     }
 }
@@ -167,6 +176,10 @@ pub struct SdkLimitsConfig {
     pub max_entries_per_day: Option<usize>,
     #[serde(default)]
     pub max_open_positions: Option<usize>,
+    /// Buying power as a multiple of total equity. When absent the runner uses the
+    /// strategy manifest's default, else `max(1, position_percent x max_open_positions)`.
+    #[serde(default)]
+    pub max_gross_exposure: Option<f64>,
     /// `priority` (higher `ctx.priority()` first), `random` (seeded), or `alphabetical`.
     #[serde(default = "default_tie_break")]
     pub tie_break: String,
@@ -191,6 +204,7 @@ impl SdkLimitsConfig {
         Ok(EntryLimits {
             max_entries_per_day: self.max_entries_per_day,
             max_open_positions: self.max_open_positions,
+            max_gross_exposure: self.max_gross_exposure,
             tie_break,
             seed: self.seed,
         })
@@ -271,6 +285,7 @@ impl SdkRunConfig {
             commission_per_unit_per_fill: self.costs.commission_per_unit_per_fill,
             apply_exit_slippage_to_targets: false,
             all_in_round_trip_bps: self.costs.all_in_round_trip_bps,
+            max_commission_percent_of_notional: self.costs.max_commission_percent_of_notional,
         }
     }
 }
@@ -359,6 +374,20 @@ impl ProgressReporter {
         self.last = std::time::Instant::now() - std::time::Duration::from_secs(60);
         self.report(total, total, "done");
     }
+}
+
+/// Buying power when the run does not set one: the strategy's declared need, else enough
+/// for every allowed position at the configured size, and never below a cash account (1x).
+pub fn default_max_gross_exposure(
+    declared: Option<f64>,
+    position_percent: f64,
+    max_open_positions: Option<usize>,
+) -> f64 {
+    if let Some(value) = declared.filter(|v| v.is_finite() && *v > 0.0) {
+        return value;
+    }
+    let slots = max_open_positions.filter(|n| *n > 0).unwrap_or(1) as f64;
+    (position_percent * slots).max(1.0)
 }
 
 /// Calendar days of history to read before `start` so `warmup_bars` completed bars are
@@ -1002,6 +1031,13 @@ pub fn run(
             }
         }
     }
+    if effective_limits.max_gross_exposure.is_none() {
+        effective_limits.max_gross_exposure = Some(default_max_gross_exposure(
+            manifest.default_max_gross_exposure,
+            config.sizing.position_percent,
+            effective_limits.max_open_positions,
+        ));
+    }
     let mut broker =
         SimulatedBroker::new(config.sizing.initial_capital, config.simulation_costs())?
             .with_limits(effective_limits.entry_limits()?);
@@ -1247,4 +1283,21 @@ pub fn print_summary(summary: &SdkRunSummary) {
         summary.maximum_drawdown_percent
     );
     println!("report: {}", summary.output.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposure_default_covers_the_allowed_positions_but_never_below_cash() {
+        // Ten positions at 10% each: a cash account.
+        assert_eq!(default_max_gross_exposure(None, 0.1, Some(10)), 1.0);
+        // One position at 100% with unlimited slots still means 1x.
+        assert_eq!(default_max_gross_exposure(None, 1.0, None), 1.0);
+        // Five positions at 50% each is a deliberate 2.5x.
+        assert_eq!(default_max_gross_exposure(None, 0.5, Some(5)), 2.5);
+        // A strategy that declares its leverage wins.
+        assert_eq!(default_max_gross_exposure(Some(10.0), 0.1, Some(10)), 10.0);
+    }
 }

@@ -437,6 +437,10 @@ pub struct SimulationCosts {
     /// When set, replaces ticks and per-unit commission with a notional charge of half this
     /// amount on entry and half on exit.
     pub all_in_round_trip_bps: Option<f64>,
+    /// Caps per-unit commission at this percent of the fill's notional (brokers cap
+    /// per-share commission at about 1% of trade value). Without it a sub-penny stock pays
+    /// more in commission than the position is worth. Ignored for the basis-point model.
+    pub max_commission_percent_of_notional: Option<f64>,
 }
 
 impl Default for SimulationCosts {
@@ -448,6 +452,7 @@ impl Default for SimulationCosts {
             commission_per_unit_per_fill: 0.0,
             apply_exit_slippage_to_targets: false,
             all_in_round_trip_bps: None,
+            max_commission_percent_of_notional: None,
         }
     }
 }
@@ -468,6 +473,10 @@ pub enum TieBreak {
 pub struct EntryLimits {
     pub max_entries_per_day: Option<usize>,
     pub max_open_positions: Option<usize>,
+    /// Buying power: total entry notional of open positions may not exceed this multiple of
+    /// total equity. An entry that would breach it is cut to the remaining buying power or
+    /// rejected. `None` leaves exposure unconstrained.
+    pub max_gross_exposure: Option<f64>,
     pub tie_break: TieBreak,
     pub seed: u64,
 }
@@ -542,15 +551,53 @@ impl SimulatedBroker {
     fn entry_commission_for(&self, price: f64, quantity: usize) -> f64 {
         match self.costs.all_in_round_trip_bps {
             Some(bps) => price * quantity as f64 * bps / 20_000.0,
-            None => quantity as f64 * self.costs.commission_per_unit_per_fill,
+            None => self.capped_unit_commission(price, quantity),
         }
     }
 
     fn exit_commission_for(&self, entry_price: f64, quantity: usize) -> f64 {
         match self.costs.all_in_round_trip_bps {
             Some(bps) => entry_price * quantity as f64 * bps / 20_000.0,
-            None => quantity as f64 * self.costs.commission_per_unit_per_fill,
+            None => self.capped_unit_commission(entry_price, quantity),
         }
+    }
+
+    /// Per-unit commission, capped at `max_commission_percent_of_notional` of the fill.
+    fn capped_unit_commission(&self, price: f64, quantity: usize) -> f64 {
+        let raw = quantity as f64 * self.costs.commission_per_unit_per_fill;
+        match self.costs.max_commission_percent_of_notional {
+            Some(percent) if percent.is_finite() && percent >= 0.0 => {
+                raw.min(price * quantity as f64 * percent / 100.0)
+            }
+            _ => raw,
+        }
+    }
+
+    /// Realized equity plus open positions marked to the latest observed price.
+    fn total_equity(&self) -> f64 {
+        let unrealized = self
+            .positions
+            .iter()
+            .map(|(symbol, position)| {
+                let mark = self
+                    .last_marks
+                    .get(symbol)
+                    .map_or(position.snapshot.entry_price, |(_, _, price)| *price);
+                position.snapshot.side.sign()
+                    * (mark - position.snapshot.entry_price)
+                    * position.snapshot.quantity as f64
+                    - position.entry_commission
+            })
+            .sum::<f64>();
+        self.realized_equity + unrealized
+    }
+
+    /// Entry notional of every open position (the exposure the buying-power cap measures).
+    fn gross_notional(&self) -> f64 {
+        self.positions
+            .values()
+            .map(|position| position.snapshot.entry_price * position.snapshot.quantity as f64)
+            .sum()
     }
 
     fn slippage(&self, entry: bool) -> f64 {
@@ -684,6 +731,37 @@ impl SimulatedBroker {
             };
         }
         let entry_price = self.round_tick(entry_price);
+        // Account guards. Quantity was sized by the strategy against a reference price; the
+        // fill price can differ (a $0.0001 print rounds up to a $0.01 tick, a gap opens far
+        // from the prior close), so check what the fill actually costs.
+        let equity = self.total_equity();
+        if equity <= 0.0 {
+            return BrokerEvent::OrderRejected {
+                symbol,
+                reason: "account equity exhausted".to_owned(),
+            };
+        }
+        let mut quantity = quantity;
+        if let Some(cap) = self.limits.max_gross_exposure {
+            let available = equity * cap - self.gross_notional();
+            let notional = entry_price * quantity as f64;
+            if notional > available {
+                let affordable = if available > 0.0 && entry_price > 0.0 {
+                    (available / entry_price).floor() as usize
+                } else {
+                    0
+                };
+                if affordable == 0 {
+                    return BrokerEvent::OrderRejected {
+                        symbol,
+                        reason: format!(
+                            "insufficient buying power: {notional:.2} notional exceeds {available:.2} available at {cap}x equity"
+                        ),
+                    };
+                }
+                quantity = affordable;
+            }
+        }
         let stop = stop.or_else(|| {
             stop_percent.map(|percent| match side {
                 Side::Buy => entry_price * (1.0 - percent),
@@ -1258,23 +1336,9 @@ impl BrokerAdapter for SimulatedBroker {
     }
 
     fn snapshot(&self) -> PortfolioSnapshot {
-        let unrealized = self
-            .positions
-            .iter()
-            .map(|(symbol, position)| {
-                let mark = self
-                    .last_marks
-                    .get(symbol)
-                    .map_or(position.snapshot.entry_price, |(_, _, price)| *price);
-                position.snapshot.side.sign()
-                    * (mark - position.snapshot.entry_price)
-                    * position.snapshot.quantity as f64
-                    - position.entry_commission
-            })
-            .sum::<f64>();
         PortfolioSnapshot {
             realized_equity: self.realized_equity,
-            total_equity: self.realized_equity + unrealized,
+            total_equity: self.total_equity(),
             positions: self
                 .positions
                 .iter()
@@ -1537,6 +1601,207 @@ mod tests {
             ),
             bars,
         }
+    }
+
+    fn guard_costs() -> SimulationCosts {
+        SimulationCosts {
+            tick_size: 0.01,
+            entry_slippage_ticks: 1,
+            exit_slippage_ticks: 1,
+            commission_per_unit_per_fill: 0.005,
+            apply_exit_slippage_to_targets: false,
+            all_in_round_trip_bps: None,
+            max_commission_percent_of_notional: None,
+        }
+    }
+
+    fn market_entry(symbol: &str, quantity: usize) -> OrderIntent {
+        OrderIntent::EnterBracket {
+            symbol: symbol.to_owned(),
+            side: Side::Buy,
+            quantity,
+            timing: ExecutionTiming::NextBarOpen,
+            stop: None,
+            target: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn open_event(date: NaiveDate, price: f64, symbol: &str) -> MarketEvent {
+        MarketEvent::BarOpen {
+            date,
+            time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            prices: BTreeMap::from([(symbol.to_owned(), MarketOpen { price })]),
+        }
+    }
+
+    fn close_event(date: NaiveDate, price: f64, symbol: &str) -> MarketEvent {
+        MarketEvent::BarClose {
+            date,
+            time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            bars: BTreeMap::from([(
+                symbol.to_owned(),
+                MarketBar {
+                    open: price,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: 1.0,
+                },
+            )]),
+        }
+    }
+
+    /// Reproduces the ADTC.US case from the all-US-stocks RSI run: the strategy sized 10% of
+    /// $173,650 equity at a $0.0001 reference price (173,650,494 shares), but the fill rounds
+    /// up to the $0.01 tick, so the position cost 8.7x equity. Without a buying-power cap the
+    /// legacy broker accepts it.
+    #[test]
+    fn uncapped_broker_accepts_fill_far_beyond_equity() {
+        let date = NaiveDate::from_ymd_opt(2021, 9, 17).unwrap();
+        let mut broker = SimulatedBroker::new(173_650.0, guard_costs()).unwrap();
+        let session_close = close_event(date.pred_opt().unwrap(), 0.0001, "ADTC");
+        broker
+            .submit(&session_close, vec![market_entry("ADTC", 173_650_494)])
+            .unwrap();
+        let events = broker
+            .on_market_event(&open_event(date, 0.0001, "ADTC"))
+            .unwrap();
+        let opened = events
+            .iter()
+            .find_map(|event| match event {
+                BrokerEvent::PositionOpened { position } => Some(position.clone()),
+                _ => None,
+            })
+            .expect("legacy behaviour fills the order");
+        let notional = opened.entry_price * opened.quantity as f64;
+        assert!(notional / 173_650.0 > 8.0, "notional was {notional}");
+    }
+
+    #[test]
+    fn buying_power_cap_cuts_an_entry_to_available_equity() {
+        let date = NaiveDate::from_ymd_opt(2021, 9, 17).unwrap();
+        let mut broker = SimulatedBroker::new(173_650.0, guard_costs())
+            .unwrap()
+            .with_limits(EntryLimits {
+                max_gross_exposure: Some(1.0),
+                ..EntryLimits::default()
+            });
+        let session_close = close_event(date.pred_opt().unwrap(), 0.0001, "ADTC");
+        broker
+            .submit(&session_close, vec![market_entry("ADTC", 173_650_494)])
+            .unwrap();
+        let events = broker
+            .on_market_event(&open_event(date, 0.0001, "ADTC"))
+            .unwrap();
+        let opened = events
+            .iter()
+            .find_map(|event| match event {
+                BrokerEvent::PositionOpened { position } => Some(position.clone()),
+                _ => None,
+            })
+            .expect("the entry still fills, at a size the account can carry");
+        let notional = opened.entry_price * opened.quantity as f64;
+        assert!(notional <= 173_650.0 + 0.01, "notional was {notional}");
+        assert_eq!(opened.quantity, 17_365_000);
+    }
+
+    #[test]
+    fn buying_power_cap_counts_existing_positions() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let mut broker = SimulatedBroker::new(100_000.0, guard_costs())
+            .unwrap()
+            .with_limits(EntryLimits {
+                max_gross_exposure: Some(1.0),
+                ..EntryLimits::default()
+            });
+        let prior = close_event(date.pred_opt().unwrap(), 100.0, "AAA");
+        // 900 shares at ~$100 uses 90% of buying power.
+        broker
+            .submit(&prior, vec![market_entry("AAA", 900)])
+            .unwrap();
+        broker
+            .on_market_event(&open_event(date, 100.0, "AAA"))
+            .unwrap();
+        // A second symbol asking for another 50% is cut to what remains (~10%).
+        let prior_b = close_event(date, 100.0, "BBB");
+        broker
+            .submit(&prior_b, vec![market_entry("BBB", 500)])
+            .unwrap();
+        let next = date.succ_opt().unwrap();
+        let events = broker
+            .on_market_event(&open_event(next, 100.0, "BBB"))
+            .unwrap();
+        let opened = events
+            .iter()
+            .find_map(|event| match event {
+                BrokerEvent::PositionOpened { position } => Some(position.clone()),
+                _ => None,
+            })
+            .expect("fills within remaining buying power");
+        assert!(opened.quantity < 110, "quantity was {}", opened.quantity);
+        assert!(broker.gross_notional() <= broker.total_equity() * 1.0 + 0.01);
+    }
+
+    /// Once equity is gone nothing should trade; the legacy broker kept opening positions
+    /// with negative equity, which is how a drawdown of -1,479% was recorded.
+    #[test]
+    fn no_entries_once_equity_is_exhausted() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let mut costs = guard_costs();
+        costs.commission_per_unit_per_fill = 50.0; // absurd, to bankrupt the account fast
+        let mut broker = SimulatedBroker::new(1_000.0, costs).unwrap();
+        let prior = close_event(date.pred_opt().unwrap(), 10.0, "AAA");
+        broker
+            .submit(&prior, vec![market_entry("AAA", 100)])
+            .unwrap();
+        broker
+            .on_market_event(&open_event(date, 10.0, "AAA"))
+            .unwrap();
+        let close = close_event(date, 10.0, "AAA");
+        broker
+            .submit(
+                &close,
+                vec![OrderIntent::ExitPosition {
+                    symbol: "AAA".to_owned(),
+                    timing: ExecutionTiming::ThisBarClose,
+                    reason: "test".to_owned(),
+                }],
+            )
+            .unwrap();
+        assert!(
+            broker.total_equity() < 0.0,
+            "equity {}",
+            broker.total_equity()
+        );
+        broker.submit(&close, vec![market_entry("BBB", 1)]).unwrap();
+        let next = date.succ_opt().unwrap();
+        let events = broker
+            .on_market_event(&open_event(next, 10.0, "BBB"))
+            .unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                BrokerEvent::OrderRejected { reason, .. } if reason.contains("exhausted")
+            )),
+            "expected a rejection, got {events:?}"
+        );
+        assert!(broker.positions.is_empty());
+    }
+
+    /// ADTC.US paid $1.74M in commission on a position worth $17k: 173M shares at half a cent
+    /// each. Brokers cap per-share commission at about 1% of trade value.
+    #[test]
+    fn per_unit_commission_is_capped_relative_to_notional() {
+        let mut costs = guard_costs();
+        costs.max_commission_percent_of_notional = Some(1.0);
+        let broker = SimulatedBroker::new(100_000.0, costs).unwrap();
+        // 1,000,000 shares at $0.01: raw commission $5,000 vs 1% of $10,000 notional = $100.
+        assert!((broker.entry_commission_for(0.01, 1_000_000) - 100.0).abs() < 1e-9);
+        // A normal fill is unaffected: 100 shares at $50 -> $0.50 raw vs $50 cap.
+        assert!((broker.entry_commission_for(50.0, 100) - 0.5).abs() < 1e-9);
+        let uncapped = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
+        assert!((uncapped.entry_commission_for(0.01, 1_000_000) - 5_000.0).abs() < 1e-9);
     }
 
     #[test]

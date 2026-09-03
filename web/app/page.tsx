@@ -185,6 +185,7 @@ type Overrides = {
   holding_period_minutes?: number;
   position_percent?: number;
   min_price?: number;
+  max_gross_exposure?: number;
   max_positions_per_day?: number;
   all_in_round_trip_bps?: number;
   position_slots?: number;
@@ -937,7 +938,7 @@ function RunReport({ detail }: { detail: RunDetail }) {
           <table>
             <thead>
               <tr>
-                <th>Date</th>
+                <th>Entry</th>
                 <th>Symbol</th>
                 <th>Side</th>
                 <th>Return</th>
@@ -947,12 +948,9 @@ function RunReport({ detail }: { detail: RunDetail }) {
               </tr>
             </thead>
             <tbody>
-              {report.trades
-                .slice()
-                .reverse()
-                .map((trade, index) => (
+              {report.trades.map((trade, index) => (
                   <tr key={`${trade.trade_date}-${trade.symbol}-${index}`}>
-                    <td>{trade.trade_date}</td>
+                    <td>{trade.trade_date} {trade.entry_time.slice(11, 16)}</td>
                     <td>{trade.symbol}</td>
                     <td>
                       <span className={`direction ${trade.direction}`}>
@@ -964,7 +962,11 @@ function RunReport({ detail }: { detail: RunDetail }) {
                     </td>
                     <td className={classFor(trade.pnl)}>{money(trade.pnl)}</td>
                     <td>{number(trade.leverage)}×</td>
-                    <td>{trade.exit_time.slice(11, 19)}</td>
+                    <td>
+                      {trade.exit_time.slice(0, 10) === trade.trade_date
+                        ? trade.exit_time.slice(11, 16)
+                        : `${trade.exit_time.slice(0, 10)} ${trade.exit_time.slice(11, 16)}`}
+                    </td>
                   </tr>
                 ))}
             </tbody>
@@ -3571,6 +3573,17 @@ function SdkForm({
               onChange={(event) => setParam("max_open_positions", Math.max(0, Math.round(+event.target.value)))}
             />
             <small>0 = unlimited</small>
+          </label>
+          <label>
+            Max gross exposure ×
+            <input
+              type="number"
+              min="0.1"
+              step="any"
+              value={(parameters.max_gross_exposure as number | undefined) ?? Math.max(1, ((parameters.position_percent as number | undefined) ?? 1) * Math.max(1, maxOpen))}
+              onChange={(event) => setParam("max_gross_exposure", +event.target.value)}
+            />
+            <small>buying power as a multiple of equity · fills beyond it are cut or rejected</small>
           </label>
           <label>
             Tie-break

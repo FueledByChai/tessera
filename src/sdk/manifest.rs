@@ -162,6 +162,11 @@ pub struct Manifest {
     /// Default account-wide entry cap per day (the run form can override).
     #[serde(default)]
     pub default_max_entries_per_day: Option<usize>,
+    /// Buying power the strategy needs, as a multiple of equity (for example 10 for a
+    /// volatility-targeted strategy that levers up to 10x). Runs default to this, else to
+    /// `max(1, position_percent x max_open_positions)`.
+    #[serde(default)]
+    pub default_max_gross_exposure: Option<f64>,
     /// Default tie-break when more entries compete than slots: priority, random, alphabetical.
     #[serde(default)]
     pub default_tie_break: Option<String>,
@@ -195,6 +200,7 @@ impl Manifest {
             daily_context: false,
             screen_universe: false,
             default_max_entries_per_day: None,
+            default_max_gross_exposure: None,
             default_tie_break: None,
             default_seed: 0,
             default_symbols: Vec::new(),
@@ -240,6 +246,12 @@ impl Manifest {
         self
     }
     /// Default daily entry cap and tie-break (`priority`, `random`, or `alphabetical`).
+    /// Declares the buying power (multiple of equity) this strategy's sizing can reach.
+    pub fn max_gross_exposure(mut self, times_equity: f64) -> Self {
+        self.default_max_gross_exposure = Some(times_equity);
+        self
+    }
+
     pub fn entry_limits(mut self, max_entries_per_day: usize, tie_break: &str, seed: u64) -> Self {
         self.default_max_entries_per_day = Some(max_entries_per_day);
         self.default_tie_break = Some(tie_break.to_owned());
