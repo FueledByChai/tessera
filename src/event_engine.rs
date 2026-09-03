@@ -5,6 +5,7 @@
 //! brokers own fills, positions, cash, and reconciliation.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use chrono::{NaiveDate, NaiveTime};
@@ -35,7 +36,7 @@ pub struct MarketOpen {
 pub enum MarketEvent {
     SessionStart {
         date: NaiveDate,
-        symbols: Vec<String>,
+        symbols: Arc<[String]>,
     },
     BarOpen {
         date: NaiveDate,
@@ -49,7 +50,7 @@ pub enum MarketEvent {
     },
     SessionEnd {
         date: NaiveDate,
-        symbols: Vec<String>,
+        symbols: Arc<[String]>,
     },
 }
 
@@ -74,7 +75,8 @@ impl MarketEvent {
 #[derive(Debug, Clone)]
 pub struct HistoricalSession {
     pub date: NaiveDate,
-    pub symbols: Vec<String>,
+    /// Shared across sessions so universe-sized replays do not copy the list per session.
+    pub symbols: Arc<[String]>,
     pub bars: Vec<(NaiveTime, BTreeMap<String, MarketBar>)>,
 }
 
@@ -297,6 +299,14 @@ impl<S: EventStrategy> StrategyHost<S> {
         }
     }
 
+    /// Every strategy instance the host owns (one for a portfolio host).
+    pub fn instances(&self) -> Vec<&S> {
+        match self {
+            Self::PerInstrument(strategies) => strategies.values().collect(),
+            Self::Portfolio(strategy) => vec![strategy],
+        }
+    }
+
     pub fn strategy_mut(&mut self, symbol: &str) -> Option<&mut S> {
         match self {
             Self::PerInstrument(strategies) => strategies.get_mut(symbol),
@@ -325,7 +335,7 @@ impl<S: EventStrategy> StrategyHost<S> {
                             if !present.contains(symbol.as_str()) {
                                 continue;
                             }
-                            let single = vec![symbol.clone()];
+                            let single: Arc<[String]> = Arc::from(vec![symbol.clone()]);
                             let scoped = if starting {
                                 MarketEvent::SessionStart {
                                     date: *date,
@@ -1313,28 +1323,45 @@ impl HistoricalEventEngine {
         Self::run_with_progress(host, broker, sessions, &mut |_, _, _| {})
     }
 
-    /// Replays every session, calling `progress(completed, total, date)` after each one so
-    /// long runs can report where they are.
+    /// Replays borrowed sessions, cloning each session's bars into its events.
     pub fn run_with_progress<S: EventStrategy, B: BrokerAdapter>(
         host: &mut StrategyHost<S>,
         broker: &mut B,
         sessions: &[HistoricalSession],
         progress: &mut dyn FnMut(usize, usize, NaiveDate),
     ) -> Result<HistoricalRunStats> {
+        Self::run_owned(host, broker, sessions.to_vec(), progress)
+    }
+
+    /// Replays owned sessions, moving each session's bars into its events instead of
+    /// cloning them; with tens of thousands of instruments the copies dominated runtime.
+    /// `progress(completed, total, date)` is called before each session.
+    pub fn run_owned<S: EventStrategy, B: BrokerAdapter>(
+        host: &mut StrategyHost<S>,
+        broker: &mut B,
+        sessions: Vec<HistoricalSession>,
+        progress: &mut dyn FnMut(usize, usize, NaiveDate),
+    ) -> Result<HistoricalRunStats> {
         let mut stats = HistoricalRunStats::default();
-        for (session_index, session) in sessions.iter().enumerate() {
+        let total = sessions.len();
+        for (session_index, session) in sessions.into_iter().enumerate() {
             stats.sessions += 1;
-            progress(session_index, sessions.len(), session.date);
+            progress(session_index, total, session.date);
+            let HistoricalSession {
+                date,
+                symbols,
+                bars: session_bars,
+            } = session;
             Self::dispatch(
                 host,
                 broker,
-                MarketEvent::SessionStart {
-                    date: session.date,
-                    symbols: session.symbols.clone(),
+                &MarketEvent::SessionStart {
+                    date,
+                    symbols: Arc::clone(&symbols),
                 },
                 &mut stats,
             )?;
-            for (time, bars) in &session.bars {
+            for (time, bars) in session_bars {
                 let prices = bars
                     .iter()
                     .map(|(symbol, bar)| (symbol.clone(), MarketOpen { price: bar.open }))
@@ -1343,26 +1370,18 @@ impl HistoricalEventEngine {
                 Self::dispatch(
                     host,
                     broker,
-                    MarketEvent::BarOpen {
-                        date: session.date,
-                        time: *time,
-                        prices,
-                    },
+                    &MarketEvent::BarOpen { date, time, prices },
                     &mut stats,
                 )?;
                 stats.bar_closes += 1;
                 Self::dispatch(
                     host,
                     broker,
-                    MarketEvent::BarClose {
-                        date: session.date,
-                        time: *time,
-                        bars: bars.clone(),
-                    },
+                    &MarketEvent::BarClose { date, time, bars },
                     &mut stats,
                 )?;
             }
-            if session_index + 1 == sessions.len() {
+            if session_index + 1 == total {
                 let broker_events = broker.finalize_historical()?;
                 stats.broker_events += broker_events.len();
                 let followups = host.on_broker_events(&broker_events)?;
@@ -1374,10 +1393,7 @@ impl HistoricalEventEngine {
             Self::dispatch(
                 host,
                 broker,
-                MarketEvent::SessionEnd {
-                    date: session.date,
-                    symbols: session.symbols.clone(),
-                },
+                &MarketEvent::SessionEnd { date, symbols },
                 &mut stats,
             )?;
         }
@@ -1387,16 +1403,16 @@ impl HistoricalEventEngine {
     fn dispatch<S: EventStrategy, B: BrokerAdapter>(
         host: &mut StrategyHost<S>,
         broker: &mut B,
-        event: MarketEvent,
+        event: &MarketEvent,
         stats: &mut HistoricalRunStats,
     ) -> Result<()> {
-        let broker_events = broker.on_market_event(&event)?;
+        let broker_events = broker.on_market_event(event)?;
         stats.broker_events += broker_events.len();
         let followups = host.on_broker_events(&broker_events)?;
-        Self::submit(host, broker, &event, followups, stats)?;
+        Self::submit(host, broker, event, followups, stats)?;
 
-        let intents = host.on_market_event(&event, &broker.snapshot())?;
-        Self::submit(host, broker, &event, intents, stats)
+        let intents = host.on_market_event(event, &broker.snapshot())?;
+        Self::submit(host, broker, event, intents, stats)
     }
 
     fn submit<S: EventStrategy, B: BrokerAdapter>(
@@ -1506,7 +1522,12 @@ mod tests {
         }
         HistoricalSession {
             date,
-            symbols: symbols.iter().map(|value| (*value).to_owned()).collect(),
+            symbols: Arc::from(
+                symbols
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>(),
+            ),
             bars,
         }
     }

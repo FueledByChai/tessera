@@ -679,17 +679,6 @@ fn plan_standard(
         !requested_dates.is_empty(),
         "no bars were available in the requested window"
     );
-    let sessions = by_date
-        .iter()
-        .map(|(date, times)| HistoricalSession {
-            date: *date,
-            symbols: active.clone(),
-            bars: times
-                .iter()
-                .map(|(time, bars)| (*time, bars.clone()))
-                .collect(),
-        })
-        .collect::<Vec<_>>();
     let mut coverage = Vec::new();
     for date in &requested_dates {
         let times = &by_date[date];
@@ -711,6 +700,17 @@ fn plan_standard(
         "no selected symbol has bars in the requested window"
     );
     let count = active.len();
+    // Sessions take ownership of the bar tables (no per-session copies) and share one
+    // symbol list.
+    let shared_symbols: Arc<[String]> = Arc::from(active.clone());
+    let sessions = by_date
+        .into_iter()
+        .map(|(date, times)| HistoricalSession {
+            date,
+            symbols: Arc::clone(&shared_symbols),
+            bars: times.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
     let mut instances = BTreeMap::new();
     for (index, symbol) in active.iter().enumerate() {
         let daily = daily_context
@@ -916,7 +916,7 @@ fn plan_screened(
             symbols.insert(equity_symbol.clone());
             HistoricalSession {
                 date: *date,
-                symbols: symbols.into_iter().collect(),
+                symbols: Arc::from(symbols.into_iter().collect::<Vec<_>>()),
                 bars: by_date
                     .remove(date)
                     .unwrap_or_default()
@@ -993,15 +993,16 @@ pub fn run(
         SimulatedBroker::new(config.sizing.initial_capital, config.simulation_costs())?
             .with_limits(effective_limits.entry_limits()?);
     let mut reporter = ProgressReporter::new("replay");
-    HistoricalEventEngine::run_with_progress(
+    let session_count = sessions.len();
+    HistoricalEventEngine::run_owned(
         &mut host,
         &mut broker,
-        &sessions,
+        sessions,
         &mut |done, total, date| {
             reporter.report(done, total, &date.to_string());
         },
     )?;
-    reporter.finish(sessions.len());
+    reporter.finish(session_count);
 
     // Daily equity is account-wide; fills are summed across symbols.
     let equity_curve = host
@@ -1010,15 +1011,9 @@ pub fn run(
         .daily_equity
         .clone();
     let mut fills_by_day: BTreeMap<NaiveDate, usize> = BTreeMap::new();
-    for session in &sessions {
-        for symbol in &session.symbols {
-            if let Some(instance) = host.strategy(symbol) {
-                for (date, fills) in &instance.fills_by_day {
-                    if date == &session.date {
-                        *fills_by_day.entry(*date).or_default() += fills;
-                    }
-                }
-            }
+    for instance in host.instances() {
+        for (date, fills) in &instance.fills_by_day {
+            *fills_by_day.entry(*date).or_default() += fills;
         }
     }
     let mut previous = config.sizing.initial_capital;
