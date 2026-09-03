@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use backtester::portfolio::combine_portfolio;
-use backtester::report::generate_report;
-use backtester::sdk;
-use backtester::sdk::runner::SdkRunConfig;
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
+use tessera::portfolio::combine_portfolio;
+use tessera::report::generate_report;
+use tessera::sdk;
+use tessera::sdk::runner::SdkRunConfig;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "backtester",
+    name = "tessera",
     version,
-    about = "Fast mixed-resolution market backtester"
+    about = "Tessera: fast event-driven market tessera"
 )]
 struct Cli {
     #[command(subcommand)]

@@ -17,13 +17,13 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 
-use backtester::local_config::LocalConfig;
-use backtester::portfolio::{
+use tessera::local_config::LocalConfig;
+use tessera::portfolio::{
     CapitalMode, PortfolioComponentConfig, PortfolioConfig, RebalanceMethod, combine_portfolio,
 };
-use backtester::report::{ReportView, generate_report, load_report_view};
-use backtester::sdk::manifest::Manifest as SdkManifest;
-use backtester::sdk::runner::{
+use tessera::report::{ReportView, generate_report, load_report_view};
+use tessera::sdk::manifest::Manifest as SdkManifest;
+use tessera::sdk::runner::{
     Resolution as SdkResolution, SdkCostConfig, SdkDataConfig, SdkLimitsConfig, SdkRunConfig,
     SdkSizingConfig, SessionKind as SdkSessionKind,
 };
@@ -486,13 +486,13 @@ fn default_research_label() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let root = std::env::var_os("BACKTESTER_ROOT")
+    let root = std::env::var_os("TESSERA_ROOT")
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir().context("resolve working directory")?);
     let state_dir = root.join("data/ui");
     fs::create_dir_all(&state_dir).context("create UI state directory")?;
     let connection =
-        Connection::open(state_dir.join("backtester_ui.sqlite3")).context("open UI catalog")?;
+        Connection::open(state_dir.join("tessera_ui.sqlite3")).context("open UI catalog")?;
     migrate(&connection)?;
     recover_incomplete_jobs(&connection)?;
     seed_strategies(&connection)?;
@@ -604,7 +604,7 @@ async fn main() -> Result<()> {
 
     let address = "127.0.0.1:8787";
     let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Backtester API listening on http://{address}");
+    println!("Tessera API listening on http://{address}");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -1800,11 +1800,11 @@ fn engine_path_for(state: &AppState, strategy_id: &str) -> Result<PathBuf> {
     })
 }
 
-/// Runs `backtester sdk-manifests` on the given engine, cached by binary mtime.
+/// Runs `tessera sdk-manifests` on the given engine, cached by binary mtime.
 fn sdk_manifests_for_engine(state: &AppState, engine: &Path) -> Result<Vec<SdkManifest>> {
     anyhow::ensure!(
         engine.is_file(),
-        "backtester engine is not built at {}; run cargo build --release --bin backtester",
+        "tessera engine is not built at {}; run cargo build --release --bin tessera",
         engine.display()
     );
     let modified = fs::metadata(engine)?.modified()?;
@@ -2275,7 +2275,7 @@ async fn build_strategy_draft(
         .arg("build")
         .arg("--release")
         .arg("--bin")
-        .arg("backtester")
+        .arg("tessera")
         .output()
         .await?;
     let log = format!(
@@ -2300,8 +2300,8 @@ async fn build_strategy_draft(
     )?;
     let engine_dir = draft_root(&state, &id).join("engine");
     fs::create_dir_all(&engine_dir)?;
-    let engine_path = engine_dir.join("backtester");
-    fs::copy(target.join("release/backtester"), &engine_path)?;
+    let engine_path = engine_dir.join("tessera");
+    fs::copy(target.join("release/tessera"), &engine_path)?;
     let ids = sync_sdk_strategies(&state, Some(&engine_path), Some(&id))?;
     let strategies = {
         let connection = state.database.lock().expect("database lock poisoned");
@@ -3009,7 +3009,7 @@ async fn release_strategy_draft(
         .arg("build")
         .arg("--release")
         .arg("--bin")
-        .arg("backtester")
+        .arg("tessera")
         .output()
         .await?;
     require_api(
@@ -3048,8 +3048,8 @@ async fn release_strategy_draft(
         }
         fs::write(target_file, file.content)?;
     }
-    let engine_path = release_root.join("backtester");
-    fs::copy(target.join("release/backtester"), &engine_path)?;
+    let engine_path = release_root.join("tessera");
+    fs::copy(target.join("release/tessera"), &engine_path)?;
     let paths = load_draft_files(&state, &id)?
         .iter()
         .map(|file| file.path.clone())
@@ -4887,7 +4887,7 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
                 .context("validate SDK run configuration snapshot")?;
             (
                 JobExecutionPlan::Standard("run-strategy"),
-                "backtester run-strategy",
+                "tessera run-strategy",
             )
         }
         _ => bail!("this strategy is not runnable in this build; only SDK strategies can run"),
@@ -4948,13 +4948,13 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
     };
     let engine = if let Some(relative) = custom_engine {
         state.root.join(checked_workspace_relative(&relative)?)
-    } else if state.root.join("target/release/backtester").is_file() {
-        state.root.join("target/release/backtester")
+    } else if state.root.join("target/release/tessera").is_file() {
+        state.root.join("target/release/tessera")
     } else {
-        state.root.join("target/debug/backtester")
+        state.root.join("target/debug/tessera")
     };
     if !engine.is_file() {
-        bail!("backtester engine is not built; run cargo build --release --bin backtester");
+        bail!("tessera engine is not built; run cargo build --release --bin tessera");
     }
     let mut outputs = Vec::new();
     match plan {
@@ -5028,10 +5028,7 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
             ],
         )?;
     } else {
-        let error = format!(
-            "backtester exited with code {exit_code}; see {}",
-            job.log_path
-        );
+        let error = format!("tessera exited with code {exit_code}; see {}", job.log_path);
         connection.execute(
             "UPDATE jobs SET status='failed', finished_at=?2, error=?3 WHERE id=?1",
             params![job_id, finished_at, error],

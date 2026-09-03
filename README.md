@@ -1,4 +1,6 @@
-# Backtester
+# Tessera
+
+*Tessera* (Latin: one tile of a mosaic). Bars, fills, and runs are the tiles; the portfolio is the picture.
 
 An event-driven backtesting engine written in Rust, with a local browser UI styled after a
 trading terminal. Strategies are single Rust files: declare the parameters, write the bar
@@ -63,7 +65,7 @@ Requires a recent stable Rust toolchain and, for the UI, Node 20 or later.
 
 ```bash
 cargo build --release
-cargo run --release --bin backtester -- run-strategy \
+cargo run --release --bin tessera -- run-strategy \
   --config examples/configs/rsi_mean_reversion.toml \
   --start 2019-01-01 --end 2025-12-31 \
   --output-dir artifacts/rsi_demo
@@ -71,14 +73,14 @@ open artifacts/rsi_demo/report.html
 ```
 
 `examples/configs/` holds a run configuration for each bundled example, and
-`cargo run --release --bin backtester -- sdk-manifests` prints every discovered strategy and
+`cargo run --release --bin tessera -- sdk-manifests` prints every discovered strategy and
 its parameters as JSON.
 
 ### Local UI
 
 ```bash
-cargo build --release --bin backtester --bin backtester_ui
-./target/release/backtester_ui          # API on http://127.0.0.1:8787
+cargo build --release --bin tessera --bin tessera-ui
+./target/release/tessera-ui          # API on http://127.0.0.1:8787
 cd web && npm install && npm run dev    # UI on http://127.0.0.1:3322
 ```
 
@@ -131,8 +133,8 @@ the same name as an example replaces it.
 src/event_engine.rs   replay loop, simulated broker, order intents, entry arbitration
 src/sdk/              one-file strategy SDK: manifest, context, indicators, runner
 src/strategies/user/  bundled example strategies (discovered by build.rs)
-src/bin/backtester    engine CLI: run-strategy, sdk-manifests, report, combine
-src/bin/backtester_ui local API server for the browser UI
+src/bin/tessera    engine CLI: run-strategy, sdk-manifests, report, combine
+src/bin/tessera-ui local API server for the browser UI
 src/report.rs         HTML tear sheet and metrics
 src/portfolio.rs      combines completed runs into portfolios
 web/                  Next.js single-page terminal UI

@@ -5,7 +5,7 @@ deferred.
 
 ## Product goal
 
-Backtester should provide TradingView-like strategy authoring with portfolio-aware execution. A
+Tessera should provide TradingView-like strategy authoring with portfolio-aware execution. A
 strategy author writes parameters, indicator/feature state, signal rules, optional ranking, and order
 intent. The platform owns data access, clocks, synchronized events, simulated or live execution,
 positions, cash, costs, immutable provenance, standard artifacts, reports, comparisons, and research

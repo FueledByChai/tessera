@@ -1,6 +1,6 @@
 # Product Backlog
 
-This is the working feature and user-story backlog for the Backtester application. It records product
+This is the working feature and user-story backlog for the Tessera application. It records product
 intent and acceptance criteria; it is not evidence that a feature has been implemented.
 
 Statuses: **Proposed**, **Ready**, **In progress**, **Complete**, or **Deferred**.
@@ -37,7 +37,7 @@ Statuses: **Proposed**, **Ready**, **In progress**, **Complete**, or **Deferred*
 
 ### BT-101 — Versioned strategy-package manifest
 
-**Status:** In progress (September 2, 2026): manifests are declared in code (`crate::sdk::Manifest`) with id, version, name, description, rules, asset scope, warm-up, and parameters; the engine exports them via `backtester sdk-manifests` and the catalog syncs from the binary. Source hashes and out-of-checkout packages remain open.  
+**Status:** In progress (September 2, 2026): manifests are declared in code (`crate::sdk::Manifest`) with id, version, name, description, rules, asset scope, warm-up, and parameters; the engine exports them via `tessera sdk-manifests` and the catalog syncs from the binary. Source hashes and out-of-checkout packages remain open.  
 **User story:** As a strategy author, I want a package to describe itself so the application can
 discover and run it without hardcoded strategy-specific UI or registry logic.
 
@@ -582,7 +582,7 @@ so an unplugged volume cannot redirect writes to my internal disk.
 ### BT-713 — External-storage performance qualification
 
 **Status:** Proposed  
-**User story:** As a user, I want to benchmark a candidate external SSD with real Backtester workloads
+**User story:** As a user, I want to benchmark a candidate external SSD with real Tessera workloads
 before making it the active data volume.
 
 **Acceptance criteria:**

@@ -259,28 +259,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "backtester"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "chrono-tz",
- "clap",
- "csv",
- "polars",
- "rand 0.9.5",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
- "tower-http",
-]
-
-[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3097,6 +3075,28 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows",
+]
+
+[[package]]
+name = "tessera-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "csv",
+ "polars",
+ "rand 0.9.5",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+ "tower-http",
 ]
 
 [[package]]

@@ -189,7 +189,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let output = std::env::temp_dir().join(format!(
-            "backtester-standard-artifacts-{}-{suffix}",
+            "tessera-standard-artifacts-{}-{suffix}",
             std::process::id()
         ));
         let start = NaiveDate::from_ymd_opt(2026, 1, 1).expect("date");

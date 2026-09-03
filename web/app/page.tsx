@@ -4807,7 +4807,7 @@ export default function Home() {
         <div className="brand">
           <span className="brand-mark">BT</span>
           <div>
-            <strong>Backtester</strong>
+            <strong>Tessera</strong>
             <small>Research Console</small>
           </div>
         </div>

@@ -83,8 +83,8 @@ pub struct LocalConfig {
 
 impl LocalConfig {
     /// Loads `local.toml` from the repository root, falling back to the bundled example
-    /// data. Environment variables `BACKTESTER_DATA_ROOT` (a folder containing `eod/`,
-    /// `5m/`, `1m/`, and `catalog/`) and `BACKTESTER_ENGINE` override the file.
+    /// data. Environment variables `TESSERA_DATA_ROOT` (a folder containing `eod/`,
+    /// `5m/`, `1m/`, and `catalog/`) and `TESSERA_ENGINE` override the file.
     pub fn load(root: &Path) -> Result<Self> {
         let path = root.join(LOCAL_FILE);
         let mut config = if path.is_file() {
@@ -96,17 +96,17 @@ impl LocalConfig {
         } else {
             Self::bundled_example(root)
         };
-        if let Ok(data_root) = env::var("BACKTESTER_DATA_ROOT") {
+        if let Ok(data_root) = env::var("TESSERA_DATA_ROOT") {
             let data_root = PathBuf::from(data_root);
             config.data.daily_dir = data_root.join("eod");
             config.data.five_minute_dir = data_root.join("5m");
             config.data.one_minute_dir = data_root.join("1m");
             config.data.catalog_dir = data_root.join("catalog");
         }
-        if let Ok(engine) = env::var("BACKTESTER_ENGINE") {
+        if let Ok(engine) = env::var("TESSERA_ENGINE") {
             config.engine.path = Some(PathBuf::from(engine));
         }
-        if let Ok(dirs) = env::var("BACKTESTER_STRATEGY_DIRS") {
+        if let Ok(dirs) = env::var("TESSERA_STRATEGY_DIRS") {
             config
                 .strategies
                 .dirs
@@ -160,7 +160,7 @@ impl LocalConfig {
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             self.data.daily_dir.is_dir(),
-            "daily data directory does not exist: {} (edit {LOCAL_FILE} or set BACKTESTER_DATA_ROOT)",
+            "daily data directory does not exist: {} (edit {LOCAL_FILE} or set TESSERA_DATA_ROOT)",
             self.data.daily_dir.display()
         );
         Ok(())
@@ -170,11 +170,11 @@ impl LocalConfig {
         if let Some(path) = &self.engine.path {
             return path.clone();
         }
-        let release = root.join("target/release/backtester");
+        let release = root.join("target/release/tessera");
         if release.is_file() {
             release
         } else {
-            root.join("target/debug/backtester")
+            root.join("target/debug/tessera")
         }
     }
 }
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn relative_paths_resolve_against_root() {
-        let root = Path::new("/tmp/backtester-root");
+        let root = Path::new("/tmp/tessera-root");
         let config = LocalConfig {
             data: DataLibrary {
                 daily_dir: PathBuf::from("data/eod"),

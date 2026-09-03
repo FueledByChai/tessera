@@ -1,14 +1,14 @@
-# Backtester local UI
+# Tessera local UI
 
 The planned separation between the open-source application, external strategy packages, and
 external data libraries is recorded in [OPEN_SOURCE_ARCHITECTURE_DIRECTION.md](OPEN_SOURCE_ARCHITECTURE_DIRECTION.md).
 Proposed features and their acceptance criteria are tracked in [PRODUCT_BACKLOG.md](PRODUCT_BACKLOG.md).
 
-Double-click `Launch Backtester UI.command` in Finder. The first launch may take a few minutes while the Rust service is built. Later launches reuse the compiled service and open `http://127.0.0.1:3322/` directly.
+Double-click `Launch Tessera.command` in Finder. The first launch may take a few minutes while the Rust service is built. Later launches reuse the compiled service and open `http://127.0.0.1:3322/` directly.
 
 The initial vertical slice provides:
 
-- A local SQLite catalog at `data/ui/backtester_ui.sqlite3`.
+- A local SQLite catalog at `data/ui/tessera_ui.sqlite3`.
 - Automatic, non-destructive import of every `artifacts/*/report.html` result as an immutable legacy run.
 - Every one-file SDK strategy discovered by `build.rs` (bundled examples plus any folders listed in `local.toml` `[strategies] dirs`), each with its manifest parameters exposed as form fields. Legacy catalog rows imported from older artifacts remain visible for their run history but are not runnable.
 - A Strategies catalog rendered as a dense monitor table instead of tiles, so it scales to a large number of entries. Rows are grouped by asset class, status, or shown flat; custom releases nest under their base strategy; columns sort by name, version, status, assets, run count, and last run; a filter box matches name, id, asset, or description; arrow keys move the selection and Enter opens it. A sticky inspector rail shows the selected strategy's description, config, base strategy, source hash, run history summary, and Open / View source actions.
@@ -48,7 +48,7 @@ Custom profiles are append-only. The current fixed-tick strategy adapters requir
 
 A strategy is a single Rust file in `src/strategies/user/` that implements `crate::sdk::Strategy`: a `manifest()` declaring parameters (int, decimal, bool, choice with defaults, ranges, help, simple/advanced tier), a `new(params, symbol)` constructor, and `on_bar(ctx, bar)`. The context exposes the account (`equity`, `position`, `is_flat`) and accepts orders (`buy`, `buy_with` with stop/target, `sell_short`, `close`, `set_stop`) with platform sizing (`Size::Default`) or strategy overrides (`Size::Percent`, `Size::Units`). Streaming indicators (`Rsi`, `Sma`, `Ema`, `Atr`, `Bollinger`, `Vwap`, `RollingHigh`, `RollingLow`, `Crossover`) come from `crate::sdk::prelude`. `build.rs` discovers every file in that folder, so there is no module list or registry to edit; the reference file is `src/strategies/user/rsi_mean_reversion.rs` and the skeleton is `docs/templates/sdk_strategy_skeleton.rs`.
 
-Strategies are resolution-agnostic. The run form chooses daily, five-minute, or one-minute bars, regular or extended hours, the symbol list (one strategy instance per symbol on a shared account), position size, and initial capital; manifest parameters render automatically. The engine exposes `backtester sdk-manifests` and `backtester run-strategy --config <toml>`; the local service syncs every compiled manifest into the catalog at startup (`base_strategy_id = "sdk"`, `command_name = "run-strategy"`).
+Strategies are resolution-agnostic. The run form chooses daily, five-minute, or one-minute bars, regular or extended hours, the symbol list (one strategy instance per symbol on a shared account), position size, and initial capital; manifest parameters render automatically. The engine exposes `tessera sdk-manifests` and `tessera run-strategy --config <toml>`; the local service syncs every compiled manifest into the catalog at startup (`base_strategy_id = "sdk"`, `command_name = "run-strategy"`).
 
 The SDK also covers intraday strategies with daily context, resting limit orders, and universe-scale screens. A manifest can declare `daily_context()` (intraday runs receive completed daily bars through `on_daily_bar`), `screened_universe()` (a daily `screen()` pass across every symbol decides which symbol-days get intraday bars, so the full US common-stock universe runs in seconds), `allows_short()`, and `entry_limits(max_per_day, tie_break, seed)`. The context offers `buy_limit`/`sell_short_limit` with expiry, gap veto, percent stop, and timed exits; `exit_at`/`exit_after_minutes`; `priority()` for the daily entry cap; shared run-wide state (`shared_get/set/push/series`); and `symbol_index()` so list order can act as priority. The run form exposes a universe selector (all US common stocks, all ETFs, or both), entry limits (max entries per day, max open positions, priority / seeded-random / alphabetical tie-break), and accepts any cost profile including all-in basis points. Two production strategies ship as one-file SDK versions: `gap_fade` (any ETF list in priority order; first confirmed instrument trades, or largest gap) and `limit_buyer` (screened universe). Their legacy engines remain frozen for existing runs.
 
@@ -71,7 +71,7 @@ Changing any draft file invalidates its previous validation. Released strategies
 Run the API from the repository root:
 
 ```sh
-cargo run --bin backtester_ui
+cargo run --bin tessera-ui
 ```
 
 Run the browser application in a second terminal for development:
@@ -81,6 +81,6 @@ cd web
 npm run dev -- --host 127.0.0.1 --port 3322
 ```
 
-The double-click launcher uses the built production server (`npm run build` followed by `npm run start`) so it is independent of any development server. It stages disposable web dependencies and build output under `~/Library/Caches/Backtester/web-runtime`; source code, the SQLite catalog, and immutable run artifacts stay in the Backtester project. This avoids macOS cloud-storage eviction of `node_modules` when the project is under Documents.
+The double-click launcher uses the built production server (`npm run build` followed by `npm run start`) so it is independent of any development server. It stages disposable web dependencies and build output under `~/Library/Caches/Tessera/web-runtime`; source code, the SQLite catalog, and immutable run artifacts stay in the Tessera project. This avoids macOS cloud-storage eviction of `node_modules` when the project is under Documents.
 
 The service health check is `http://127.0.0.1:8787/api/health`. Runtime logs for the double-click launcher are written under `data/ui/logs/`.

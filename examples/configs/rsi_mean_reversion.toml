@@ -1,5 +1,5 @@
 # Runs the bundled RSI example against the synthetic data in examples/data.
-#   cargo run --release --bin backtester -- run-strategy \
+#   cargo run --release --bin tessera -- run-strategy \
 #     --config examples/configs/rsi_mean_reversion.toml \
 #     --start 2019-01-01 --end 2025-12-31 --output-dir artifacts/rsi_demo
 strategy = "rsi_mean_reversion"

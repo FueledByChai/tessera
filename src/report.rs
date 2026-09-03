@@ -1387,7 +1387,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "backtester-strategy-watchlist-{}-{suffix}.parquet",
+            "tessera-strategy-watchlist-{}-{suffix}.parquet",
             std::process::id()
         ));
         let mut frame = df!(

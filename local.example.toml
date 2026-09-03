@@ -1,8 +1,8 @@
 # Copy to `local.toml` (git-ignored) and point it at your market-data library.
 # Without a local.toml the app uses the small synthetic dataset under examples/data.
 #
-# Environment overrides: BACKTESTER_DATA_ROOT (folder holding eod/, 5m/, 1m/, catalog/),
-# BACKTESTER_ENGINE (engine binary), BACKTESTER_STRATEGY_DIRS (extra strategy folders).
+# Environment overrides: TESSERA_DATA_ROOT (folder holding eod/, 5m/, 1m/, catalog/),
+# TESSERA_ENGINE (engine binary), TESSERA_STRATEGY_DIRS (extra strategy folders).
 
 [data]
 # CSV folders, one file per symbol named `<SYMBOL>.csv`.
@@ -24,9 +24,9 @@ provider = "csv-folders"
 
 [engine]
 # Optional: run strategies with a different engine binary, for example one built from a
-# private strategies repository. Defaults to target/release/backtester in this checkout.
-# path = "../Backtester-private/target/release/backtester"
+# private strategies repository. Defaults to target/release/tessera in this checkout.
+# path = "../Tessera-private/target/release/tessera"
 
 [strategies]
 # Extra folders of one-file SDK strategies compiled into this checkout's engine.
-# dirs = ["../Backtester-private/strategies"]
+# dirs = ["../Tessera-private/strategies"]

@@ -1,5 +1,5 @@
 # Runs the bundled moving-average-cross example against the synthetic data.
-#   cargo run --release --bin backtester -- run-strategy \
+#   cargo run --release --bin tessera -- run-strategy \
 #     --config examples/configs/moving_average_cross.toml \
 #     --start 2019-01-01 --end 2025-12-31 --output-dir artifacts/ma_cross_demo
 strategy = "moving_average_cross"

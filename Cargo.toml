@@ -1,7 +1,22 @@
 [package]
-name = "backtester"
+name = "tessera-engine"
+description = "Tessera: an event-driven backtesting engine with a one-file strategy SDK and a terminal-style local UI"
+license = "AGPL-3.0-only"
+repository = "https://github.com/FueledByChai/tessera"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "tessera"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+[[bin]]
+name = "tessera-ui"
+path = "src/bin/tessera_ui.rs"
 
 [dependencies]
 anyhow = "1.0"

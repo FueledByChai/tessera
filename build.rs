@@ -2,7 +2,7 @@
 //!
 //! Strategy files come from `src/strategies/user/` in this checkout plus any extra
 //! folders named in `local.toml` (`[strategies] dirs = [...]`) or the
-//! `BACKTESTER_STRATEGY_DIRS` environment variable, which is how a private strategies
+//! `TESSERA_STRATEGY_DIRS` environment variable, which is how a private strategies
 //! repository is compiled into the engine without living in this repository. Every
 //! file must define `pub fn entry() -> crate::sdk::StrategyEntry`.
 
@@ -15,11 +15,11 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=local.toml");
-    println!("cargo:rerun-if-env-changed=BACKTESTER_STRATEGY_DIRS");
+    println!("cargo:rerun-if-env-changed=TESSERA_STRATEGY_DIRS");
 
     let mut dirs = vec![manifest_dir.join("src/strategies/user")];
     dirs.extend(local_strategy_dirs(&manifest_dir));
-    if let Ok(extra) = env::var("BACKTESTER_STRATEGY_DIRS") {
+    if let Ok(extra) = env::var("TESSERA_STRATEGY_DIRS") {
         dirs.extend(
             env::split_paths(&extra)
                 .filter(|p| !p.as_os_str().is_empty())
