@@ -3989,3 +3989,39 @@ nav {
   background: #050505;
   color: var(--muted);
 }
+
+/* Running-job progress (dashboard worker queue panel) */
+.job-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0 12px;
+  font-size: 12px;
+  color: var(--text-muted, #b8b8b8);
+}
+.job-progress-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.job-progress-stage {
+  color: var(--accent, #f89828);
+  letter-spacing: 0.08em;
+  font-weight: 600;
+}
+.job-progress-pct {
+  color: var(--text, #f0f0f0);
+  font-weight: 600;
+}
+.job-progress-track {
+  height: 8px;
+  background: #1c1c4a;
+  border: 1px solid #2a2a66;
+  overflow: hidden;
+}
+.job-progress-track i {
+  display: block;
+  height: 100%;
+  background: var(--accent, #f89828);
+  transition: width 0.6s ease;
+}

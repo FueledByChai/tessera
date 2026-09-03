@@ -4,7 +4,7 @@
 //! code produces broker-neutral [`OrderIntent`] values; simulated and live
 //! brokers own fills, positions, cash, and reconciliation.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use chrono::{NaiveDate, NaiveTime};
@@ -67,41 +67,6 @@ impl MarketEvent {
         match self {
             Self::BarOpen { time, .. } | Self::BarClose { time, .. } => Some(*time),
             Self::SessionStart { .. } | Self::SessionEnd { .. } => None,
-        }
-    }
-
-    fn for_symbol(&self, symbol: &str) -> Option<Self> {
-        match self {
-            Self::SessionStart { date, symbols } | Self::SessionEnd { date, symbols } => {
-                if !symbols.iter().any(|value| value == symbol) {
-                    return None;
-                }
-                let symbols = vec![symbol.to_owned()];
-                Some(match self {
-                    Self::SessionStart { .. } => Self::SessionStart {
-                        date: *date,
-                        symbols,
-                    },
-                    _ => Self::SessionEnd {
-                        date: *date,
-                        symbols,
-                    },
-                })
-            }
-            Self::BarOpen { date, time, prices } => {
-                prices.get(symbol).cloned().map(|price| Self::BarOpen {
-                    date: *date,
-                    time: *time,
-                    prices: BTreeMap::from([(symbol.to_owned(), price)]),
-                })
-            }
-            Self::BarClose { date, time, bars } => {
-                bars.get(symbol).cloned().map(|bar| Self::BarClose {
-                    date: *date,
-                    time: *time,
-                    bars: BTreeMap::from([(symbol.to_owned(), bar)]),
-                })
-            }
         }
     }
 }
@@ -347,10 +312,59 @@ impl<S: EventStrategy> StrategyHost<S> {
         match self {
             Self::Portfolio(strategy) => strategy.on_market_event(event, portfolio),
             Self::PerInstrument(strategies) => {
+                // Dispatch in strategy (alphabetical) order, but only touch the strategies
+                // that actually have data in this event: with thousands of instruments the
+                // naive "every strategy checks every event" loop was quadratic.
                 let mut intents = Vec::new();
-                for (symbol, strategy) in strategies {
-                    if let Some(event) = event.for_symbol(symbol) {
-                        intents.extend(strategy.on_market_event(&event, portfolio)?);
+                match event {
+                    MarketEvent::SessionStart { date, symbols }
+                    | MarketEvent::SessionEnd { date, symbols } => {
+                        let present: HashSet<&str> = symbols.iter().map(String::as_str).collect();
+                        let starting = matches!(event, MarketEvent::SessionStart { .. });
+                        for (symbol, strategy) in strategies.iter_mut() {
+                            if !present.contains(symbol.as_str()) {
+                                continue;
+                            }
+                            let single = vec![symbol.clone()];
+                            let scoped = if starting {
+                                MarketEvent::SessionStart {
+                                    date: *date,
+                                    symbols: single,
+                                }
+                            } else {
+                                MarketEvent::SessionEnd {
+                                    date: *date,
+                                    symbols: single,
+                                }
+                            };
+                            intents.extend(strategy.on_market_event(&scoped, portfolio)?);
+                        }
+                    }
+                    MarketEvent::BarOpen { date, time, prices } => {
+                        for (symbol, price) in prices {
+                            let Some(strategy) = strategies.get_mut(symbol) else {
+                                continue;
+                            };
+                            let scoped = MarketEvent::BarOpen {
+                                date: *date,
+                                time: *time,
+                                prices: BTreeMap::from([(symbol.clone(), price.clone())]),
+                            };
+                            intents.extend(strategy.on_market_event(&scoped, portfolio)?);
+                        }
+                    }
+                    MarketEvent::BarClose { date, time, bars } => {
+                        for (symbol, bar) in bars {
+                            let Some(strategy) = strategies.get_mut(symbol) else {
+                                continue;
+                            };
+                            let scoped = MarketEvent::BarClose {
+                                date: *date,
+                                time: *time,
+                                bars: BTreeMap::from([(symbol.clone(), bar.clone())]),
+                            };
+                            intents.extend(strategy.on_market_event(&scoped, portfolio)?);
+                        }
                     }
                 }
                 Ok(intents)
@@ -1296,9 +1310,21 @@ impl HistoricalEventEngine {
         broker: &mut B,
         sessions: &[HistoricalSession],
     ) -> Result<HistoricalRunStats> {
+        Self::run_with_progress(host, broker, sessions, &mut |_, _, _| {})
+    }
+
+    /// Replays every session, calling `progress(completed, total, date)` after each one so
+    /// long runs can report where they are.
+    pub fn run_with_progress<S: EventStrategy, B: BrokerAdapter>(
+        host: &mut StrategyHost<S>,
+        broker: &mut B,
+        sessions: &[HistoricalSession],
+        progress: &mut dyn FnMut(usize, usize, NaiveDate),
+    ) -> Result<HistoricalRunStats> {
         let mut stats = HistoricalRunStats::default();
         for (session_index, session) in sessions.iter().enumerate() {
             stats.sessions += 1;
+            progress(session_index, sessions.len(), session.date);
             Self::dispatch(
                 host,
                 broker,

@@ -82,6 +82,14 @@ type RunMetrics = {
   start?: string | null;
   end?: string | null;
 };
+type JobProgress = {
+  stage: string;
+  done: number;
+  total: number;
+  percent: number;
+  label: string;
+  elapsed_seconds: number;
+};
 type Job = {
   id: string;
   strategy_id: string;
@@ -91,7 +99,42 @@ type Job = {
   created_at: string;
   log_path: string;
   error?: string;
+  progress?: JobProgress | null;
 };
+
+function formatElapsed(seconds: number) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return m > 0 ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+
+/** Progress of a running engine job: stage, bar, counts, and a rough time remaining. */
+function JobProgressBar({ job }: { job: Job }) {
+  const progress = job.progress;
+  if (job.status === "queued") {
+    return <div className="job-progress"><span className="job-progress-stage">QUEUED</span><span>waiting for a worker</span></div>;
+  }
+  if (!progress) {
+    return <div className="job-progress"><span className="job-progress-stage">STARTING</span><span>loading data…</span></div>;
+  }
+  const pct = Math.max(0, Math.min(100, progress.percent));
+  const rate = progress.elapsed_seconds > 0 && progress.done > 0 ? progress.done / progress.elapsed_seconds : 0;
+  const remaining = rate > 0 ? Math.round((progress.total - progress.done) / rate) : null;
+  const unit = progress.stage === "replay" ? "sessions" : progress.stage === "load" ? "symbols" : progress.stage;
+  return (
+    <div className="job-progress">
+      <div className="job-progress-row">
+        <span className="job-progress-stage">{progress.stage.toUpperCase()}</span>
+        <span className="job-progress-pct">{pct.toFixed(0)}%</span>
+      </div>
+      <div className="job-progress-track"><i style={{ width: `${pct}%` }} /></div>
+      <div className="job-progress-row">
+        <span>{progress.done.toLocaleString()} / {progress.total.toLocaleString()} {unit}{progress.stage === "replay" && progress.label && progress.label !== "done" ? ` · ${progress.label}` : ""}</span>
+        <span>{formatElapsed(progress.elapsed_seconds)}{remaining != null && pct < 100 ? ` · ~${formatElapsed(remaining)} left` : ""}</span>
+      </div>
+    </div>
+  );
+}
 type Dashboard = {
   strategies: Strategy[];
   recent_runs: Run[];
@@ -4973,11 +5016,16 @@ export default function Home() {
                     <i />
                     <span>03</span>
                   </div>
-                  <p>
-                    {runningJob
-                      ? `${runningJob.start_date} → ${runningJob.end_date}`
-                      : "New jobs run in isolated processes and survive browser closure."}
-                  </p>
+                  {runningJob ? (
+                    <>
+                      <p>
+                        {runningJob.strategy_id} · {runningJob.start_date} → {runningJob.end_date}
+                      </p>
+                      <JobProgressBar job={runningJob} />
+                    </>
+                  ) : (
+                    <p>New jobs run in isolated processes and survive browser closure.</p>
+                  )}
                   <button
                     className="secondary-action"
                     onClick={() => void openStrategy()}
@@ -5335,6 +5383,7 @@ export default function Home() {
           <span>{connected ? "Engine online" : "Engine offline"}</span>
           <span>
             Queue {dashboard.active_jobs}/{dashboard.worker_capacity}
+            {runningJob?.progress ? ` · ${runningJob.progress.stage} ${runningJob.progress.percent.toFixed(0)}%` : ""}
           </span>
           <span>{dashboard.historical_reports} reports</span>
           {stripStatus?.latest_spy_date && (

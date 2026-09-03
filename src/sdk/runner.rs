@@ -305,6 +305,50 @@ fn valid_prices(open: f64, high: f64, low: f64, close: f64) -> bool {
 }
 
 /// Split-adjusted daily bars, each carrying its adjusted-to-raw ratio.
+/// Writes machine-readable `progress:` lines to stderr, throttled to about one per second,
+/// so the UI can show where a long run is. Format: `progress: <stage> <done>/<total> <label>`.
+pub struct ProgressReporter {
+    stage: &'static str,
+    started: std::time::Instant,
+    last: std::time::Instant,
+    last_percent: usize,
+}
+
+impl ProgressReporter {
+    pub fn new(stage: &'static str) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            stage,
+            started: now,
+            last: now - std::time::Duration::from_secs(60),
+            last_percent: usize::MAX,
+        }
+    }
+
+    pub fn report(&mut self, done: usize, total: usize, label: &str) {
+        let percent = if total == 0 { 100 } else { done * 100 / total };
+        let now = std::time::Instant::now();
+        if percent == self.last_percent && now.duration_since(self.last).as_secs() < 1 {
+            return;
+        }
+        if now.duration_since(self.last).as_millis() < 250 && percent != 100 {
+            return;
+        }
+        self.last = now;
+        self.last_percent = percent;
+        eprintln!(
+            "progress: {} {done}/{total} {label} elapsed={}s",
+            self.stage,
+            self.started.elapsed().as_secs()
+        );
+    }
+
+    pub fn finish(&mut self, total: usize) {
+        self.last = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        self.report(total, total, "done");
+    }
+}
+
 /// Calendar days of history to read before `start` so `warmup_bars` completed bars are
 /// available: bars per session for the resolution, doubled to cover weekends and holidays.
 fn warmup_horizon_days(warmup_bars: usize, resolution: Resolution) -> i64 {
@@ -588,6 +632,11 @@ fn plan_standard(
             },
         )
         .collect::<Result<Vec<_>>>()?;
+    eprintln!(
+        "progress: load {}/{} symbols loaded elapsed=0s",
+        loaded.iter().filter(|entry| entry.is_some()).count(),
+        loaded.len()
+    );
     let mut active: Vec<String> = Vec::new();
     for (symbol, bars, daily) in loaded.into_iter().flatten() {
         active.push(symbol.clone());
@@ -943,7 +992,16 @@ pub fn run(
     let mut broker =
         SimulatedBroker::new(config.sizing.initial_capital, config.simulation_costs())?
             .with_limits(effective_limits.entry_limits()?);
-    HistoricalEventEngine::run(&mut host, &mut broker, &sessions)?;
+    let mut reporter = ProgressReporter::new("replay");
+    HistoricalEventEngine::run_with_progress(
+        &mut host,
+        &mut broker,
+        &sessions,
+        &mut |done, total, date| {
+            reporter.report(done, total, &date.to_string());
+        },
+    )?;
+    reporter.finish(sessions.len());
 
     // Daily equity is account-wide; fills are summed across symbols.
     let equity_curve = host

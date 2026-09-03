@@ -565,9 +565,30 @@ pub struct SdkInstance {
     pub entries_today: usize,
     pub fills_by_day: Vec<(NaiveDate, usize)>,
     pending_fills: Vec<Fill>,
-    last_portfolio: PortfolioSnapshot,
+    last_account: LastAccount,
     last_date: NaiveDate,
     last_time: NaiveTime,
+}
+
+/// The slice of the account snapshot one instance needs, kept instead of cloning the whole
+/// positions map on every event (which dominated runtime with thousands of instruments).
+#[derive(Debug, Clone, Default)]
+struct LastAccount {
+    realized_equity: f64,
+    total_equity: f64,
+    open_positions: usize,
+    own: Option<PositionSnapshot>,
+}
+
+impl LastAccount {
+    fn from_snapshot(portfolio: &PortfolioSnapshot, symbol: &str) -> Self {
+        Self {
+            realized_equity: portfolio.realized_equity,
+            total_equity: portfolio.total_equity,
+            open_positions: portfolio.positions.len(),
+            own: portfolio.positions.get(symbol).cloned(),
+        }
+    }
 }
 
 impl SdkInstance {
@@ -591,11 +612,7 @@ impl SdkInstance {
             entries_today: 0,
             fills_by_day: Vec::new(),
             pending_fills: Vec::new(),
-            last_portfolio: PortfolioSnapshot {
-                realized_equity: 0.0,
-                total_equity: 0.0,
-                positions: BTreeMap::new(),
-            },
+            last_account: LastAccount::default(),
             last_date: spec.live_from,
             last_time: NaiveTime::from_hms_opt(0, 0, 0).expect("midnight"),
         }
@@ -623,6 +640,17 @@ impl SdkInstance {
         portfolio: &PortfolioSnapshot,
         last_price: f64,
     ) -> Ctx {
+        let account = LastAccount::from_snapshot(portfolio, &self.symbol);
+        self.ctx_from_account(date, time, &account, last_price)
+    }
+
+    fn ctx_from_account(
+        &self,
+        date: NaiveDate,
+        time: NaiveTime,
+        account: &LastAccount,
+        last_price: f64,
+    ) -> Ctx {
         Ctx {
             symbol: self.symbol.clone(),
             symbol_index: self.symbol_index,
@@ -633,10 +661,10 @@ impl SdkInstance {
             warming_up: self.warming_up,
             screening: false,
             next_session: None,
-            equity: portfolio.total_equity,
-            realized_equity: portfolio.realized_equity,
-            position: portfolio.positions.get(&self.symbol).map(position_from),
-            open_positions: portfolio.positions.len(),
+            equity: account.total_equity,
+            realized_equity: account.realized_equity,
+            position: account.own.as_ref().map(position_from),
+            open_positions: account.open_positions,
             last_price,
             sizing: self.sizing,
             allows_short: self.allows_short,
@@ -727,7 +755,7 @@ impl EventStrategy for SdkInstance {
             .get(&self.symbol)
             .map(|position| position.entry_price)
             .unwrap_or(0.0);
-        self.last_portfolio = portfolio.clone();
+        self.last_account = LastAccount::from_snapshot(portfolio, &self.symbol);
         self.last_date = event.date();
         if let Some(time) = event.time() {
             self.last_time = time;
@@ -805,23 +833,25 @@ impl EventStrategy for SdkInstance {
         // Deliver immediately so every instance sees fills in event order. The account
         // snapshot is the last one observed; a closed trade's P&L is reflected on the next
         // market event.
-        let mut portfolio = self.last_portfolio.clone();
+        let mut account = self.last_account.clone();
         match &fill {
             Fill::Opened(position) => {
-                portfolio.positions.insert(
-                    self.symbol.clone(),
-                    PositionSnapshot {
-                        symbol: self.symbol.clone(),
-                        side: position.side,
-                        quantity: position.quantity,
-                        entry_price: position.entry_price,
-                        stop: position.stop,
-                        target: position.target,
-                    },
-                );
+                if account.own.is_none() {
+                    account.open_positions += 1;
+                }
+                account.own = Some(PositionSnapshot {
+                    symbol: self.symbol.clone(),
+                    side: position.side,
+                    quantity: position.quantity,
+                    entry_price: position.entry_price,
+                    stop: position.stop,
+                    target: position.target,
+                });
             }
             Fill::Closed { .. } => {
-                portfolio.positions.remove(&self.symbol);
+                if account.own.take().is_some() {
+                    account.open_positions = account.open_positions.saturating_sub(1);
+                }
             }
             Fill::Rejected { .. } => {}
         }
@@ -830,7 +860,7 @@ impl EventStrategy for SdkInstance {
             Fill::Closed { exit_price, .. } => *exit_price,
             Fill::Rejected { .. } => 0.0,
         };
-        let mut ctx = self.ctx(self.last_date, self.last_time, &portfolio, last_price);
+        let mut ctx = self.ctx_from_account(self.last_date, self.last_time, &account, last_price);
         self.inner.on_fill(&mut ctx, &fill)?;
         Ok(ctx.orders)
     }

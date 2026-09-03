@@ -115,6 +115,81 @@ struct JobRecord {
     #[serde(skip_serializing)]
     parameters_json: String,
     costs_enabled: bool,
+    /// Where a running job is, parsed from the engine's streamed `progress:` lines.
+    #[serde(default, skip_deserializing)]
+    progress: Option<JobProgress>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct JobProgress {
+    stage: String,
+    done: u64,
+    total: u64,
+    percent: f64,
+    label: String,
+    elapsed_seconds: u64,
+}
+
+/// Reads the tail of a running job's worker log and returns the latest progress line.
+fn job_progress(root: &Path, job: &JobRecord) -> Option<JobProgress> {
+    if job.status != "running" {
+        return None;
+    }
+    let path = root.join(&job.log_path);
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail = 16 * 1024;
+    if len > tail {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(len - tail)).ok()?;
+    }
+    let mut text = String::new();
+    use std::io::Read;
+    file.read_to_string(&mut text).ok()?;
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("progress: "))?;
+    parse_progress_line(line)
+}
+
+/// `progress: <stage> <done>/<total> <label...> elapsed=<seconds>s`
+fn parse_progress_line(line: &str) -> Option<JobProgress> {
+    let rest = line.strip_prefix("progress: ")?;
+    let mut parts = rest.split_whitespace();
+    let stage = parts.next()?.to_owned();
+    let (done, total) = parts.next()?.split_once('/')?;
+    let done: u64 = done.parse().ok()?;
+    let total: u64 = total.parse().ok()?;
+    let mut label = Vec::new();
+    let mut elapsed_seconds = 0;
+    for part in parts {
+        if let Some(value) = part.strip_prefix("elapsed=") {
+            elapsed_seconds = value.trim_end_matches('s').parse().unwrap_or(0);
+        } else {
+            label.push(part);
+        }
+    }
+    let percent = if total == 0 {
+        100.0
+    } else {
+        (done as f64 / total as f64 * 100.0).min(100.0)
+    };
+    Some(JobProgress {
+        stage,
+        done,
+        total,
+        percent,
+        label: label.join(" "),
+        elapsed_seconds,
+    })
+}
+
+fn attach_progress(root: &Path, mut jobs: Vec<JobRecord>) -> Vec<JobRecord> {
+    for job in &mut jobs {
+        job.progress = job_progress(root, job);
+    }
+    jobs
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3877,7 +3952,7 @@ fn load_dashboard(state: &AppState) -> Result<DashboardResponse> {
     let connection = state.database.lock().expect("database lock poisoned");
     let strategies = query_strategies(&connection)?;
     let recent_runs = query_runs(&connection, 6)?;
-    let jobs = query_jobs(&connection, 8)?;
+    let jobs = attach_progress(&state.root, query_jobs(&connection, 8)?);
     let historical_reports =
         connection.query_row("SELECT COUNT(*) FROM runs WHERE legacy = 1", [], |row| {
             row.get::<_, i64>(0)
@@ -4470,6 +4545,7 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         error: row.get(10)?,
         parameters_json: row.get(11)?,
         costs_enabled: row.get::<_, i64>(12)? != 0,
+        progress: None,
     })
 }
 
@@ -4838,7 +4914,10 @@ fn load_job(state: &AppState, job_id: &str) -> Result<JobRecord> {
 
 fn load_jobs(state: &AppState, limit: usize) -> Result<Vec<JobRecord>> {
     let connection = state.database.lock().expect("database lock poisoned");
-    query_jobs(&connection, limit)
+    Ok(attach_progress(
+        &state.root,
+        query_jobs(&connection, limit)?,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -4958,6 +5037,16 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
     let mut outputs = Vec::new();
     match plan {
         JobExecutionPlan::Standard(command_name) => {
+            // stderr streams straight into worker.log while the engine runs so progress
+            // lines are visible before the job finishes; stdout is captured as before.
+            let live_log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            {
+                use std::io::Write;
+                writeln!(&live_log, "--- simulation stderr (live) ---")?;
+            }
             let output = Command::new(&engine)
                 .current_dir(&state.root)
                 .arg(command_name)
@@ -4969,6 +5058,7 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
                 .arg(&job.end_date)
                 .arg("--output-dir")
                 .arg(&output_dir)
+                .stderr(std::process::Stdio::from(live_log))
                 .output()
                 .await?;
             outputs.push(("simulation", output));
@@ -4995,7 +5085,8 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
         .last()
         .map(|(_, output)| output.status.code().unwrap_or(-1))
         .unwrap_or(-1);
-    let mut log = Vec::new();
+    let mut log = fs::read(&log_path).unwrap_or_default();
+    log.push(b'\n');
     for (label, output) in &outputs {
         log.extend_from_slice(format!("--- {label} stdout ---\n").as_bytes());
         log.extend_from_slice(&output.stdout);
@@ -5082,6 +5173,23 @@ impl axum::response::IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_engine_progress_lines() {
+        let progress =
+            super::parse_progress_line("progress: replay 312/1926 2021-03-04 elapsed=17s")
+                .expect("parsed");
+        assert_eq!(progress.stage, "replay");
+        assert_eq!((progress.done, progress.total), (312, 1926));
+        assert_eq!(progress.label, "2021-03-04");
+        assert_eq!(progress.elapsed_seconds, 17);
+        assert!((progress.percent - 16.2).abs() < 0.1);
+        let load =
+            super::parse_progress_line("progress: load 17108/17993 symbols loaded elapsed=0s")
+                .expect("parsed");
+        assert_eq!(load.label, "symbols loaded");
+        assert!(super::parse_progress_line("not progress").is_none());
+    }
+
     use super::*;
 
     #[test]
