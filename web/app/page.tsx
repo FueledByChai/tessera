@@ -3480,7 +3480,7 @@ function SdkForm({
             <small>
               {manifest.screen_universe
                 ? "daily screen picks the intraday candidates"
-                : "explicit lists load every symbol up front; no cap, but large intraday lists use more memory"}
+                : "explicit lists load every symbol up front; no cap. Intraday bars across a whole universe exceed memory for long windows, and the engine refuses such runs up front"}
             </small>
           </label>
           {!universe && (

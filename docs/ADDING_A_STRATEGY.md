@@ -82,6 +82,13 @@ sized against:
 - **Tick floor.** Fill prices never round below one tick, so a slippage tick cannot produce a zero
   or negative price.
 
+**Memory budget.** Standard-mode runs hold every selected symbol's bars for the window. Before
+reading any file the runner estimates the bar count from file sizes and date spans and refuses runs
+above half of physical memory (override with `TESSERA_MEMORY_BUDGET_GB`), naming the estimate and
+the alternatives: shorter window, fewer symbols, daily bars, or a screened-universe strategy, which
+loads intraday data only for candidate days. A 5-minute replay of all US stocks over six years is
+about 774 million bars, roughly 93 GB.
+
 The all-US-stocks RSI run that motivated these guards sized 10% of equity at a $0.0001 reference
 price, filled at the $0.01 tick (8.7x equity), paid $1.7M in commission, and kept trading with
 negative equity. Rejected fills appear as `OrderRejected` events with the reason.

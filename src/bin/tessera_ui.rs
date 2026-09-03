@@ -3713,7 +3713,7 @@ async fn run_eod_update(state: AppState, id: &str) -> Result<()> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&log_path, log)?;
+    fs::write(&log_path, &log)?;
     let finished_at = Utc::now().to_rfc3339();
     let connection = state.database.lock().expect("database lock poisoned");
     if output.status.success() {
@@ -5142,7 +5142,7 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
         log.extend_from_slice(&output.stderr);
         log.push(b'\n');
     }
-    fs::write(&log_path, log)?;
+    fs::write(&log_path, &log)?;
     let finished_at = Utc::now().to_rfc3339();
     let metrics_dir = report_path
         .parent()
@@ -5171,7 +5171,16 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
             ],
         )?;
     } else {
-        let error = format!("tessera exited with code {exit_code}; see {}", job.log_path);
+        // Surface the engine's own reason (its last `Error:` line) instead of just the code.
+        let reason = String::from_utf8_lossy(&log)
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("Error:"))
+            .map(|line| line.trim_start_matches("Error:").trim().to_owned());
+        let error = match reason {
+            Some(reason) => format!("{reason} (exit code {exit_code}; see {})", job.log_path),
+            None => format!("tessera exited with code {exit_code}; see {}", job.log_path),
+        };
         connection.execute(
             "UPDATE jobs SET status='failed', finished_at=?2, error=?3 WHERE id=?1",
             params![job_id, finished_at, error],

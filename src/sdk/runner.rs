@@ -12,6 +12,7 @@
 //! tens of thousands of symbols memory-bounded.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -390,6 +391,129 @@ pub fn default_max_gross_exposure(
     (position_percent * slots).max(1.0)
 }
 
+/// Approximate resident bytes per bar in standard mode: the parsed bar plus its copy in
+/// the per-session tables (String key, map node, market bar).
+const BYTES_PER_BAR_ESTIMATE: f64 = 120.0;
+
+/// Estimates how many bars the standard loader would hold for `[from, end]` from file sizes
+/// and each file's first and last dates, then compares against the memory budget. The
+/// budget is half of physical memory unless `TESSERA_MEMORY_BUDGET_GB` says otherwise.
+fn check_memory_budget(config: &SdkRunConfig, from: NaiveDate, end: NaiveDate) -> Result<()> {
+    let bytes_per_row = match config.data.resolution {
+        Resolution::Daily => 60.0,
+        Resolution::FiveMinute | Resolution::OneMinute => 84.0,
+    };
+    let estimated_bars: f64 = config
+        .data
+        .symbols
+        .par_iter()
+        .map(|symbol| {
+            let path = config.symbol_file(symbol);
+            estimate_rows_in_window(&path, bytes_per_row, from, end).unwrap_or(0.0)
+        })
+        .sum();
+    let estimated_bytes = estimated_bars * BYTES_PER_BAR_ESTIMATE;
+    let budget = memory_budget_bytes();
+    if estimated_bytes > budget {
+        bail!(
+            "this run needs roughly {:.1} GB for about {:.0} million {} bars across {} symbols, \
+             above the {:.1} GB memory budget. Use a shorter window, fewer symbols, daily bars, \
+             or a screened-universe strategy that loads intraday data only for candidate days \
+             (override the budget with TESSERA_MEMORY_BUDGET_GB).",
+            estimated_bytes / 1e9,
+            estimated_bars / 1e6,
+            config.data.resolution.label(),
+            config.data.symbols.len(),
+            budget / 1e9
+        );
+    }
+    Ok(())
+}
+
+/// Rows of `path` that fall in `[from, end]`, estimated from the file size and the share
+/// of the file's date span that overlaps the window. Reads only the head and tail.
+fn estimate_rows_in_window(
+    path: &Path,
+    bytes_per_row: f64,
+    from: NaiveDate,
+    end: NaiveDate,
+) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len < 64 {
+        return Some(0.0);
+    }
+    let mut head = vec![0u8; len.min(512) as usize];
+    file.read_exact(&mut head).ok()?;
+    let head = String::from_utf8_lossy(&head);
+    let first = head.lines().nth(1).and_then(first_date_in_row)?;
+    let tail_len = len.min(512);
+    file.seek(SeekFrom::Start(len - tail_len)).ok()?;
+    let mut tail = vec![0u8; tail_len as usize];
+    file.read_exact(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let last = tail
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(first_date_in_row)?;
+    if last < first {
+        return Some(0.0);
+    }
+    let span_days = (last - first).num_days().max(1) as f64;
+    let overlap_start = from.max(first);
+    let overlap_end = end.min(last);
+    if overlap_end < overlap_start {
+        return Some(0.0);
+    }
+    let overlap_days = ((overlap_end - overlap_start).num_days() + 1) as f64;
+    let rows = len as f64 / bytes_per_row;
+    Some(rows * (overlap_days / span_days).min(1.0))
+}
+
+/// Date of a CSV row: daily rows start with `YYYY-MM-DD`; intraday rows carry a UTC epoch
+/// in the first column.
+fn first_date_in_row(line: &str) -> Option<NaiveDate> {
+    let first = line.split(',').next()?.trim();
+    if let Ok(date) = NaiveDate::parse_from_str(first, "%Y-%m-%d") {
+        return Some(date);
+    }
+    let epoch: i64 = first.parse().ok()?;
+    Some(chrono::DateTime::from_timestamp(epoch, 0)?.date_naive())
+}
+
+fn memory_budget_bytes() -> f64 {
+    if let Some(gb) = env::var("TESSERA_MEMORY_BUDGET_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+    {
+        return gb * 1e9;
+    }
+    physical_memory_bytes().map_or(8e9, |bytes| bytes * 0.5)
+}
+
+fn physical_memory_bytes() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        return String::from_utf8_lossy(&output.stdout).trim().parse().ok();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = fs::read_to_string("/proc/meminfo").ok()?;
+        let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
+        let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        return Some(kb * 1024.0);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Calendar days of history to read before `start` so `warmup_bars` completed bars are
 /// available: bars per session for the resolution, doubled to cover weekends and holidays.
 fn warmup_horizon_days(warmup_bars: usize, resolution: Resolution) -> i64 {
@@ -635,6 +759,14 @@ fn plan_standard(
             manifest.warmup_bars,
             config.data.resolution,
         ));
+    // Refuse runs that cannot fit in memory before reading a single full file. Standard mode
+    // holds every selected symbol's bars for the window; a 5-minute replay of all US stocks
+    // over several years is hundreds of gigabytes and would only thrash swap.
+    check_memory_budget(config, load_from, end)?;
+    let load_counter = std::sync::atomic::AtomicUsize::new(0);
+    let load_started = std::time::Instant::now();
+    let load_last_report = Mutex::new(std::time::Instant::now());
+    let total_symbols = config.data.symbols.len();
     let loaded = config
         .data
         .symbols
@@ -647,6 +779,16 @@ fn plan_standard(
                     "{} data is not available for {symbol}",
                     config.data.resolution.label()
                 );
+                let done = load_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Ok(mut last) = load_last_report.try_lock() {
+                    if last.elapsed().as_millis() >= 1000 {
+                        *last = std::time::Instant::now();
+                        eprintln!(
+                            "progress: load {done}/{total_symbols} symbols elapsed={}s",
+                            load_started.elapsed().as_secs()
+                        );
+                    }
+                }
                 let mut bars = match config.data.resolution {
                     Resolution::Daily => load_daily(&path)?,
                     Resolution::FiveMinute | Resolution::OneMinute => {
@@ -675,9 +817,10 @@ fn plan_standard(
         )
         .collect::<Result<Vec<_>>>()?;
     eprintln!(
-        "progress: load {}/{} symbols loaded elapsed=0s",
+        "progress: load {}/{} symbols loaded elapsed={}s",
         loaded.iter().filter(|entry| entry.is_some()).count(),
-        loaded.len()
+        loaded.len(),
+        load_started.elapsed().as_secs()
     );
     let mut active: Vec<String> = Vec::new();
     for (symbol, bars, daily) in loaded.into_iter().flatten() {
