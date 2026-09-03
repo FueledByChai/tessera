@@ -1,6 +1,5 @@
 # Tessera
 
-*Tessera* (Latin: one tile of a mosaic). Bars, fills, and runs are the tiles; the portfolio is the picture.
 
 ![Tessera run view: the bundled moving-average-cross example, terminal display mode](docs/images/tessera-dashboard.png)
 
