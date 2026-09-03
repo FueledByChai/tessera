@@ -654,6 +654,9 @@ async fn main() -> Result<()> {
         .route("/api/runs/{id}/report", get(run_report))
         .route("/api/runs/{id}/star", post(set_run_star))
         .route("/api/sweeps", get(list_sweeps).post(create_sweep))
+        .route("/api/studies", get(list_studies).post(create_study))
+        .route("/api/studies/{id}", get(study_detail))
+        .route("/api/lake/instruments", get(lake_instruments))
         .route("/api/sweeps/{id}", get(sweep_detail))
         .route(
             "/api/portfolios",
@@ -763,6 +766,18 @@ fn migrate(connection: &Connection) -> Result<()> {
              regime_ok INTEGER NOT NULL,
              candidate_count INTEGER NOT NULL,
              immutable INTEGER NOT NULL DEFAULT 1
+         );
+         CREATE TABLE IF NOT EXISTS studies (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             status TEXT NOT NULL,
+             start_date TEXT NOT NULL,
+             end_date TEXT NOT NULL,
+             config_json TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             finished_at TEXT,
+             error TEXT,
+             artifact_dir TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS sweeps (
              id TEXT PRIMARY KEY,
@@ -1334,6 +1349,7 @@ struct InstrumentDataRoots {
     five_minute_dir: PathBuf,
     one_minute_dir: PathBuf,
     universe_dir: PathBuf,
+    lake_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1349,6 +1365,9 @@ struct InstrumentRecord {
     daily: bool,
     five_minute: bool,
     one_minute: bool,
+    /// Tick data in the parquet lake: second resolutions and book features available.
+    #[serde(default)]
+    tick: bool,
     #[serde(skip)]
     name_upper: String,
 }
@@ -1428,6 +1447,7 @@ fn instrument_data_roots(state: &AppState) -> Result<InstrumentDataRoots> {
         five_minute_dir: data.five_minute_dir.clone(),
         one_minute_dir: data.one_minute_dir.clone(),
         universe_dir: data.catalog_dir.clone(),
+        lake_dir: data.lake_dir.clone(),
     })
 }
 
@@ -1522,6 +1542,7 @@ fn read_instrument_catalog(
             daily: false,
             five_minute: false,
             one_minute: false,
+            tick: false,
         });
     }
     Ok(())
@@ -1571,6 +1592,7 @@ fn build_instrument_index(roots: InstrumentDataRoots) -> Result<InstrumentIndex>
             daily: daily.contains(&symbol),
             five_minute: five_minute.contains(&symbol),
             one_minute: one_minute.contains(&symbol),
+            tick: false,
             asset_class: classify_instrument("", &suffix),
             exchange: suffix.clone(),
             symbol,
@@ -1581,6 +1603,42 @@ fn build_instrument_index(roots: InstrumentDataRoots) -> Result<InstrumentIndex>
             currency: String::new(),
             status: "uncataloged".to_owned(),
         });
+    }
+    if let Some(lake) = roots.lake_dir.as_deref() {
+        match tessera::lake::discover(lake) {
+            Ok(instruments) => {
+                for instrument in instruments {
+                    let symbol = format!("{}:{}", instrument.exchange, instrument.symbol);
+                    records.push(InstrumentRecord {
+                        daily: false,
+                        five_minute: false,
+                        one_minute: false,
+                        tick: instrument.has_trades,
+                        asset_class: "Crypto".to_owned(),
+                        exchange: instrument.exchange.clone(),
+                        code: instrument.symbol.clone(),
+                        suffix: instrument.exchange.clone(),
+                        name: format!(
+                            "{} tick data {} to {} ({} days{})",
+                            instrument.exchange,
+                            instrument.first_date,
+                            instrument.last_date,
+                            instrument.days,
+                            if instrument.has_book { ", L2 book" } else { "" }
+                        ),
+                        name_upper: format!(
+                            "{} {} {}",
+                            instrument.exchange, instrument.symbol, "TICK CRYPTO"
+                        )
+                        .to_ascii_uppercase(),
+                        currency: String::new(),
+                        status: "tick".to_owned(),
+                        symbol,
+                    });
+                }
+            }
+            Err(error) => eprintln!("lake discovery failed: {error:#}"),
+        }
     }
     records.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     Ok(InstrumentIndex {
@@ -1601,10 +1659,12 @@ fn comma_list(value: Option<&str>) -> Vec<String> {
 }
 
 fn has_resolution(record: &InstrumentRecord, resolution: &str) -> bool {
+    // Tick records can build any intraday bar from trades; only daily is off the table.
     match resolution.to_ascii_lowercase().as_str() {
         "daily" | "eod" | "d" | "1d" => record.daily,
-        "5m" | "five_minute" => record.five_minute,
-        "1m" | "one_minute" => record.one_minute,
+        "5m" | "five_minute" => record.five_minute || record.tick,
+        "1m" | "one_minute" => record.one_minute || record.tick,
+        other if other.ends_with('s') => record.tick,
         _ => true,
     }
 }
@@ -2116,6 +2176,22 @@ fn build_sdk_run_config(
         .unwrap_or_else(|| vec![serde_json::json!("SPY.US")]);
     let symbols = expand_sdk_universe(state, &requested)?;
     anyhow::ensure!(!symbols.is_empty(), "select at least one symbol");
+    {
+        let lake_symbols = symbols
+            .iter()
+            .filter(|symbol| tessera::lake::is_lake_symbol(symbol))
+            .count();
+        if lake_symbols > 0 {
+            anyhow::ensure!(
+                state.local.data.lake_dir.is_some(),
+                "EXCHANGE:SYMBOL instruments need lake_dir in local.toml"
+            );
+            anyhow::ensure!(
+                lake_symbols == symbols.len(),
+                "mix of tick-lake instruments (EXCHANGE:SYMBOL) and CSV symbols in one run is not supported"
+            );
+        }
+    }
     // No symbol cap: standard-mode strategies load every selected symbol's bars up front,
     // so very large explicit lists at intraday resolution trade memory for convenience.
     // Screened-universe strategies stream candidates instead.
@@ -3744,6 +3820,251 @@ async fn run_eod_update(state: AppState, id: &str) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Feature studies on the tick lake (feature vs forward return).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StudyRecord {
+    id: String,
+    name: String,
+    status: String,
+    start_date: String,
+    end_date: String,
+    config_json: String,
+    created_at: String,
+    finished_at: Option<String>,
+    error: Option<String>,
+    artifact_dir: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CreateStudyRequest {
+    name: String,
+    start_date: String,
+    end_date: String,
+    symbols: Vec<String>,
+    #[serde(default = "default_study_step")]
+    step_secs: u32,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    horizons: Vec<usize>,
+    #[serde(default)]
+    decision_delay_bars: usize,
+}
+
+fn default_study_step() -> u32 {
+    1
+}
+
+#[derive(Debug, Serialize)]
+struct StudyDetailResponse {
+    study: StudyRecord,
+    result: Option<serde_json::Value>,
+}
+
+fn query_studies(connection: &Connection, limit: usize) -> Result<Vec<StudyRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, name, status, start_date, end_date, config_json, created_at, finished_at, error, artifact_dir
+         FROM studies ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit as i64], |row| {
+        Ok(StudyRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            status: row.get(2)?,
+            start_date: row.get(3)?,
+            end_date: row.get(4)?,
+            config_json: row.get(5)?,
+            created_at: row.get(6)?,
+            finished_at: row.get(7)?,
+            error: row.get(8)?,
+            artifact_dir: row.get(9)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+async fn list_studies(State(state): State<AppState>) -> Result<Json<Vec<StudyRecord>>, ApiError> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    Ok(Json(query_studies(&connection, 50)?))
+}
+
+async fn lake_instruments(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<tessera::lake::LakeInstrument>>, ApiError> {
+    let Some(lake) = state.local.data.lake_dir.clone() else {
+        return Ok(Json(Vec::new()));
+    };
+    let instruments = tokio::task::spawn_blocking(move || tessera::lake::discover(&lake))
+        .await
+        .context("lake discovery task failed")??;
+    Ok(Json(instruments))
+}
+
+async fn study_detail(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<StudyDetailResponse>, ApiError> {
+    let study = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        query_studies(&connection, 1000)?
+            .into_iter()
+            .find(|study| study.id == id)
+            .context("unknown study")?
+    };
+    let path = state.root.join(&study.artifact_dir).join("study.json");
+    let result = tokio::task::spawn_blocking(move || {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    })
+    .await
+    .context("study read task failed")?;
+    Ok(Json(StudyDetailResponse { study, result }))
+}
+
+async fn create_study(
+    State(state): State<AppState>,
+    Json(request): Json<CreateStudyRequest>,
+) -> Result<(StatusCode, Json<StudyRecord>), ApiError> {
+    let (config, start, end) = validate_study_request(&state, &request)?;
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.6fZ").to_string();
+    let id = format!("study-{stamp}");
+    let artifact_dir = format!("artifacts/studies/{stamp}");
+    let record = StudyRecord {
+        id: id.clone(),
+        name: request.name.trim().to_owned(),
+        status: "running".to_owned(),
+        start_date: request.start_date.clone(),
+        end_date: request.end_date.clone(),
+        config_json: serde_json::to_string(&config)?,
+        created_at: Utc::now().to_rfc3339(),
+        finished_at: None,
+        error: None,
+        artifact_dir: artifact_dir.clone(),
+    };
+    insert_study(&state, &record)?;
+    spawn_study(state, id, artifact_dir, config, start, end);
+    Ok((StatusCode::ACCEPTED, Json(record)))
+}
+
+fn validate_study_request(
+    state: &AppState,
+    request: &CreateStudyRequest,
+) -> Result<(tessera::study::StudyConfig, NaiveDate, NaiveDate)> {
+    let lake_dir = state
+        .local
+        .data
+        .lake_dir
+        .clone()
+        .context("studies need lake_dir in local.toml")?;
+    anyhow::ensure!(!request.name.trim().is_empty(), "name the study");
+    anyhow::ensure!(
+        !request.symbols.is_empty(),
+        "select at least one lake instrument"
+    );
+    for symbol in &request.symbols {
+        anyhow::ensure!(
+            tessera::lake::is_lake_symbol(symbol),
+            "{symbol} is not an EXCHANGE:SYMBOL lake instrument"
+        );
+    }
+    let start = NaiveDate::parse_from_str(&request.start_date, "%Y-%m-%d")
+        .context("start_date must use YYYY-MM-DD")?;
+    let end = NaiveDate::parse_from_str(&request.end_date, "%Y-%m-%d")
+        .context("end_date must use YYYY-MM-DD")?;
+    anyhow::ensure!(start <= end, "start_date must be on or before end_date");
+    anyhow::ensure!(
+        request.step_secs > 0 && request.step_secs < 60 && 60 % request.step_secs == 0,
+        "step_secs must divide a minute (1, 2, 5, 10, 15, 30)"
+    );
+    let config = tessera::study::StudyConfig {
+        lake_dir,
+        symbols: request.symbols.clone(),
+        step_secs: request.step_secs,
+        features: if request.features.is_empty() {
+            tessera::study::FEATURES
+                .iter()
+                .map(|f| (*f).to_owned())
+                .collect()
+        } else {
+            request.features.clone()
+        },
+        horizons: if request.horizons.is_empty() {
+            vec![1, 5, 30, 60]
+        } else {
+            request.horizons.clone()
+        },
+        decision_delay_bars: request.decision_delay_bars,
+        buckets: 10,
+    };
+    for feature in &config.features {
+        anyhow::ensure!(
+            tessera::study::FEATURES.contains(&feature.as_str()),
+            "unknown feature {feature}"
+        );
+    }
+    Ok((config, start, end))
+}
+
+fn insert_study(state: &AppState, record: &StudyRecord) -> Result<()> {
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "INSERT INTO studies (id, name, status, start_date, end_date, config_json, created_at, artifact_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.id,
+                record.name,
+                record.status,
+                record.start_date,
+                record.end_date,
+                record.config_json,
+                record.created_at,
+                record.artifact_dir
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn spawn_study(
+    state: AppState,
+    id: String,
+    artifact_dir: String,
+    config: tessera::study::StudyConfig,
+    start: NaiveDate,
+    end: NaiveDate,
+) {
+    let worker_state = state;
+    let worker_config = config;
+    tokio::spawn(async move {
+        let output_dir = worker_state.root.join(&artifact_dir);
+        let result = tokio::task::spawn_blocking(move || {
+            fs::create_dir_all(&output_dir)?;
+            let config_path = output_dir.join("study_config.toml");
+            fs::write(&config_path, toml::to_string_pretty(&worker_config)?)?;
+            tessera::study::run(&worker_config, start, end, &output_dir).map(|_| ())
+        })
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("study task failed: {error}")));
+        let (status, error) = match result {
+            Ok(()) => ("complete", None),
+            Err(error) => ("failed", Some(format!("{error:#}"))),
+        };
+        let connection = worker_state
+            .database
+            .lock()
+            .expect("database lock poisoned");
+        let _ = connection.execute(
+            "UPDATE studies SET status=?2, finished_at=?3, error=?4 WHERE id=?1",
+            params![id, status, Utc::now().to_rfc3339(), error],
+        );
+    });
 }
 
 async fn create_job(

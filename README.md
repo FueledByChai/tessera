@@ -50,6 +50,10 @@ exposed as form fields. No registry edits, no module lists.
   or alphabetical tie-breaks when more signals fire than the limits allow.
 - **Universe-scale runs**: explicit symbol lists have no cap; a six-year daily replay across all
   US common stocks (about 18,000 symbols) runs in about a minute, with live progress in the UI.
+- **Tick data and order-book features**: point `lake_dir` at a parquet lake of trades and L2
+  book events and run strategies on 1s/5s/30s bars with bid/ask, microprice, spread, and
+  order-book imbalance on every bar. A feature study (CLI and UI) measures information
+  coefficients and decile returns at several horizons before you write the strategy.
 - **Universe screening**: strategies can screen a daily universe and the engine loads intraday
   data only for candidate symbol-days, so a year across all US common stocks runs in seconds.
 - **Costs**: tick slippage and per-unit commission or an all-in round-trip basis-point charge,

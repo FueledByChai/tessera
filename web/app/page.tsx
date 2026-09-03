@@ -38,7 +38,8 @@ type View =
   | "run"
   | "data"
   | "costs"
-  | "code";
+  | "code"
+  | "studies";
 type Strategy = {
   id: string;
   name: string;
@@ -233,6 +234,7 @@ type InstrumentHit = {
   daily: boolean;
   five_minute: boolean;
   one_minute: boolean;
+  tick?: boolean;
   coverage: Record<string, { first: string; last: string }>;
   missing_resolutions: string[];
 };
@@ -529,6 +531,7 @@ const navItems: [string, string, View | "new"][] = [
   ["Runs", "▤", "runs"],
   ["Compare", "⇄", "compare"],
   ["Portfolios", "◫", "portfolios"],
+  ["Studies", "∿", "studies"],
   ["Data", "▦", "data"],
   ["Costs", "¢", "costs"],
   ["Code", "</>", "code"],
@@ -1312,6 +1315,316 @@ function MultiRunChart({ details }: { details: RunDetail[] }) {
           />
         ))}
       </svg>
+    </div>
+  );
+}
+
+type StudyRecord = {
+  id: string;
+  name: string;
+  status: string;
+  start_date: string;
+  end_date: string;
+  config_json: string;
+  created_at: string;
+  finished_at?: string | null;
+  error?: string | null;
+};
+type StudyCell = {
+  symbol: string;
+  feature: string;
+  horizon_bars: number;
+  horizon_secs: number;
+  observations: number;
+  ic: number;
+  top_minus_bottom_bps: number;
+  top_minus_bottom_t: number;
+  buckets: { bucket: number; count: number; feature_mean: number; forward_bps: number }[];
+};
+type StudyResult = {
+  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number };
+  start: string;
+  end: string;
+  symbols: { symbol: string; bars: number; bars_with_book: number }[];
+  cells: StudyCell[];
+};
+type LakeInstrument = {
+  exchange: string;
+  symbol: string;
+  first_date: string;
+  last_date: string;
+  days: number;
+  has_book: boolean;
+};
+
+const STUDY_FEATURES = [
+  ["obi_l1", "OBI L1 (touch)"],
+  ["obi_l5", "OBI L5"],
+  ["obi_l10", "OBI L10"],
+  ["microprice_bps", "Microprice dev (bps)"],
+  ["trade_imbalance", "Trade imbalance"],
+  ["spread_bps", "Spread (bps)"],
+  ["return_1", "Last bar return (bps)"],
+  ["signed_volume", "Signed volume"],
+] as const;
+
+function icClass(value: number) {
+  if (!Number.isFinite(value)) return "";
+  if (Math.abs(value) < 0.01) return "";
+  return value > 0 ? "positive" : "negative";
+}
+
+/** Feature studies on the tick lake: create, list, and read IC / decile tables. */
+function StudiesWorkspace() {
+  const [instruments, setInstruments] = useState<LakeInstrument[]>([]);
+  const [studies, setStudies] = useState<StudyRecord[]>([]);
+  const [selected, setSelected] = useState<string>("");
+  const [detail, setDetail] = useState<{ study: StudyRecord; result: StudyResult | null } | null>(null);
+  const [symbols, setSymbols] = useState<string[]>([]);
+  const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id));
+  const [step, setStep] = useState(1);
+  const [horizons, setHorizons] = useState("1,5,30,60");
+  const [delay, setDelay] = useState(1);
+  const [scope, setScope] = useState("ALL");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const refresh = useCallback(async () => {
+    const [i, s] = await Promise.all([
+      fetch(`${API}/lake/instruments`, { cache: "no-store" }),
+      fetch(`${API}/studies`, { cache: "no-store" }),
+    ]);
+    if (i.ok) setInstruments(await i.json());
+    if (s.ok) setStudies(await s.json());
+  }, []);
+  useEffect(() => {
+    const initial = window.setTimeout(() => void refresh(), 0);
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, [refresh]);
+  useEffect(() => {
+    if (!selected) return;
+    let cancelled = false;
+    fetch(`${API}/studies/${selected}`, { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body: { study: StudyRecord; result: StudyResult | null } | null) => {
+        if (!cancelled && body) setDetail(body);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [selected, studies]);
+
+  const minDate = instruments.reduce((m, i) => (m && m < i.first_date ? m : i.first_date), "");
+  const maxDate = instruments.reduce((m, i) => (m > i.last_date ? m : i.last_date), "");
+  const result = detail?.result ?? null;
+  const symbolsInResult = result ? Array.from(new Set(result.cells.map((c) => c.symbol))) : [];
+  const scopeSymbol = symbolsInResult.includes(scope) ? scope : symbolsInResult.includes("ALL") ? "ALL" : symbolsInResult[0];
+  const cells = result ? result.cells.filter((c) => c.symbol === scopeSymbol) : [];
+  const horizonList = result ? result.config.horizons : [];
+  const featureList = result ? result.config.features : [];
+  const cellFor = (feature: string, horizon: number) => cells.find((c) => c.feature === feature && c.horizon_bars === horizon);
+  const [bucketFeature, setBucketFeature] = useState("obi_l1");
+  const [bucketHorizon, setBucketHorizon] = useState<number | null>(null);
+  const bucketCell = cellFor(featureList.includes(bucketFeature) ? bucketFeature : featureList[0] ?? "", bucketHorizon ?? horizonList[1] ?? horizonList[0] ?? 1);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/studies`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: form.get("name"),
+          start_date: form.get("start_date"),
+          end_date: form.get("end_date"),
+          symbols,
+          step_secs: step,
+          features,
+          horizons: horizons.split(",").map((h) => Number(h.trim())).filter((h) => h > 0),
+          decision_delay_bars: delay,
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error);
+      setSelected(body.id);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="studies-workspace">
+      <section className="panel">
+        <div className="terminal-panel-title"><span>STD</span> NEW FEATURE STUDY · tick lake</div>
+        {instruments.length === 0 ? (
+          <div className="empty-state">No tick lake configured. Set <code>lake_dir</code> in local.toml to a parquet lake with trades, book_snapshots, and book_events.</div>
+        ) : (
+          <form onSubmit={submit} noValidate>
+            <div className="sweep-form-grid">
+              <label>
+                Study name
+                <input name="name" defaultValue="OBI vs forward return" maxLength={80} required />
+              </label>
+              <label>
+                Start
+                <input name="start_date" type="date" defaultValue={minDate} min={minDate} max={maxDate} required />
+              </label>
+              <label>
+                End
+                <input name="end_date" type="date" defaultValue={maxDate} min={minDate} max={maxDate} required />
+              </label>
+              <label>
+                Sampling grid
+                <select value={step} onChange={(e) => setStep(Number(e.target.value))}>
+                  {[1, 2, 5, 10, 15, 30].map((s) => (
+                    <option key={s} value={s}>{s} second{s > 1 ? "s" : ""}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Horizons (bars)
+                <input value={horizons} onChange={(e) => setHorizons(e.target.value)} />
+                <small>comma-separated, in bars of the grid</small>
+              </label>
+              <label>
+                Decision delay (bars)
+                <input type="number" min="0" max="60" value={delay} onChange={(e) => setDelay(Math.max(0, Math.round(Number(e.target.value))))} />
+                <small>bars between seeing the book and acting</small>
+              </label>
+            </div>
+            <div className="study-pick-grid">
+              <fieldset>
+                <legend>Instruments</legend>
+                {instruments.map((i) => {
+                  const id = `${i.exchange}:${i.symbol}`;
+                  return (
+                    <label key={id} className="check-row">
+                      <input
+                        type="checkbox"
+                        checked={symbols.includes(id)}
+                        onChange={(e) => setSymbols(e.target.checked ? [...symbols, id] : symbols.filter((s) => s !== id))}
+                      />
+                      <span>{id}</span>
+                      <small>{i.first_date} → {i.last_date} · {i.days}d{i.has_book ? " · L2" : ""}</small>
+                    </label>
+                  );
+                })}
+              </fieldset>
+              <fieldset>
+                <legend>Features</legend>
+                {STUDY_FEATURES.map(([id, label]) => (
+                  <label key={id} className="check-row">
+                    <input
+                      type="checkbox"
+                      checked={features.includes(id)}
+                      onChange={(e) => setFeatures(e.target.checked ? [...features, id] : features.filter((f) => f !== id))}
+                    />
+                    <span>{label}</span>
+                    <small>{id}</small>
+                  </label>
+                ))}
+              </fieldset>
+            </div>
+            {error && <p className="negative-text">{error}</p>}
+            <div className="sweep-submit">
+              <span>{symbols.length} instruments · {features.length} features · grid {step}s</span>
+              <button className="primary-action" disabled={busy || symbols.length === 0 || features.length === 0}>
+                Run study →
+              </button>
+            </div>
+          </form>
+        )}
+      </section>
+
+      <div className="compare-grid">
+        <section className="panel sweep-history">
+          <div className="terminal-panel-title"><span>HST</span> STUDIES</div>
+          {studies.length ? studies.map((study) => (
+            <button
+              key={study.id}
+              className={selected === study.id ? "sweep-row active" : "sweep-row"}
+              onClick={() => setSelected(study.id)}
+            >
+              <strong>{study.name}</strong>
+              <span>{study.start_date} → {study.end_date}</span>
+              <em>{study.status}</em>
+            </button>
+          )) : <div className="empty-state">No studies yet.</div>}
+        </section>
+        <section className="panel sweep-results">
+          <div className="terminal-panel-title">
+            <span>IC</span> INFORMATION COEFFICIENT
+            {symbolsInResult.length > 1 && (
+              <select value={scopeSymbol} onChange={(e) => setScope(e.target.value)}>
+                {symbolsInResult.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            )}
+          </div>
+          {!detail ? <div className="empty-state">Select a study.</div> : detail.study.status === "failed" ? (
+            <div className="run-failure"><strong>Study failed</strong><span>{detail.study.error}</span></div>
+          ) : !result ? (
+            <div className="empty-state">Running… {detail.study.status}</div>
+          ) : (
+            <>
+              <div className="sweep-summary-strip">
+                <strong>{detail.study.name}</strong>
+                <span>{result.start} → {result.end} · {result.config.step_secs}s grid · delay {result.config.decision_delay_bars} bar</span>
+                <span>{result.symbols.map((s) => `${s.symbol} ${s.bars_with_book.toLocaleString()} bars`).join(" · ")}</span>
+              </div>
+              <div className="table-wrap sweep-heatmap"><table>
+                <thead><tr><th>feature ↓ / horizon →</th>{horizonList.map((h) => <th key={h}>{h * result.config.step_secs}s</th>)}</tr></thead>
+                <tbody>{featureList.map((feature) => (
+                  <tr key={feature}><th>{feature}</th>
+                    {horizonList.map((h) => {
+                      const c = cellFor(feature, h);
+                      return (
+                        <td key={h} className={c ? icClass(c.ic) : "pending-cell"} title={c ? `t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()}` : ""}>
+                          {c ? `${c.ic >= 0 ? "+" : ""}${c.ic.toFixed(4)}` : "·"}
+                          {c && <small> {c.top_minus_bottom_bps >= 0 ? "+" : ""}{c.top_minus_bottom_bps.toFixed(2)}bp</small>}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}</tbody>
+              </table></div>
+              <p className="footnote">Cell: Spearman IC, then top-minus-bottom decile forward return in bps. Hover for the t-stat and observation count.</p>
+              <div className="terminal-panel-title">
+                <span>DEC</span> DECILES
+                <select value={bucketCell?.feature ?? ""} onChange={(e) => setBucketFeature(e.target.value)}>
+                  {featureList.map((f) => <option key={f} value={f}>{f}</option>)}
+                </select>
+                <select value={bucketCell?.horizon_bars ?? ""} onChange={(e) => setBucketHorizon(Number(e.target.value))}>
+                  {horizonList.map((h) => <option key={h} value={h}>{h * result.config.step_secs}s</option>)}
+                </select>
+              </div>
+              {bucketCell && (
+                <div className="table-wrap"><table>
+                  <thead><tr><th>Decile</th><th>Feature mean</th><th>Forward (bps)</th><th>Count</th></tr></thead>
+                  <tbody>{bucketCell.buckets.map((b) => (
+                    <tr key={b.bucket}>
+                      <td>{b.bucket}</td>
+                      <td>{b.feature_mean.toFixed(4)}</td>
+                      <td className={classFor(b.forward_bps)}>{b.forward_bps >= 0 ? "+" : ""}{b.forward_bps.toFixed(3)}</td>
+                      <td>{b.count.toLocaleString()}</td>
+                    </tr>
+                  ))}</tbody>
+                </table></div>
+              )}
+            </>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
@@ -2592,9 +2905,15 @@ function InstrumentPicker({
   }
 
   const coverageChips = (hit: InstrumentHit) =>
-    (["daily", "5m", "1m"] as const).map((resolution) => {
+    (["daily", "5m", "1m", "tick"] as const).map((resolution) => {
       const present =
-        resolution === "daily" ? hit.daily : resolution === "5m" ? hit.five_minute : hit.one_minute;
+        resolution === "daily"
+          ? hit.daily
+          : resolution === "5m"
+            ? hit.five_minute
+            : resolution === "1m"
+              ? hit.one_minute
+              : Boolean(hit.tick);
       const required = requirement.resolutions.includes(resolution);
       if (!present && !required) return null;
       const range = hit.coverage[resolution];
@@ -3520,8 +3839,12 @@ function SdkForm({
               <option value="daily">Daily</option>
               <option value="5m">5 minute</option>
               <option value="1m">1 minute</option>
+              <option value="30s">30 second (tick lake)</option>
+              <option value="15s">15 second (tick lake)</option>
+              <option value="5s">5 second (tick lake)</option>
+              <option value="1s">1 second (tick lake)</option>
             </select>
-            <small>the strategy is resolution-agnostic</small>
+            <small>the strategy is resolution-agnostic; second bars need EXCHANGE:SYMBOL tick-lake instruments</small>
           </label>
           <label>
             Session
@@ -5196,6 +5519,7 @@ export default function Home() {
             />
           )}
 
+          {view === "studies" && <StudiesWorkspace />}
           {view === "portfolios" && (
             <PortfolioWorkspace
               runs={runs}

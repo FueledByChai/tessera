@@ -61,6 +61,59 @@ so a schema mismatch fails the run instead of silently falling back to a partial
 `report` command then owns all metrics, charts, tables, and HTML; strategy-specific report code is
 not permitted for a standard UI strategy.
 
+## Tick data, second bars, and book features
+
+With `lake_dir` set in `local.toml`, instruments named `EXCHANGE:SYMBOL` (for example
+`PARADEX:SOL-USD-PERP`) come from a parquet tick lake laid out as
+`<lake>/<feed>/exchange=<EX>/symbol=<SYM>/date=<YYYY-MM-DD>/*.parquet` with feeds `trades`
+(recvTimestampMicros, price, size, aggressor), `book_snapshots` (bookEpoch, anchor, bids/asks
+ladders) and `book_events` (bookEpoch, side, price, newSize, action CHANGE/DELETE). Sessions are
+UTC days.
+
+Resolutions `1s`, `5s`, `15s`, `30s` (any second count dividing a minute) build regular bars from
+trades; buckets without trades repeat the last close with zero volume. The engine rebuilds the L2
+book from snapshots and deltas (epoch resets, crossed-book repair) and samples it at every bar
+close into `bar.book`:
+
+```rust
+if let Some(book) = bar.book {
+    // book.bid, book.ask, book.mid, book.microprice, book.spread_bps,
+    // book.obi_l1 / obi_l5 / obi_l10 (in [-1, 1]), book.bid_depth_l5, book.ask_depth_l5,
+    // book.trade_count, book.buy_volume, book.sell_volume,
+    // book.trade_imbalance(), book.microprice_bps()
+    if book.obi_l1 > 0.6 && ctx.is_flat() { ctx.buy(Size::Default); }
+}
+```
+
+`bar.book` is `None` for CSV bars and for the first bars of a session until the book is rebuilt.
+`tessera lake-diagnose --lake <dir> --symbol EXCHANGE:SYMBOL --date YYYY-MM-DD` reports how often
+the rebuilt touch brackets the venue's trades; expect 97% or better on a healthy feed.
+
+## Feature studies
+
+Before writing a strategy, measure whether a feature predicts anything:
+
+```bash
+tessera study --config study.toml --start 2026-06-25 --end 2026-06-29 --output-dir artifacts/obi
+```
+
+with
+
+```toml
+lake_dir = "/path/to/lake"
+symbols = ["PARADEX:SOL-USD-PERP", "BINANCE_FUTURES:SOLUSDT"]
+step_secs = 1                       # sampling grid; horizons and delay are in bars of it
+features = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "return_1"]
+horizons = [1, 5, 30, 60]
+decision_delay_bars = 1             # bars between observing the book and acting
+```
+
+The study reports, per symbol and pooled, the Spearman rank correlation between the feature and the
+forward mid-price return (the information coefficient), decile mean forward returns in basis
+points, and a t-statistic for top-minus-bottom decile. The UI's Studies page runs the same thing
+against the configured lake. Use receive timestamps and a non-zero delay, or the edge will look
+better than it is.
+
 ## Platform sizing and price guards
 
 `Size::Default` uses the run's `position_percent` (fraction of equity). The simulated broker then

@@ -4050,3 +4050,15 @@ nav {
   text-transform: uppercase;
   font-size: 13px;
 }
+
+/* Studies workspace */
+.studies-workspace { display: flex; flex-direction: column; gap: 14px; }
+.study-pick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+.study-pick-grid fieldset { border: 1px solid #2a2a66; padding: 10px 12px; margin: 0; }
+.study-pick-grid legend { color: var(--accent, #f89828); font-size: 12px; letter-spacing: 0.08em; }
+.check-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; }
+.check-row small { color: var(--text-muted, #b8b8b8); margin-left: auto; font-size: 11px; }
+.sweep-heatmap td small { display: block; font-size: 11px; opacity: 0.8; }
+.sweep-heatmap td.positive { color: #32c832; }
+.sweep-heatmap td.negative { color: #e03040; }
+@media (max-width: 1100px) { .study-pick-grid { grid-template-columns: 1fr; } }
