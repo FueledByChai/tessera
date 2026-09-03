@@ -1491,7 +1491,7 @@ nav {
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 .catalog-table.table-wrap table {
-  font-size: 13px;
+  font-size: 18px;
   line-height: 1.3;
 }
 .catalog-table.table-wrap th,
@@ -1500,7 +1500,7 @@ nav {
   text-align: left;
 }
 .catalog-table.table-wrap th {
-  font-size: 11px;
+  font-size: 15px;
   letter-spacing: 0.06em;
   user-select: none;
 }
@@ -2806,12 +2806,12 @@ nav {
 }
 .activity-panel table,
 .table-wrap table {
-  font-size: 15px;
-  line-height: 1.45;
+  font-size: 22px;
+  line-height: 1.4;
 }
 .activity-panel th,
 .table-wrap th {
-  font-size: 13px;
+  font-size: 19px;
 }
 .activity-panel th,
 .activity-panel td,
@@ -3519,30 +3519,30 @@ nav {
 .app-shell[data-theme="terminal"] .field-grid label {
   font-size: 10px;
 }
-/* Grids: 20px rows, 12px mono, amber 10px headers. */
+/* Grids: 18px mono rows, 15px gray column headers (scaled up 50% for readability). */
 .app-shell[data-theme="terminal"] .table-wrap table,
 .app-shell[data-theme="terminal"] .activity-panel table {
-  font-size: 12px;
+  font-size: 18px;
   line-height: 1.25;
 }
 .app-shell[data-theme="terminal"] .table-wrap th,
 .app-shell[data-theme="terminal"] .table-wrap td,
 .app-shell[data-theme="terminal"] .activity-panel th,
 .app-shell[data-theme="terminal"] .activity-panel td {
-  padding: 4px 8px;
+  padding: 6px 10px;
 }
 .app-shell[data-theme="terminal"] .table-wrap th,
 .app-shell[data-theme="terminal"] .activity-panel th {
-  font-size: 10px;
+  font-size: 15px;
   letter-spacing: 0.06em;
 }
 .app-shell[data-theme="terminal"] .runs-table td.run-name strong {
-  font-size: 12px;
+  font-size: 18px;
 }
 .app-shell[data-theme="terminal"] .runs-table td:first-child small,
 .app-shell[data-theme="terminal"] .runs-table td.run-name small {
   margin-top: 1px;
-  font-size: 9px;
+  font-size: 13px;
 }
 .app-shell[data-theme="terminal"] tr:hover td {
   background: #0d2038;
