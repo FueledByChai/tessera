@@ -348,6 +348,9 @@ type ReportView = {
     pnl: number;
     return_percent: number;
     leverage?: number;
+    entry_price?: number | null;
+    exit_price?: number | null;
+    quantity?: number | null;
   }[];
   trade_breakdown: {
     scope: string;
@@ -558,6 +561,12 @@ function money(value: number | undefined) {
         maximumFractionDigits: 0,
       }).format(value);
 }
+/** Prices with enough decimals to show sub-dollar fills honestly. */
+function tradePrice(value: number) {
+  const decimals = Math.abs(value) >= 1 ? 2 : 4;
+  return value.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
 function classFor(value: number | undefined) {
   return value == null ? "" : value >= 0 ? "positive-text" : "negative-text";
 }
@@ -939,34 +948,36 @@ function RunReport({ detail }: { detail: RunDetail }) {
             <thead>
               <tr>
                 <th>Entry</th>
+                <th>Exit</th>
                 <th>Symbol</th>
                 <th>Side</th>
+                <th>Shares</th>
+                <th>Entry px</th>
+                <th>Exit px</th>
                 <th>Return</th>
                 <th>P&amp;L</th>
                 <th>Leverage</th>
-                <th>Exit</th>
               </tr>
             </thead>
             <tbody>
               {report.trades.map((trade, index) => (
                   <tr key={`${trade.trade_date}-${trade.symbol}-${index}`}>
                     <td>{trade.trade_date} {trade.entry_time.slice(11, 16)}</td>
+                    <td>{trade.exit_time.slice(0, 10)} {trade.exit_time.slice(11, 16)}</td>
                     <td>{trade.symbol}</td>
                     <td>
                       <span className={`direction ${trade.direction}`}>
                         {trade.direction ?? "—"}
                       </span>
                     </td>
+                    <td>{trade.quantity != null ? trade.quantity.toLocaleString() : "—"}</td>
+                    <td>{trade.entry_price != null ? tradePrice(trade.entry_price) : "—"}</td>
+                    <td>{trade.exit_price != null ? tradePrice(trade.exit_price) : "—"}</td>
                     <td className={classFor(trade.return_percent)}>
                       {percent(trade.return_percent, 3)}
                     </td>
                     <td className={classFor(trade.pnl)}>{money(trade.pnl)}</td>
                     <td>{number(trade.leverage)}×</td>
-                    <td>
-                      {trade.exit_time.slice(0, 10) === trade.trade_date
-                        ? trade.exit_time.slice(11, 16)
-                        : `${trade.exit_time.slice(0, 10)} ${trade.exit_time.slice(11, 16)}`}
-                    </td>
                   </tr>
                 ))}
             </tbody>

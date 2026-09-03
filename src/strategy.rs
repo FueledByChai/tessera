@@ -51,6 +51,10 @@ pub struct StandardTradeRecord {
     pub pnl: f64,
     pub return_percent: f64,
     pub leverage: Option<f64>,
+    /// Fill details; older artifacts predate these columns, so readers treat them as optional.
+    pub entry_price: Option<f64>,
+    pub exit_price: Option<f64>,
+    pub quantity: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +116,10 @@ pub fn write_standard_artifacts(
         "exit_time" => bundle.trades.iter().map(|row| row.exit_time.as_str()).collect::<Vec<_>>(),
         "pnl" => bundle.trades.iter().map(|row| row.pnl).collect::<Vec<_>>(),
         "return_percent" => bundle.trades.iter().map(|row| row.return_percent).collect::<Vec<_>>(),
-        "leverage" => bundle.trades.iter().map(|row| row.leverage).collect::<Vec<_>>()
+        "leverage" => bundle.trades.iter().map(|row| row.leverage).collect::<Vec<_>>(),
+        "entry_price" => bundle.trades.iter().map(|row| row.entry_price).collect::<Vec<_>>(),
+        "exit_price" => bundle.trades.iter().map(|row| row.exit_price).collect::<Vec<_>>(),
+        "quantity" => bundle.trades.iter().map(|row| row.quantity).collect::<Vec<_>>()
     )?;
     write_parquet(&mut trades, &output_dir.join("trades.parquet"))?;
 
@@ -226,6 +233,9 @@ mod tests {
             pnl: 1_000.0,
             return_percent: 1.0,
             leverage: Some(1.0),
+            entry_price: None,
+            exit_price: None,
+            quantity: None,
         }];
         let coverage = vec![StandardCoverageRecord {
             trade_date: end,

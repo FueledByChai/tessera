@@ -1213,6 +1213,9 @@ pub fn run(
                     0.0
                 },
                 leverage: (trade.equity_at_entry > 0.0).then(|| notional / trade.equity_at_entry),
+                entry_price: Some(trade.entry_price),
+                exit_price: Some(trade.exit_price),
+                quantity: Some(trade.quantity as f64),
             }
         })
         .collect::<Vec<_>>();

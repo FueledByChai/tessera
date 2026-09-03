@@ -114,6 +114,9 @@ struct TradePoint {
     pnl: f64,
     return_percent: f64,
     leverage: Option<f64>,
+    entry_price: Option<f64>,
+    exit_price: Option<f64>,
+    quantity: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -282,6 +285,9 @@ pub struct ReportTradeView {
     pub pnl: f64,
     pub return_percent: f64,
     pub leverage: Option<f64>,
+    pub entry_price: Option<f64>,
+    pub exit_price: Option<f64>,
+    pub quantity: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -474,6 +480,9 @@ pub fn load_report_view(results_dir: &Path) -> Result<ReportView> {
                 pnl: trade.pnl,
                 return_percent: trade.return_percent,
                 leverage: trade.leverage,
+                entry_price: trade.entry_price,
+                exit_price: trade.exit_price,
+                quantity: trade.quantity,
             })
             .collect(),
         trade_breakdown,
@@ -535,6 +544,10 @@ fn load_trades(path: &Path) -> Result<Vec<TradePoint>> {
         .column("leverage")
         .ok()
         .and_then(|column| column.f64().ok());
+    let optional_f64 = |name: &str| frame.column(name).ok().and_then(|column| column.f64().ok());
+    let entry_prices = optional_f64("entry_price");
+    let exit_prices = optional_f64("exit_price");
+    let quantities = optional_f64("quantity");
     let mut rows = Vec::with_capacity(frame.height());
     for index in 0..frame.height() {
         rows.push(TradePoint {
@@ -551,6 +564,9 @@ fn load_trades(path: &Path) -> Result<Vec<TradePoint>> {
             pnl: pnls.get(index).context("trade pnl is null")?,
             return_percent: returns.get(index).context("trade return is null")?,
             leverage: leverages.and_then(|values| values.get(index)),
+            entry_price: entry_prices.and_then(|values| values.get(index)),
+            exit_price: exit_prices.and_then(|values| values.get(index)),
+            quantity: quantities.and_then(|values| values.get(index)),
         });
     }
     Ok(rows)
@@ -1450,6 +1466,9 @@ mod tests {
             pnl: 0.0,
             return_percent: 0.0,
             leverage: None,
+            entry_price: None,
+            exit_price: None,
+            quantity: None,
         };
         // Exit order: the long hold closes last even though it was entered first.
         let by_exit = vec![
@@ -1529,6 +1548,9 @@ mod tests {
             pnl,
             return_percent,
             leverage: None,
+            entry_price: None,
+            exit_price: None,
+            quantity: None,
         };
         let trades = [trade("long", 100.0, 1.0), trade("long", -50.0, -0.5)];
         let references = trades.iter().collect::<Vec<_>>();
