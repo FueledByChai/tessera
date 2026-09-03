@@ -1954,7 +1954,6 @@ fn validate_sdk_platform_parameters(parameters: &serde_json::Value) -> Result<()
     if let Some(symbols) = object.get("symbols") {
         let list = symbols.as_array().context("symbols must be a list")?;
         anyhow::ensure!(!list.is_empty(), "select at least one symbol");
-        anyhow::ensure!(list.len() <= 50, "SDK runs support at most fifty symbols");
     }
     if let Some(resolution) = object.get("resolution").and_then(serde_json::Value::as_str) {
         SdkResolution::parse(resolution)?;
@@ -2022,10 +2021,10 @@ fn build_sdk_run_config(
         .unwrap_or_else(|| vec![serde_json::json!("SPY.US")]);
     let symbols = expand_sdk_universe(state, &requested)?;
     anyhow::ensure!(!symbols.is_empty(), "select at least one symbol");
-    anyhow::ensure!(
-        manifest.screen_universe || symbols.len() <= 200,
-        "this strategy loads every symbol's bars up front; keep the list to 200 symbols or use a screened-universe strategy"
-    );
+    // No symbol cap: standard-mode strategies load every selected symbol's bars up front,
+    // so very large explicit lists at intraday resolution trade memory for convenience.
+    // Screened-universe strategies stream candidates instead.
+    let _ = manifest.screen_universe;
     let limits = SdkLimitsConfig {
         max_entries_per_day: object
             .get("max_entries_per_day")

@@ -305,6 +305,18 @@ fn valid_prices(open: f64, high: f64, low: f64, close: f64) -> bool {
 }
 
 /// Split-adjusted daily bars, each carrying its adjusted-to-raw ratio.
+/// Calendar days of history to read before `start` so `warmup_bars` completed bars are
+/// available: bars per session for the resolution, doubled to cover weekends and holidays.
+fn warmup_horizon_days(warmup_bars: usize, resolution: Resolution) -> i64 {
+    let bars_per_session = match resolution {
+        Resolution::Daily => 1,
+        Resolution::FiveMinute => 78,
+        Resolution::OneMinute => 390,
+    };
+    let sessions = warmup_bars.div_ceil(bars_per_session) as i64;
+    sessions * 2 + 14
+}
+
 pub fn load_daily(path: &Path) -> Result<Vec<Bar>> {
     let mut reader = csv::Reader::from_path(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -530,20 +542,55 @@ fn plan_standard(
     let mut per_symbol: BTreeMap<String, Vec<Bar>> = BTreeMap::new();
     let mut daily_context: BTreeMap<String, Arc<Vec<Bar>>> = BTreeMap::new();
     let mut warmup_from = start;
-    for symbol in &config.data.symbols {
-        let path = config.symbol_file(symbol);
-        anyhow::ensure!(
-            path.is_file(),
-            "{} data is not available for {symbol}",
-            config.data.resolution.label()
-        );
-        let bars = match config.data.resolution {
-            Resolution::Daily => load_daily(&path)?,
-            Resolution::FiveMinute | Resolution::OneMinute => {
-                load_intraday(&path, config.data.session, None)?
-            }
-        };
-        anyhow::ensure!(!bars.is_empty(), "{symbol} contains no valid bars");
+    // Files are read in parallel and trimmed to the requested window plus a generous
+    // warm-up horizon, so thousands of symbols load quickly without holding full histories.
+    let load_from = start
+        - chrono::Duration::days(warmup_horizon_days(
+            manifest.warmup_bars,
+            config.data.resolution,
+        ));
+    let loaded = config
+        .data
+        .symbols
+        .par_iter()
+        .map(
+            |symbol| -> Result<Option<(String, Vec<Bar>, Option<Arc<Vec<Bar>>>)>> {
+                let path = config.symbol_file(symbol);
+                anyhow::ensure!(
+                    path.is_file(),
+                    "{} data is not available for {symbol}",
+                    config.data.resolution.label()
+                );
+                let mut bars = match config.data.resolution {
+                    Resolution::Daily => load_daily(&path)?,
+                    Resolution::FiveMinute | Resolution::OneMinute => {
+                        load_intraday(&path, config.data.session, None)?
+                    }
+                };
+                bars.retain(|bar| bar.date >= load_from && bar.date <= end);
+                if bars.is_empty() {
+                    // Listed after the window or delisted before it: skip rather than abort,
+                    // so universe-sized explicit lists run without hand-pruning.
+                    eprintln!("warning: skipping {symbol}: no bars in the requested window");
+                    return Ok(None);
+                }
+                let daily = if manifest.daily_context && config.data.resolution.is_intraday() {
+                    let daily_path = config.daily_file(symbol);
+                    anyhow::ensure!(
+                        daily_path.is_file(),
+                        "daily data is not available for {symbol} (required for daily context)"
+                    );
+                    Some(Arc::new(load_daily(&daily_path)?))
+                } else {
+                    None
+                };
+                Ok(Some((symbol.clone(), bars, daily)))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let mut active: Vec<String> = Vec::new();
+    for (symbol, bars, daily) in loaded.into_iter().flatten() {
+        active.push(symbol.clone());
         let first_requested = bars.partition_point(|bar| bar.date < start);
         if manifest.warmup_bars > 0 {
             let seed_start = first_requested.saturating_sub(manifest.warmup_bars);
@@ -553,15 +600,10 @@ fn plan_standard(
                 }
             }
         }
-        if manifest.daily_context && config.data.resolution.is_intraday() {
-            let daily_path = config.daily_file(symbol);
-            anyhow::ensure!(
-                daily_path.is_file(),
-                "daily data is not available for {symbol} (required for daily context)"
-            );
-            daily_context.insert(symbol.clone(), Arc::new(load_daily(&daily_path)?));
+        if let Some(daily) = daily {
+            daily_context.insert(symbol.clone(), daily);
         }
-        per_symbol.insert(symbol.clone(), bars);
+        per_symbol.insert(symbol, bars);
     }
 
     let mut by_date: BTreeMap<NaiveDate, BTreeMap<NaiveTime, BTreeMap<String, MarketBar>>> =
@@ -592,7 +634,7 @@ fn plan_standard(
         .iter()
         .map(|(date, times)| HistoricalSession {
             date: *date,
-            symbols: config.data.symbols.clone(),
+            symbols: active.clone(),
             bars: times
                 .iter()
                 .map(|(time, bars)| (*time, bars.clone()))
@@ -602,7 +644,7 @@ fn plan_standard(
     let mut coverage = Vec::new();
     for date in &requested_dates {
         let times = &by_date[date];
-        for symbol in &config.data.symbols {
+        for symbol in &active {
             let present = times.values().any(|bars| bars.contains_key(symbol));
             coverage.push(CoverageRow {
                 symbol: symbol.clone(),
@@ -615,9 +657,13 @@ fn plan_standard(
             });
         }
     }
-    let count = config.data.symbols.len();
+    anyhow::ensure!(
+        !active.is_empty(),
+        "no selected symbol has bars in the requested window"
+    );
+    let count = active.len();
     let mut instances = BTreeMap::new();
-    for (index, symbol) in config.data.symbols.iter().enumerate() {
+    for (index, symbol) in active.iter().enumerate() {
         let daily = daily_context
             .remove(symbol)
             .unwrap_or_else(|| Arc::new(Vec::new()));
@@ -642,8 +688,8 @@ fn plan_standard(
         sessions,
         coverage,
         instances,
-        equity_symbol: config.data.symbols[0].clone(),
-        symbol_note: config.data.symbols.clone(),
+        equity_symbol: active[0].clone(),
+        symbol_note: active.clone(),
     })
 }
 
