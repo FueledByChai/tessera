@@ -2,6 +2,8 @@
 
 *Tessera* (Latin: one tile of a mosaic). Bars, fills, and runs are the tiles; the portfolio is the picture.
 
+![Tessera dashboard in terminal display mode](docs/images/tessera-dashboard.png)
+
 An event-driven backtesting engine written in Rust, with a local browser UI styled after a
 trading terminal. Strategies are single Rust files: declare the parameters, write the bar
 logic, and the engine handles replay, order simulation, position sizing, costs, portfolio
