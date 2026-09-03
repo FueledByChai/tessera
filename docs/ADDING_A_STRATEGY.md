@@ -61,6 +61,14 @@ so a schema mismatch fails the run instead of silently falling back to a partial
 `report` command then owns all metrics, charts, tables, and HTML; strategy-specific report code is
 not permitted for a standard UI strategy.
 
+## Platform sizing and price guards
+
+`Size::Default` uses the run's `position_percent` (fraction of equity). Entries are skipped when the
+reference price is below the run's `min_price` (default $1.00, set 0 to disable): sub-dollar prints
+make fixed-tick slippage and per-share commission meaningless, and a $0.0001 bar can otherwise turn a
+small allocation into tens of millions of shares. Fill prices are also floored at one tick so a
+slippage tick can never produce a zero or negative price.
+
 ## Event-driven strategy checklist
 
 1. Add `src/strategies/<strategy_id>.rs` and implement `EventStrategy`.

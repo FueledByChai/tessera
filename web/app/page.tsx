@@ -184,6 +184,7 @@ type Overrides = {
   gap_veto_buffer_percent?: number;
   holding_period_minutes?: number;
   position_percent?: number;
+  min_price?: number;
   max_positions_per_day?: number;
   all_in_round_trip_bps?: number;
   position_slots?: number;
@@ -3525,6 +3526,17 @@ function SdkForm({
               onChange={(event) => setParam("position_percent", +event.target.value / 100)}
             />
             <small>of equity per Size::Default entry</small>
+          </label>
+          <label>
+            Minimum price
+            <input
+              type="number"
+              min="0"
+              step="any"
+              value={(parameters.min_price as number | undefined) ?? 1}
+              onChange={(event) => setParam("min_price", +event.target.value)}
+            />
+            <small>skip entries below this price · 0 disables</small>
           </label>
           <label>
             Initial capital

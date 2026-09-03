@@ -172,6 +172,8 @@ pub enum Fill {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SizingPolicy {
     pub position_percent: f64,
+    /// Entries below this reference price are skipped (platform data-quality guard).
+    pub min_price: f64,
 }
 
 /// Run-wide scratch space visible to every strategy instance.
@@ -414,6 +416,9 @@ impl Ctx {
         if side == Side::Sell && !self.allows_short {
             return;
         }
+        if self.last_price < self.sizing.min_price {
+            return;
+        }
         let quantity = self.quantity_for(size, self.last_price);
         if quantity == 0 {
             return;
@@ -438,6 +443,9 @@ impl Ctx {
             return;
         }
         if !(order.limit.is_finite() && order.limit > 0.0) {
+            return;
+        }
+        if order.limit < self.sizing.min_price {
             return;
         }
         let quantity = self.quantity_for(size, order.limit);

@@ -1803,6 +1803,7 @@ const SDK_PLATFORM_KEYS: &[&str] = &[
     "resolution",
     "session",
     "position_percent",
+    "min_price",
     "initial_capital",
     "max_entries_per_day",
     "max_open_positions",
@@ -2033,6 +2034,13 @@ fn validate_sdk_platform_parameters(parameters: &serde_json::Value) -> Result<()
     if let Some(resolution) = object.get("resolution").and_then(serde_json::Value::as_str) {
         SdkResolution::parse(resolution)?;
     }
+    if let Some(min_price) = object.get("min_price") {
+        let value = min_price.as_f64().context("min_price must be a number")?;
+        anyhow::ensure!(
+            value.is_finite() && value >= 0.0,
+            "minimum price must be zero or positive"
+        );
+    }
     if let Some(session) = object.get("session").and_then(serde_json::Value::as_str) {
         anyhow::ensure!(
             ["regular", "extended"].contains(&session),
@@ -2139,6 +2147,10 @@ fn build_sdk_run_config(
         .get("initial_capital")
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(100_000.0);
+    let min_price = object
+        .get("min_price")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1.0);
     let strategy_parameters: serde_json::Map<String, serde_json::Value> = object
         .iter()
         .filter(|(key, _)| !SDK_PLATFORM_KEYS.contains(&key.as_str()))
@@ -2192,6 +2204,7 @@ fn build_sdk_run_config(
         sizing: SdkSizingConfig {
             initial_capital,
             position_percent,
+            min_price,
         },
         costs,
         limits,
@@ -5058,8 +5071,11 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
                 .arg(&job.end_date)
                 .arg("--output-dir")
                 .arg(&output_dir)
+                .stdout(std::process::Stdio::piped())
+                // tokio's `output()` would force stderr back to a pipe, so spawn explicitly.
                 .stderr(std::process::Stdio::from(live_log))
-                .output()
+                .spawn()?
+                .wait_with_output()
                 .await?;
             outputs.push(("simulation", output));
         }

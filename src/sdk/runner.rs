@@ -102,6 +102,11 @@ pub struct SdkSizingConfig {
     /// Fraction of equity per `Size::Default` entry, for example `1.0` for fully invested.
     #[serde(default = "default_position_percent")]
     pub position_percent: f64,
+    /// Entries are skipped when the reference price is below this. Sub-dollar prices make
+    /// fixed-tick slippage and per-share commission meaningless, and a $0.0001 print can
+    /// otherwise turn a 5% allocation into tens of millions of shares. Set to 0 to disable.
+    #[serde(default = "default_min_price")]
+    pub min_price: f64,
 }
 
 fn default_capital() -> f64 {
@@ -110,12 +115,16 @@ fn default_capital() -> f64 {
 fn default_position_percent() -> f64 {
     1.0
 }
+fn default_min_price() -> f64 {
+    1.0
+}
 
 impl Default for SdkSizingConfig {
     fn default() -> Self {
         Self {
             initial_capital: default_capital(),
             position_percent: default_position_percent(),
+            min_price: default_min_price(),
         }
     }
 }
@@ -227,7 +236,10 @@ impl SdkRunConfig {
             "initial capital must be positive"
         );
         anyhow::ensure!(
-            self.sizing.position_percent.is_finite() && self.sizing.position_percent > 0.0,
+            self.sizing.position_percent.is_finite()
+                && self.sizing.position_percent > 0.0
+                && self.sizing.min_price.is_finite()
+                && self.sizing.min_price >= 0.0,
             "position percent must be positive"
         );
         anyhow::ensure!(self.costs.tick_size > 0.0, "tick size must be positive");
@@ -560,6 +572,7 @@ fn make_instance(
             symbol_count: count,
             sizing: SizingPolicy {
                 position_percent: config.sizing.position_percent,
+                min_price: config.sizing.min_price,
             },
             allows_short: entry.manifest.allows_short,
             live_from: start,
@@ -1064,7 +1077,17 @@ pub fn run(
 
     write_csv(output_dir.join("daily_returns.csv"), &daily)?;
     write_csv(output_dir.join("trades.csv"), &trades)?;
-    write_csv(output_dir.join("coverage.csv"), &coverage)?;
+    // coverage.parquet is the record of truth; the CSV twin is a convenience that would run
+    // to hundreds of megabytes for universe-sized symbol lists, so it is skipped past a cap.
+    const COVERAGE_CSV_ROW_CAP: usize = 2_000_000;
+    if coverage.len() <= COVERAGE_CSV_ROW_CAP {
+        write_csv(output_dir.join("coverage.csv"), &coverage)?;
+    } else {
+        eprintln!(
+            "coverage.csv skipped ({} rows exceed the {COVERAGE_CSV_ROW_CAP} row cap); coverage.parquet holds the full table",
+            coverage.len()
+        );
+    }
 
     let mut parameters = params.display_map();
     parameters.insert(

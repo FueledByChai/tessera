@@ -615,8 +615,15 @@ impl SimulatedBroker {
         (ordered, dropped)
     }
 
+    /// Rounds to the tick grid and never returns a price below one tick: fixed-tick
+    /// slippage on a sub-penny print must not produce a zero or negative fill.
     fn round_tick(&self, value: f64) -> f64 {
-        (value / self.costs.tick_size).round() * self.costs.tick_size
+        let rounded = (value / self.costs.tick_size).round() * self.costs.tick_size;
+        if self.costs.tick_size > 0.0 {
+            rounded.max(self.costs.tick_size)
+        } else {
+            rounded
+        }
     }
 
     fn open_position(

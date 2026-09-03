@@ -4002,7 +4002,11 @@ nav {
 .job-progress-row {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.job-progress-row span {
+  white-space: nowrap;
 }
 .job-progress-stage {
   color: var(--accent, #f89828);
