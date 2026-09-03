@@ -7,3 +7,4 @@ pub mod report;
 pub mod sdk;
 pub mod strategies;
 pub mod strategy;
+pub mod study;

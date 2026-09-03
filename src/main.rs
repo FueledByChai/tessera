@@ -64,6 +64,17 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         rows: usize,
     },
+    /// Feature study on the tick lake: feature vs forward return at several horizons.
+    Study {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        start: NaiveDate,
+        #[arg(long)]
+        end: NaiveDate,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     /// Check a lake symbol-day: epochs, delta mix, and whether the rebuilt book brackets trades.
     LakeDiagnose {
         #[arg(long)]
@@ -192,6 +203,25 @@ fn main() -> Result<()> {
                     ),
                 }
             }
+        }
+        Command::Study {
+            config,
+            start,
+            end,
+            output_dir,
+        } => {
+            let text = std::fs::read_to_string(&config)
+                .with_context(|| format!("failed to read {}", config.display()))?;
+            let config: tessera::study::StudyConfig = toml::from_str(&text)?;
+            let result = tessera::study::run(&config, start, end, &output_dir)?;
+            for coverage in &result.symbols {
+                println!(
+                    "{}: {} bars, {} with book",
+                    coverage.symbol, coverage.bars, coverage.bars_with_book
+                );
+            }
+            print!("{}", tessera::study::summary_table(&result));
+            println!("wrote {}", output_dir.join("study.json").display());
         }
         Command::LakeDiagnose { lake, symbol, date } => {
             let sym = tessera::lake::LakeSymbol::parse(&symbol)
