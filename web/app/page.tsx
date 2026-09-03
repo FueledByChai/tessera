@@ -4198,6 +4198,15 @@ export default function Home() {
     const statusResponse = await fetch(`${API}/data/status`, { cache: "no-store" });
     if (statusResponse.ok) setDataStatus(await statusResponse.json());
   }, []);
+  useEffect(() => {
+    if (view !== "data") return;
+    const initial = window.setTimeout(() => void refreshDataStatus(), 0);
+    const timer = window.setInterval(() => void refreshDataStatus(), 30_000);
+    return () => {
+      window.clearTimeout(initial);
+      window.clearInterval(timer);
+    };
+  }, [view, refreshDataStatus]);
   const openRun = useCallback(async (id: string) => {
     setBusy(true);
     setError("");
