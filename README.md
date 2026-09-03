@@ -127,8 +127,11 @@ the same name as an example replaces it.
   order vocabulary, indicators, daily context, screening, and multi-symbol runs.
 - `docs/STRATEGY_SDK_ARCHITECTURE.md` explains the event engine underneath.
 - `docs/templates/sdk_strategy_skeleton.rs` is the skeleton the UI uses for new strategies.
-- `src/strategies/user/` contains the two bundled examples, RSI mean reversion and moving
-  average cross.
+- `src/strategies/user/` contains the bundled examples: RSI mean reversion and moving average
+  cross (single-symbol or explicit lists, any resolution), and RSI intraday screened, which
+  filters the daily universe by price and dollar volume and loads 5-minute bars only for the
+  symbol-days that pass. That last pattern is how to run intraday logic across every US stock
+  without loading the whole intraday library.
 
 ## Repository layout
 

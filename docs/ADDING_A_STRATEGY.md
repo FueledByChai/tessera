@@ -82,6 +82,12 @@ sized against:
 - **Tick floor.** Fill prices never round below one tick, so a slippage tick cannot produce a zero
   or negative price.
 
+**Screened universes.** For intraday logic across a large universe, declare
+`.screened_universe()` and implement `screen()`: it receives every daily bar of every symbol and
+returns whether to load intraday bars for the next session. `src/strategies/user/rsi_intraday_screened.rs`
+is the bundled example (price and dollar-volume screen, intraday RSI, flat by the close); a month
+across all US stocks on 5-minute bars runs in about 20 seconds.
+
 **Memory budget.** Standard-mode runs hold every selected symbol's bars for the window. Before
 reading any file the runner estimates the bar count from file sizes and date spans and refuses runs
 above half of physical memory (override with `TESSERA_MEMORY_BUDGET_GB`), naming the estimate and
