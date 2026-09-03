@@ -1,0 +1,4 @@
+Code,Name,Country,Exchange,Currency,Type,Isin
+DEMO,Demo Index ETF,USA,DEMO,USD,ETF,
+ACME,Acme Widgets Inc,USA,DEMO,USD,Common Stock,
+ZENITH,Zenith Robotics Corp,USA,DEMO,USD,Common Stock,

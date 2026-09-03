@@ -1,0 +1,19 @@
+# Build output
+/target/
+/web/node_modules/
+/web/dist/
+/web/.next/
+/web/.vinext/
+/web/.wrangler/
+
+# Local state: run artifacts, the local catalog database, worker logs, drafts and compiled engines
+/artifacts/
+/data/ui/
+/strategy_workspace/
+
+# Machine-specific configuration (see local.example.toml)
+/local.toml
+
+# Misc
+*.part
+.DS_Store

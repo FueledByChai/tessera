@@ -1,0 +1,26 @@
+[package]
+name = "backtester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10.4"
+clap = { version = "4.6.1", features = ["derive"] }
+csv = "1.3"
+polars = { version = "0.54.4", default-features = false, features = ["parquet"] }
+rand = "0.9"
+rayon = "1.10"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.47", features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
+[profile.release]
+# Keep optimized iteration fast. Enable LTO only after benchmarks prove it matters.
+codegen-units = 16

@@ -1,0 +1,26 @@
+# Runs the bundled RSI example against the synthetic data in examples/data.
+#   cargo run --release --bin backtester -- run-strategy \
+#     --config examples/configs/rsi_mean_reversion.toml \
+#     --start 2019-01-01 --end 2025-12-31 --output-dir artifacts/rsi_demo
+strategy = "rsi_mean_reversion"
+
+[data]
+resolution = "daily"          # daily | 5m | 1m
+session = "regular"           # regular | extended
+daily_dir = "examples/data/eod"
+five_minute_dir = "examples/data/5m"
+one_minute_dir = "examples/data/1m"
+symbols = ["DEMO.US"]
+calendar_symbol = "DEMO.US"
+
+[sizing]
+initial_capital = 100000.0
+position_percent = 1.0        # fraction of equity per position
+
+[costs]                        # omitted fields use the US-equity defaults
+
+[limits]                       # max_entries_per_day, max_open_positions, tie_break, seed
+
+[parameters]                   # anything declared in the strategy manifest
+oversold = 30
+overbought = 70

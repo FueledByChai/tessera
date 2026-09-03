@@ -1,0 +1,32 @@
+# Copy to `local.toml` (git-ignored) and point it at your market-data library.
+# Without a local.toml the app uses the small synthetic dataset under examples/data.
+#
+# Environment overrides: BACKTESTER_DATA_ROOT (folder holding eod/, 5m/, 1m/, catalog/),
+# BACKTESTER_ENGINE (engine binary), BACKTESTER_STRATEGY_DIRS (extra strategy folders).
+
+[data]
+# CSV folders, one file per symbol named `<SYMBOL>.csv`.
+#   daily:    Date,Open,High,Low,Close,Adjusted_close,Volume
+#   intraday: Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume   (UTC epoch seconds)
+daily_dir = "/path/to/data/eod"
+five_minute_dir = "/path/to/data/5m"
+one_minute_dir = "/path/to/data/1m"
+# catalog.csv (Code,Name,Country,Exchange,Currency,Type) plus optional stocks.txt / etfs.txt
+# universe lists and provider sub-catalogs (CC/, FOREX/, delisted/) in the same layout.
+catalog_dir = "/path/to/data/catalog"
+# Daily file whose dates define the trading calendar for screened-universe runs.
+calendar_symbol = "SPY.US"
+# Optional: JSON written by your refresh job, shown on the Data page.
+# freshness_file = "/path/to/data/state/bulk_eod.json"
+# Optional: shell command the Data page can launch to refresh the library.
+# update_command = "python3 /path/to/provider/nightly.py"
+provider = "csv-folders"
+
+[engine]
+# Optional: run strategies with a different engine binary, for example one built from a
+# private strategies repository. Defaults to target/release/backtester in this checkout.
+# path = "../Backtester-private/target/release/backtester"
+
+[strategies]
+# Extra folders of one-file SDK strategies compiled into this checkout's engine.
+# dirs = ["../Backtester-private/strategies"]
