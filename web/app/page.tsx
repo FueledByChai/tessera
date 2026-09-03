@@ -374,7 +374,19 @@ type RunDetail = {
   report_url?: string;
   config_text?: string;
   manifest?: Record<string, unknown>;
+  job_error?: string | null;
 };
+
+/** Why a failed run failed, straight from the worker. */
+function RunFailure({ detail }: { detail: RunDetail }) {
+  if (detail.run.status !== "Failed" && !detail.job_error) return null;
+  return (
+    <div className="run-failure">
+      <strong>Run failed</strong>
+      <span>{detail.job_error ?? "The worker did not record a reason; check the worker log in the run's artifact folder."}</span>
+    </div>
+  );
+}
 type DataUpdate = {
   id: string;
   status: string;
@@ -702,6 +714,8 @@ function EquityChart({ rows }: { rows: ReportView["daily"] }) {
 
 function RunReport({ detail }: { detail: RunDetail }) {
   const report = detail.report;
+  if (!report && (detail.run.status === "Failed" || detail.job_error))
+    return <RunFailure detail={detail} />;
   if (!report)
     return (
       <section className="panel legacy-report-card">
@@ -725,6 +739,7 @@ function RunReport({ detail }: { detail: RunDetail }) {
   const m = report.metrics;
   return (
     <>
+      <RunFailure detail={detail} />
       {report.coverage.percent < 99.5 && (
         <div className="coverage-warning">
           <strong>Partial signal-session coverage</strong>

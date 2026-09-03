@@ -383,6 +383,8 @@ struct RunDetailResponse {
     report_url: Option<String>,
     config_text: Option<String>,
     manifest: Option<serde_json::Value>,
+    /// The worker's error for a failed job, so the run page can say why.
+    job_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3478,9 +3480,16 @@ async fn run_detail(
 }
 
 fn run_detail_sync(state: &AppState, id: &str) -> Result<RunDetailResponse> {
-    let run = {
+    let (run, job_error) = {
         let connection = state.database.lock().expect("database lock poisoned");
-        query_run(&connection, &id)?
+        let run = query_run(&connection, id)?;
+        let job_error: Option<String> = connection
+            .query_row("SELECT error FROM jobs WHERE run_id = ?1", [id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        (run, job_error)
     };
     let artifact_dir = checked_artifact_path(&state.root, &run.artifact_dir)?;
     let report_path = run
@@ -3521,6 +3530,7 @@ fn run_detail_sync(state: &AppState, id: &str) -> Result<RunDetailResponse> {
         report_url,
         config_text,
         manifest,
+        job_error,
     })
 }
 
