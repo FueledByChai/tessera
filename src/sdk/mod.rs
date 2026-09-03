@@ -17,6 +17,7 @@ pub use strategy::{Bar, Ctx, Exec, Fill, LimitOrder, Position, Size, Strategy, S
 pub mod prelude {
     pub use crate::event_engine::{Side, TimeExit};
     pub use crate::indicators::{Adx, Ewma, RollingMean};
+    pub use crate::lake::BookFeatures;
     pub use crate::sdk::indicators::{
         Atr, Bollinger, Crossover, Ema, RollingHigh, RollingLow, Rsi, Sma, Vwap,
     };

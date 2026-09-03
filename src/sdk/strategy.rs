@@ -30,6 +30,9 @@ pub struct Bar {
     /// Adjusted-to-raw price ratio for daily bars (1.0 for intraday bars). Divide an
     /// adjusted price by this to get the price actually traded that day.
     pub adjustment: f64,
+    /// Order-book and trade-flow state at the bar close. Present for tick-built bars from
+    /// the parquet lake (second resolutions); `None` for CSV bars.
+    pub book: Option<crate::lake::BookFeatures>,
 }
 
 impl Bar {
@@ -551,6 +554,9 @@ pub struct InstanceSpec {
     pub daily: Arc<Vec<Bar>>,
     pub shared: SharedState,
     pub records_equity: bool,
+    /// Book features per bar for tick-built symbols, in replay order (empty otherwise).
+    /// The engine's market bars carry prices only, so features ride alongside.
+    pub book: Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
 }
 
 /// Wraps one strategy instance for one symbol and speaks the engine's event protocol.
@@ -567,6 +573,8 @@ pub struct SdkInstance {
     live_from: NaiveDate,
     daily: Arc<Vec<Bar>>,
     daily_cursor: usize,
+    book: Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
+    book_cursor: usize,
     shared: SharedState,
     records_equity: bool,
     pub daily_equity: Vec<(NaiveDate, f64)>,
@@ -614,6 +622,8 @@ impl SdkInstance {
             live_from: spec.live_from,
             daily: spec.daily,
             daily_cursor: 0,
+            book: spec.book,
+            book_cursor: 0,
             shared: spec.shared,
             records_equity: spec.records_equity,
             daily_equity: Vec::new(),
@@ -715,6 +725,25 @@ impl SdkInstance {
         Ok(())
     }
 
+    /// Advances the book cursor to this bar and returns its features, if any.
+    fn book_features_at(
+        &mut self,
+        date: NaiveDate,
+        time: NaiveTime,
+    ) -> Option<crate::lake::BookFeatures> {
+        while let Some((d, t, _)) = self.book.get(self.book_cursor) {
+            if (*d, *t) < (date, time) {
+                self.book_cursor += 1;
+            } else {
+                break;
+            }
+        }
+        match self.book.get(self.book_cursor) {
+            Some((d, t, features)) if (*d, *t) == (date, time) => Some(*features),
+            _ => None,
+        }
+    }
+
     fn daily_history_last_close(&self) -> Option<f64> {
         self.daily
             .get(..self.daily_cursor)
@@ -743,6 +772,7 @@ fn bar_from(date: NaiveDate, time: NaiveTime, bar: &MarketBar) -> Bar {
         close: bar.close,
         volume: bar.volume,
         adjustment: 1.0,
+        book: None,
     }
 }
 
@@ -787,7 +817,8 @@ impl EventStrategy for SdkInstance {
                 let Some(market_bar) = bars.get(&self.symbol) else {
                     return Ok(Vec::new());
                 };
-                let bar = bar_from(*date, *time, market_bar);
+                let mut bar = bar_from(*date, *time, market_bar);
+                bar.book = self.book_features_at(*date, *time);
                 let mut ctx = self.ctx(*date, *time, portfolio, bar.close);
                 for fill in std::mem::take(&mut self.pending_fills) {
                     self.inner.on_fill(&mut ctx, &fill)?;

@@ -2219,6 +2219,7 @@ fn build_sdk_run_config(
             one_minute_dir: state.local.data.one_minute_dir.clone(),
             symbols,
             calendar_symbol: state.local.data.calendar_symbol.clone(),
+            lake_dir: state.local.data.lake_dir.clone(),
         },
         sizing: SdkSizingConfig {
             initial_capital,

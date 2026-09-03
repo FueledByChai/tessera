@@ -21,6 +21,10 @@ calendar_symbol = "SPY.US"
 # Optional: shell command the Data page can launch to refresh the library.
 # update_command = "python3 /path/to/provider/nightly.py"
 provider = "csv-folders"
+# Optional: parquet tick lake for crypto/HFT research. Feeds trades/, book_snapshots/,
+# book_events/ partitioned as exchange=<EX>/symbol=<SYM>/date=<YYYY-MM-DD>/*.parquet.
+# Enables EXCHANGE:SYMBOL instruments (e.g. PARADEX:SOL-USD-PERP) and 1s/5s/30s bars.
+# lake_dir = "/path/to/lake"
 
 [engine]
 # Optional: run strategies with a different engine binary, for example one built from a

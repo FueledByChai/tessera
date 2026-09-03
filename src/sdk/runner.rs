@@ -35,34 +35,62 @@ use crate::strategy::{
     StandardTradeRecord, write_standard_artifacts,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
-    #[serde(rename = "daily")]
     Daily,
-    #[serde(rename = "5m")]
     FiveMinute,
-    #[serde(rename = "1m")]
     OneMinute,
+    /// Sub-minute bars built from tick data in the parquet lake (`1s`, `5s`, `30s`, ...).
+    Seconds(u32),
 }
 
 impl Resolution {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Daily => "daily",
-            Self::FiveMinute => "5m",
-            Self::OneMinute => "1m",
+            Self::Daily => "daily".to_owned(),
+            Self::FiveMinute => "5m".to_owned(),
+            Self::OneMinute => "1m".to_owned(),
+            Self::Seconds(n) => format!("{n}s"),
         }
     }
     pub fn parse(value: &str) -> Result<Self> {
-        Ok(match value.trim().to_ascii_lowercase().as_str() {
+        let value = value.trim().to_ascii_lowercase();
+        Ok(match value.as_str() {
             "daily" | "eod" | "1d" | "d" => Self::Daily,
             "5m" | "five_minute" => Self::FiveMinute,
             "1m" | "one_minute" => Self::OneMinute,
-            other => bail!("unsupported resolution {other:?}; use daily, 5m, or 1m"),
+            other => match other.strip_suffix('s').and_then(|n| n.parse::<u32>().ok()) {
+                Some(n) if n > 0 && n < 60 && 60 % n == 0 => Self::Seconds(n),
+                _ => bail!(
+                    "unsupported resolution {other:?}; use daily, 5m, 1m, or a second count that divides a minute such as 1s, 5s, 15s, 30s"
+                ),
+            },
         })
     }
     pub fn is_intraday(self) -> bool {
         self != Self::Daily
+    }
+    /// True for tick-built bars, which come from the parquet lake rather than CSV files.
+    pub fn is_tick_built(self) -> bool {
+        matches!(self, Self::Seconds(_))
+    }
+}
+
+impl Serialize for Resolution {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for Resolution {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Resolution::parse(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -84,6 +112,9 @@ pub struct SdkDataConfig {
     #[serde(default)]
     pub one_minute_dir: PathBuf,
     pub symbols: Vec<String>,
+    /// Parquet tick lake root for `EXCHANGE:SYMBOL` instruments and second resolutions.
+    #[serde(default)]
+    pub lake_dir: Option<PathBuf>,
     /// Daily file whose dates define the session calendar for screened runs.
     #[serde(default = "default_calendar_symbol")]
     pub calendar_symbol: String,
@@ -266,7 +297,7 @@ impl SdkRunConfig {
         match self.data.resolution {
             Resolution::Daily => &self.data.daily_dir,
             Resolution::FiveMinute => &self.data.five_minute_dir,
-            Resolution::OneMinute => &self.data.one_minute_dir,
+            Resolution::OneMinute | Resolution::Seconds(_) => &self.data.one_minute_dir,
         }
     }
 
@@ -442,18 +473,35 @@ const BYTES_PER_BAR_ESTIMATE: f64 = 120.0;
 fn check_memory_budget(config: &SdkRunConfig, from: NaiveDate, end: NaiveDate) -> Result<()> {
     let bytes_per_row = match config.data.resolution {
         Resolution::Daily => 60.0,
-        Resolution::FiveMinute | Resolution::OneMinute => 84.0,
+        Resolution::FiveMinute | Resolution::OneMinute | Resolution::Seconds(_) => 84.0,
+    };
+    let tick_built = config.data.resolution.is_tick_built();
+    let days = ((end - from).num_days() + 1).max(1) as f64;
+    let bars_per_day = match config.data.resolution {
+        Resolution::Seconds(n) => 86_400.0 / f64::from(n.max(1)),
+        Resolution::OneMinute => 1_440.0,
+        Resolution::FiveMinute => 288.0,
+        Resolution::Daily => 1.0,
     };
     let estimated_bars: f64 = config
         .data
         .symbols
         .par_iter()
         .map(|symbol| {
+            if tick_built || crate::lake::is_lake_symbol(symbol) {
+                // Regular grid: one bar per step per day, book features alongside.
+                return days * bars_per_day;
+            }
             let path = config.symbol_file(symbol);
             estimate_rows_in_window(&path, bytes_per_row, from, end).unwrap_or(0.0)
         })
         .sum();
-    let estimated_bytes = estimated_bars * BYTES_PER_BAR_ESTIMATE;
+    let per_bar = if tick_built {
+        BYTES_PER_BAR_ESTIMATE * 2.0
+    } else {
+        BYTES_PER_BAR_ESTIMATE
+    };
+    let estimated_bytes = estimated_bars * per_bar;
     let budget = memory_budget_bytes();
     if estimated_bytes > budget {
         bail!(
@@ -562,6 +610,7 @@ fn warmup_horizon_days(warmup_bars: usize, resolution: Resolution) -> i64 {
         Resolution::Daily => 1,
         Resolution::FiveMinute => 78,
         Resolution::OneMinute => 390,
+        Resolution::Seconds(n) => (86_400 / n.max(1)) as usize,
     };
     let sessions = warmup_bars.div_ceil(bars_per_session) as i64;
     sessions * 2 + 14
@@ -600,6 +649,7 @@ pub fn load_daily(path: &Path) -> Result<Vec<Bar>> {
                 close,
                 volume: raw.volume.max(0.0),
                 adjustment: factor,
+                book: None,
             });
         }
     }
@@ -653,6 +703,7 @@ fn load_intraday(
             close,
             volume: raw.volume.unwrap_or(0.0).max(0.0),
             adjustment: 1.0,
+            book: None,
         });
     }
     bars.sort_by_key(|bar| (bar.date, bar.time));
@@ -756,6 +807,7 @@ fn make_instance(
     daily: Arc<Vec<Bar>>,
     shared: &Arc<Mutex<Shared>>,
     records_equity: bool,
+    book: Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
 ) -> Result<SdkInstance> {
     let inner = (entry.factory)(params, symbol)?;
     Ok(SdkInstance::new(
@@ -773,6 +825,7 @@ fn make_instance(
             daily,
             shared: Arc::clone(shared),
             records_equity,
+            book,
         },
         inner,
     ))
@@ -813,7 +866,58 @@ fn plan_standard(
         .symbols
         .par_iter()
         .map(
-            |symbol| -> Result<Option<(String, Vec<Bar>, Option<Arc<Vec<Bar>>>)>> {
+            |symbol| -> Result<
+                Option<(
+                    String,
+                    Vec<Bar>,
+                    Option<Arc<Vec<Bar>>>,
+                    Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>,
+                )>,
+            > {
+                if config.data.resolution.is_tick_built() || crate::lake::is_lake_symbol(symbol) {
+                    // Tick lake: bars built from trades with the book sampled at each close.
+                    let lake = config.data.lake_dir.as_deref().context(
+                        "second resolutions and EXCHANGE:SYMBOL instruments need [data] lake_dir",
+                    )?;
+                    let sym = crate::lake::LakeSymbol::parse(symbol).with_context(|| {
+                        format!("{symbol} is not an EXCHANGE:SYMBOL lake instrument")
+                    })?;
+                    let step = match config.data.resolution {
+                        Resolution::Seconds(n) => n,
+                        Resolution::OneMinute => 60,
+                        Resolution::FiveMinute => 300,
+                        Resolution::Daily => 86_400,
+                    };
+                    let lake_bars = crate::lake::build_bars(lake, &sym, step, load_from, end)?;
+                    if lake_bars.is_empty() {
+                        eprintln!(
+                            "warning: skipping {symbol}: no lake trades in the requested window"
+                        );
+                        return Ok(None);
+                    }
+                    let mut book = Vec::with_capacity(lake_bars.len());
+                    let bars = lake_bars
+                        .into_iter()
+                        .map(|bar| {
+                            if let Some(features) = bar.book {
+                                book.push((bar.date, bar.time, features));
+                            }
+                            Bar {
+                                date: bar.date,
+                                time: bar.time,
+                                open: bar.open,
+                                high: bar.high,
+                                low: bar.low,
+                                close: bar.close,
+                                volume: bar.volume,
+                                adjustment: 1.0,
+                                book: None,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    load_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Some((symbol.clone(), bars, None, book)));
+                }
                 let path = config.symbol_file(symbol);
                 anyhow::ensure!(
                     path.is_file(),
@@ -835,6 +939,7 @@ fn plan_standard(
                     Resolution::FiveMinute | Resolution::OneMinute => {
                         load_intraday(&path, config.data.session, None)?
                     }
+                    Resolution::Seconds(_) => unreachable!("tick-built bars take the lake path"),
                 };
                 bars.retain(|bar| bar.date >= load_from && bar.date <= end);
                 if bars.is_empty() {
@@ -853,7 +958,7 @@ fn plan_standard(
                 } else {
                     None
                 };
-                Ok(Some((symbol.clone(), bars, daily)))
+                Ok(Some((symbol.clone(), bars, daily, Vec::new())))
             },
         )
         .collect::<Result<Vec<_>>>()?;
@@ -864,8 +969,15 @@ fn plan_standard(
         load_started.elapsed().as_secs()
     );
     let mut active: Vec<String> = Vec::new();
-    for (symbol, bars, daily) in loaded.into_iter().flatten() {
+    let mut book_series: BTreeMap<
+        String,
+        Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
+    > = BTreeMap::new();
+    for (symbol, bars, daily, book) in loaded.into_iter().flatten() {
         active.push(symbol.clone());
+        if !book.is_empty() {
+            book_series.insert(symbol.clone(), Arc::new(book));
+        }
         let first_requested = bars.partition_point(|bar| bar.date < start);
         if manifest.warmup_bars > 0 {
             let seed_start = first_requested.saturating_sub(manifest.warmup_bars);
@@ -956,6 +1068,9 @@ fn plan_standard(
                 daily,
                 shared,
                 index == 0,
+                book_series
+                    .remove(symbol)
+                    .unwrap_or_else(|| Arc::new(Vec::new())),
             )?,
         );
     }
@@ -1036,6 +1151,7 @@ fn plan_screened(
                 Arc::new(Vec::new()),
                 shared,
                 false,
+                Arc::new(Vec::new()),
             )?;
             let mut selected = Vec::new();
             for bar in &daily {
@@ -1085,6 +1201,7 @@ fn plan_screened(
         (Resolution::FiveMinute, SessionKind::Extended) => 192.0,
         (Resolution::OneMinute, SessionKind::Regular) => 390.0,
         (Resolution::OneMinute, SessionKind::Extended) => 960.0,
+        (Resolution::Seconds(n), _) => 86_400.0 / f64::from(n.max(1)),
         (Resolution::Daily, _) => 1.0,
     };
     let estimated_bytes = candidate_days as f64 * bars_per_session * BYTES_PER_BAR_ESTIMATE;

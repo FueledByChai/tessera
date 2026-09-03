@@ -1,5 +1,6 @@
 pub mod event_engine;
 pub mod indicators;
+pub mod lake;
 pub mod local_config;
 pub mod portfolio;
 pub mod report;

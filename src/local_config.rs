@@ -39,6 +39,11 @@ pub struct DataLibrary {
     pub update_command: Option<String>,
     #[serde(default = "default_provider_name")]
     pub provider: String,
+    /// Optional parquet tick lake (trades, book snapshots, book events) laid out as
+    /// `<lake>/<feed>/exchange=<EX>/symbol=<SYM>/date=<YYYY-MM-DD>/*.parquet`. Enables
+    /// `EXCHANGE:SYMBOL` instruments and second resolutions.
+    #[serde(default)]
+    pub lake_dir: Option<PathBuf>,
 }
 
 fn default_calendar_symbol() -> String {
@@ -129,6 +134,7 @@ impl LocalConfig {
                 freshness_file: None,
                 update_command: None,
                 provider: "bundled-example".to_owned(),
+                lake_dir: None,
             },
             engine: EngineConfig::default(),
             strategies: StrategyDirs::default(),
@@ -146,6 +152,9 @@ impl LocalConfig {
         fix(&mut self.data.one_minute_dir);
         fix(&mut self.data.catalog_dir);
         if let Some(path) = self.data.freshness_file.as_mut() {
+            fix(path);
+        }
+        if let Some(path) = self.data.lake_dir.as_mut() {
             fix(path);
         }
         if let Some(path) = self.engine.path.as_mut() {
@@ -204,6 +213,7 @@ mod tests {
                 freshness_file: None,
                 update_command: None,
                 provider: "csv-folders".to_owned(),
+                lake_dir: None,
             },
             engine: EngineConfig::default(),
             strategies: StrategyDirs::default(),
