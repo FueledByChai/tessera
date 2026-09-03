@@ -117,7 +117,7 @@ struct TradePoint {
 }
 
 #[derive(Debug, Default)]
-struct Coverage {
+pub struct Coverage {
     covered: usize,
     missing_file: usize,
     missing_session: usize,
@@ -179,7 +179,11 @@ pub struct ReportView {
     pub correlation_matrices: Vec<CorrelationMatrix>,
     pub metrics: ReportMetricsView,
     pub coverage: ReportCoverageView,
+    /// Missing symbol-dates only, capped at `COVERAGE_ROW_CAP`; see `coverage_missing_total`.
     pub coverage_rows: Vec<ReportCoverageRowView>,
+    pub coverage_missing_total: usize,
+    pub coverage_by_symbol: Vec<ReportCoverageBucket>,
+    pub coverage_by_year: Vec<ReportCoverageBucket>,
     pub watchlist: Vec<ReportWatchlistRowView>,
     pub daily: Vec<ReportDailyPointView>,
     pub trades: Vec<ReportTradeView>,
@@ -192,6 +196,27 @@ pub struct ReportCoverageRowView {
     pub trade_date: String,
     pub symbol: String,
     pub status: String,
+}
+
+/// Coverage aggregated per symbol or per year, computed server-side so a universe-sized
+/// run (tens of millions of symbol-days) never ships its raw rows to the browser.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportCoverageBucket {
+    pub key: String,
+    pub covered: usize,
+    pub total: usize,
+}
+
+/// Maximum missing symbol-date rows included in a report view.
+pub const COVERAGE_ROW_CAP: usize = 5_000;
+
+#[derive(Debug, Default)]
+pub struct CoverageSummary {
+    pub coverage: Coverage,
+    pub missing_rows: Vec<ReportCoverageRowView>,
+    pub missing_total: usize,
+    pub by_symbol: Vec<ReportCoverageBucket>,
+    pub by_year: Vec<ReportCoverageBucket>,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,7 +314,7 @@ pub fn generate_report(results_dir: &Path, output: Option<&Path>) -> Result<Repo
     )?;
     anyhow::ensure!(!daily.is_empty(), "daily_equity.parquet contains no rows");
     let trades = load_trades(&results_dir.join("trades.parquet"))?;
-    let (coverage, _) = load_coverage(&results_dir.join("coverage.parquet"))?;
+    let coverage = load_coverage(&results_dir.join("coverage.parquet"))?.coverage;
     apply_drawdowns(&mut daily, manifest.initial_capital());
     let metrics = calculate_metrics(&manifest, &daily, &trades);
     let output = output
@@ -320,7 +345,8 @@ pub fn load_report_view(results_dir: &Path) -> Result<ReportView> {
     let mut daily = load_daily_equity(&results_dir.join("daily_equity.parquet"), initial_capital)?;
     anyhow::ensure!(!daily.is_empty(), "daily_equity.parquet contains no rows");
     let trades = load_trades(&results_dir.join("trades.parquet"))?;
-    let (coverage, coverage_rows) = load_coverage(&results_dir.join("coverage.parquet"))?;
+    let coverage_summary = load_coverage(&results_dir.join("coverage.parquet"))?;
+    let coverage = coverage_summary.coverage;
     let watchlist = load_watchlist(&results_dir.join("watchlist.parquet"))?;
     apply_drawdowns(&mut daily, initial_capital);
     let metrics = calculate_metrics(&manifest, &daily, &trades);
@@ -422,7 +448,10 @@ pub fn load_report_view(results_dir: &Path) -> Result<ReportView> {
             total: coverage.total(),
             percent: coverage.percent(),
         },
-        coverage_rows,
+        coverage_rows: coverage_summary.missing_rows,
+        coverage_missing_total: coverage_summary.missing_total,
+        coverage_by_symbol: coverage_summary.by_symbol,
+        coverage_by_year: coverage_summary.by_year,
         watchlist,
         daily: daily
             .into_iter()
@@ -514,29 +543,56 @@ fn load_trades(path: &Path) -> Result<Vec<TradePoint>> {
     Ok(rows)
 }
 
-fn load_coverage(path: &Path) -> Result<(Coverage, Vec<ReportCoverageRowView>)> {
+fn load_coverage(path: &Path) -> Result<CoverageSummary> {
     let frame = ParquetReader::new(File::open(path)?).finish()?;
     let dates = frame.column("trade_date")?.str()?;
     let symbols = frame.column("symbol")?.str()?;
     let statuses = frame.column("status")?.str()?;
-    let mut coverage = Coverage::default();
-    let mut rows = Vec::with_capacity(frame.height());
+    let mut summary = CoverageSummary::default();
+    let mut by_symbol: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut by_year: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for index in 0..frame.height() {
         let Some(status) = statuses.get(index) else {
             continue;
         };
+        let covered = status == "covered";
         match status {
-            "covered" => coverage.covered += 1,
-            "missing_file" => coverage.missing_file += 1,
-            _ => coverage.missing_session += 1,
+            "covered" => summary.coverage.covered += 1,
+            "missing_file" => summary.coverage.missing_file += 1,
+            _ => summary.coverage.missing_session += 1,
         }
-        rows.push(ReportCoverageRowView {
-            trade_date: dates.get(index).unwrap_or_default().to_owned(),
-            symbol: symbols.get(index).unwrap_or_default().to_owned(),
-            status: status.to_owned(),
-        });
+        let symbol = symbols.get(index).unwrap_or_default();
+        let date = dates.get(index).unwrap_or_default();
+        let entry = by_symbol.entry(symbol).or_default();
+        entry.1 += 1;
+        if covered {
+            entry.0 += 1;
+        }
+        let year = date.get(..4).unwrap_or(date);
+        let entry = by_year.entry(year).or_default();
+        entry.1 += 1;
+        if covered {
+            entry.0 += 1;
+        }
+        if !covered {
+            summary.missing_total += 1;
+            if summary.missing_rows.len() < COVERAGE_ROW_CAP {
+                summary.missing_rows.push(ReportCoverageRowView {
+                    trade_date: date.to_owned(),
+                    symbol: symbol.to_owned(),
+                    status: status.to_owned(),
+                });
+            }
+        }
     }
-    Ok((coverage, rows))
+    let bucket = |(key, (covered, total)): (&str, (usize, usize))| ReportCoverageBucket {
+        key: key.to_owned(),
+        covered,
+        total,
+    };
+    summary.by_symbol = by_symbol.into_iter().map(bucket).collect();
+    summary.by_year = by_year.into_iter().map(bucket).collect();
+    Ok(summary)
 }
 
 fn load_watchlist(path: &Path) -> Result<Vec<ReportWatchlistRowView>> {

@@ -317,6 +317,9 @@ type ReportView = {
     percent: number;
   };
   coverage_rows: { trade_date: string; symbol: string; status: string }[];
+  coverage_missing_total?: number;
+  coverage_by_symbol?: { key: string; covered: number; total: number }[];
+  coverage_by_year?: { key: string; covered: number; total: number }[];
   watchlist: {
     watch_date: string;
     symbol: string;
@@ -1039,32 +1042,21 @@ function DataCoverage({
   onSelect: (id: string) => void;
 }) {
   const report = detail?.report;
-  const rows = useMemo(
-    () => report?.coverage_rows ?? [],
+  // Aggregates come from the API; the raw rows are only the missing symbol-dates, capped.
+  const missing = useMemo(
+    () => (report?.coverage_rows ?? []).filter((row) => row.status !== "covered"),
     [report?.coverage_rows],
   );
-  const missing = rows.filter((row) => row.status !== "covered");
-  const bySymbol = useMemo(() => {
-    const result = new Map<string, { total: number; covered: number }>();
-    for (const row of rows) {
-      const value = result.get(row.symbol) ?? { total: 0, covered: 0 };
-      value.total += 1;
-      if (row.status === "covered") value.covered += 1;
-      result.set(row.symbol, value);
-    }
-    return [...result.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [rows]);
-  const byYear = useMemo(() => {
-    const result = new Map<string, { total: number; covered: number }>();
-    for (const row of rows) {
-      const year = row.trade_date.slice(0, 4);
-      const value = result.get(year) ?? { total: 0, covered: 0 };
-      value.total += 1;
-      if (row.status === "covered") value.covered += 1;
-      result.set(year, value);
-    }
-    return [...result.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [rows]);
+  const missingTotal = report?.coverage_missing_total ?? missing.length;
+  const SYMBOL_TABLE_CAP = 2000;
+  const bySymbol = useMemo(
+    () => (report?.coverage_by_symbol ?? []).map((b) => [b.key, b] as const),
+    [report?.coverage_by_symbol],
+  );
+  const byYear = useMemo(
+    () => (report?.coverage_by_year ?? []).map((b) => [b.key, b] as const),
+    [report?.coverage_by_year],
+  );
   const structured = runs.filter(
     (run) => !run.legacy && run.status === "Complete",
   );
@@ -1123,8 +1115,8 @@ function DataCoverage({
             />
             <Metric
               label="Missing rows"
-              value={String(missing.length)}
-              note="Listed below for audit"
+              value={String(missingTotal)}
+              note={missingTotal > missing.length ? `first ${missing.length} listed below` : "Listed below for audit"}
             />
           </section>
           <div className="coverage-grid">
@@ -1146,7 +1138,7 @@ function DataCoverage({
                     </tr>
                   </thead>
                   <tbody>
-                    {bySymbol.map(([symbol, value]) => (
+                    {bySymbol.slice(0, SYMBOL_TABLE_CAP).map(([symbol, value]) => (
                       <tr key={symbol}>
                         <td>{symbol}</td>
                         <td>{value.covered}</td>
@@ -1199,7 +1191,7 @@ function DataCoverage({
                 <p className="eyebrow">Exact exceptions</p>
                 <h2>Missing symbol-dates</h2>
               </div>
-              <span className="market-date">{missing.length} ROWS</span>
+              <span className="market-date">{missingTotal} ROWS{missingTotal > missing.length ? ` · FIRST ${missing.length}` : ""}</span>
             </div>
             <div className="table-wrap coverage-exceptions">
               <table>

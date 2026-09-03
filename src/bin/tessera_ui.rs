@@ -3449,6 +3449,15 @@ async fn run_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<RunDetailResponse>, ApiError> {
+    // Parquet reads for a universe-sized run take seconds; keep them off the async
+    // runtime so dashboard polling and other requests stay responsive meanwhile.
+    let response = tokio::task::spawn_blocking(move || run_detail_sync(&state, &id))
+        .await
+        .context("run detail task failed")??;
+    Ok(Json(response))
+}
+
+fn run_detail_sync(state: &AppState, id: &str) -> Result<RunDetailResponse> {
     let run = {
         let connection = state.database.lock().expect("database lock poisoned");
         query_run(&connection, &id)?
@@ -3486,13 +3495,13 @@ async fn run_detail(
     let report_url = report_path
         .filter(|path| path.is_file())
         .map(|_| format!("/api/runs/{id}/report"));
-    Ok(Json(RunDetailResponse {
+    Ok(RunDetailResponse {
         run,
         report,
         report_url,
         config_text,
         manifest,
-    }))
+    })
 }
 
 async fn run_report(
@@ -3734,7 +3743,10 @@ async fn sweep_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SweepDetailResponse>, ApiError> {
-    Ok(Json(load_sweep_detail(&state, &id)?))
+    let detail = tokio::task::spawn_blocking(move || load_sweep_detail(&state, &id))
+        .await
+        .context("sweep detail task failed")??;
+    Ok(Json(detail))
 }
 
 async fn create_sweep(
@@ -3807,10 +3819,10 @@ async fn create_sweep(
             }
         });
     }
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(load_sweep_detail(&state, &sweep_id)?),
-    ))
+    let detail = tokio::task::spawn_blocking(move || load_sweep_detail(&state, &sweep_id))
+        .await
+        .context("sweep detail task failed")??;
+    Ok((StatusCode::ACCEPTED, Json(detail)))
 }
 
 async fn list_portfolios(
@@ -5112,12 +5124,17 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
     }
     fs::write(&log_path, log)?;
     let finished_at = Utc::now().to_rfc3339();
-    let metrics_json = serde_json::to_string(
-        &report_path
-            .parent()
-            .filter(|_| succeeded)
-            .and_then(compute_metrics_for_dir),
-    )?;
+    let metrics_dir = report_path
+        .parent()
+        .filter(|_| succeeded)
+        .map(Path::to_path_buf);
+    let metrics = match metrics_dir {
+        Some(dir) => tokio::task::spawn_blocking(move || compute_metrics_for_dir(&dir))
+            .await
+            .context("metrics task failed")?,
+        None => None,
+    };
+    let metrics_json = serde_json::to_string(&metrics)?;
     let connection = state.database.lock().expect("database lock poisoned");
     if succeeded {
         connection.execute(
