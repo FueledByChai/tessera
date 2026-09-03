@@ -391,6 +391,47 @@ pub fn default_max_gross_exposure(
     (position_percent * slots).max(1.0)
 }
 
+/// Throttled `progress:` lines from inside a rayon loop: one line per second at most.
+struct ParallelProgress {
+    stage: &'static str,
+    total: usize,
+    done: std::sync::atomic::AtomicUsize,
+    started: std::time::Instant,
+    last: Mutex<std::time::Instant>,
+}
+
+impl ParallelProgress {
+    fn new(stage: &'static str, total: usize) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            stage,
+            total,
+            done: std::sync::atomic::AtomicUsize::new(0),
+            started: now,
+            last: Mutex::new(now),
+        }
+    }
+
+    fn tick(&self) {
+        let done = self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if let Ok(mut last) = self.last.try_lock() {
+            if last.elapsed().as_millis() >= 1000 {
+                *last = std::time::Instant::now();
+                eprintln!(
+                    "progress: {} {done}/{} symbols elapsed={}s",
+                    self.stage,
+                    self.total,
+                    self.started.elapsed().as_secs()
+                );
+            }
+        }
+    }
+
+    fn elapsed_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
 /// Approximate resident bytes per bar in standard mode: the parsed bar plus its copy in
 /// the per-session tables (String key, map node, market bar).
 const BYTES_PER_BAR_ESTIMATE: f64 = 120.0;
@@ -967,12 +1008,14 @@ fn plan_screened(
 
     // Phase 1: daily screen across every symbol, in parallel.
     let count = config.data.symbols.len();
+    let screen_progress = ParallelProgress::new("screen", config.data.symbols.len());
     let screened: Vec<Result<Option<(String, SdkInstance, Vec<NaiveDate>)>>> = config
         .data
         .symbols
         .par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            screen_progress.tick();
             let path = config.daily_file(symbol);
             if !path.is_file() {
                 return Ok(None);
@@ -1029,11 +1072,42 @@ fn plan_screened(
         !candidates.is_empty(),
         "the daily screen selected no symbol-days in the requested window"
     );
+    let candidate_days: usize = candidates.values().map(Vec::len).sum();
+    eprintln!(
+        "progress: screen {screened_symbols}/{screened_symbols} symbols screened, {} candidates, {candidate_days} symbol-days elapsed={}s",
+        candidates.len(),
+        screen_progress.elapsed_seconds()
+    );
+    // The intraday tables for every candidate symbol-day live in memory for the replay;
+    // refuse now rather than swap if the screen let too much through.
+    let bars_per_session = match (config.data.resolution, config.data.session) {
+        (Resolution::FiveMinute, SessionKind::Regular) => 78.0,
+        (Resolution::FiveMinute, SessionKind::Extended) => 192.0,
+        (Resolution::OneMinute, SessionKind::Regular) => 390.0,
+        (Resolution::OneMinute, SessionKind::Extended) => 960.0,
+        (Resolution::Daily, _) => 1.0,
+    };
+    let estimated_bytes = candidate_days as f64 * bars_per_session * BYTES_PER_BAR_ESTIMATE;
+    let budget = memory_budget_bytes();
+    if estimated_bytes > budget {
+        bail!(
+            "the screen selected {candidate_days} symbol-days ({} symbols): about {:.0} million {} bars, \
+             roughly {:.1} GB, above the {:.1} GB memory budget. Tighten the screen (higher \
+             minimum price or dollar volume), shorten the window, or raise TESSERA_MEMORY_BUDGET_GB.",
+            candidates.len(),
+            candidate_days as f64 * bars_per_session / 1e6,
+            config.data.resolution.label(),
+            estimated_bytes / 1e9,
+            budget / 1e9
+        );
+    }
 
     // Phase 2: intraday bars for candidate symbol-days only, in parallel.
+    let load_progress = ParallelProgress::new("load", candidates.len());
     let loaded: Vec<Result<(String, Option<Vec<Bar>>)>> = candidates
         .par_iter()
         .map(|(symbol, dates)| {
+            load_progress.tick();
             let path = config.symbol_file(symbol);
             if !path.is_file() {
                 return Ok((symbol.clone(), None));
