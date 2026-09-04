@@ -1,4 +1,14 @@
-@import "tailwindcss";
+/* Base reset (what Tailwind's preflight used to provide before the bundle went static). */
+*, *::before, *::after { box-sizing: border-box; border: 0 solid; margin: 0; padding: 0; }
+html { line-height: 1.5; -webkit-text-size-adjust: 100%; font-family: var(--font-geist-sans, sans-serif); }
+body { min-height: 100vh; }
+h1, h2, h3, h4, p, dl, dd, ol, ul, pre { margin: 0; }
+ol, ul { list-style: none; }
+button, input, select, textarea { font: inherit; color: inherit; background: transparent; }
+button { cursor: pointer; }
+table { border-collapse: collapse; }
+img, svg { display: block; max-width: 100%; }
+a { color: inherit; text-decoration: inherit; }
 
 :root {
   --font-geist-sans: Inter, "Helvetica Neue", Arial, sans-serif;

@@ -2,9 +2,6 @@
 /target/
 /web/node_modules/
 /web/dist/
-/web/.next/
-/web/.vinext/
-/web/.wrangler/
 
 # Local state: run artifacts, the local catalog database, worker logs, drafts and compiled engines
 /artifacts/

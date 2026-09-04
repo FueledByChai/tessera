@@ -609,19 +609,23 @@ async fn main() -> Result<()> {
     let scheduler_state = state.clone();
     tokio::spawn(async move { automation_scheduler(scheduler_state).await });
 
+    // The console bundle is served from this process, so the browser talks to the API on the
+    // same origin. CORS remains only for the Vite dev server (`npm run dev` on 5173).
     let cors = CorsLayer::new()
         .allow_origin([
-            "http://127.0.0.1:3000".parse::<HeaderValue>()?,
-            "http://localhost:3000".parse::<HeaderValue>()?,
-            "http://127.0.0.1:3001".parse::<HeaderValue>()?,
-            "http://localhost:3001".parse::<HeaderValue>()?,
-            "http://127.0.0.1:3002".parse::<HeaderValue>()?,
-            "http://localhost:3002".parse::<HeaderValue>()?,
-            "http://127.0.0.1:3322".parse::<HeaderValue>()?,
-            "http://localhost:3322".parse::<HeaderValue>()?,
+            "http://127.0.0.1:5173".parse::<HeaderValue>()?,
+            "http://localhost:5173".parse::<HeaderValue>()?,
         ])
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
+    let web_dist = state.root.join("web").join("dist");
+    let web_ready = web_dist.join("index.html").is_file();
+    // Unknown paths (client-side views, deep links) fall through to index.html.
+    let static_site = tower_http::services::ServeDir::new(&web_dist)
+        .append_index_html_on_directories(true)
+        .fallback(tower_http::services::ServeFile::new(
+            web_dist.join("index.html"),
+        ));
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -683,12 +687,19 @@ async fn main() -> Result<()> {
             post(build_strategy_draft),
         )
         .route("/api/data/update-eod", post(start_eod_update))
+        .fallback_service(static_site)
         .layer(cors)
         .with_state(state);
 
     let address = "127.0.0.1:8787";
     let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Tessera API listening on http://{address}");
+    if web_ready {
+        println!("Tessera console at http://{address}/ (API under /api)");
+    } else {
+        println!(
+            "Tessera API listening on http://{address}; console bundle not built yet (run `npm run build` in web/)"
+        );
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

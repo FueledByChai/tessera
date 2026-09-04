@@ -1,5 +1,3 @@
-"use client";
-
 import {
   FormEvent,
   Fragment,
@@ -10,7 +8,9 @@ import {
   useState,
 } from "react";
 
-const ORIGIN = "http://127.0.0.1:8787";
+// Same origin as the page: the Rust service serves this bundle and the API together.
+// `VITE_API_ORIGIN` overrides it when the bundle is served from somewhere else.
+const ORIGIN: string = import.meta.env.VITE_API_ORIGIN ?? "";
 const API = `${ORIGIN}/api`;
 const monthNames = [
   "Jan",

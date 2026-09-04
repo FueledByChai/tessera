@@ -8,7 +8,7 @@ themselves usually belong in your own private folder (see "Private strategies" i
 ```bash
 cargo fmt --all
 cargo test
-cd web && npm run lint && npm run build
+cd web && npm run lint && npm run typecheck && npm run build
 ```
 
 CI runs the same commands plus one example strategy against the bundled synthetic data.

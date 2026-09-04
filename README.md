@@ -86,10 +86,14 @@ its parameters as JSON.
 ### Local UI
 
 ```bash
+cd web && npm ci && npm run build && cd ..   # console bundle -> web/dist
 cargo build --release --bin tessera --bin tessera-ui
-./target/release/tessera-ui          # API on http://127.0.0.1:8787
-cd web && npm install && npm run dev    # UI on http://127.0.0.1:3322
+./target/release/tessera-ui                  # console + API on http://127.0.0.1:8787
 ```
+
+The console is a static single-page bundle served by the Rust service, so that is the only
+process. For UI development, `npm run dev` in `web/` gives hot reload on port 5173 and proxies
+the API.
 
 The UI runs strategies through the engine binary, records each run with a frozen parameter
 snapshot in a SQLite catalog under `data/ui/`, and stores artifacts under `artifacts/`.
@@ -150,7 +154,7 @@ src/bin/tessera    engine CLI: run-strategy, sdk-manifests, report, combine
 src/bin/tessera-ui local API server for the browser UI
 src/report.rs         HTML tear sheet and metrics
 src/portfolio.rs      combines completed runs into portfolios
-web/                  Next.js single-page terminal UI
+web/                  Vite + React single-page terminal UI (served by tessera-ui)
 examples/             synthetic data and run configurations
 docs/                 architecture, SDK guide, UI guide, product backlog
 ```

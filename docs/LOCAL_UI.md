@@ -4,7 +4,7 @@ The planned separation between the open-source application, external strategy pa
 external data libraries is recorded in [OPEN_SOURCE_ARCHITECTURE_DIRECTION.md](OPEN_SOURCE_ARCHITECTURE_DIRECTION.md).
 Proposed features and their acceptance criteria are tracked in [PRODUCT_BACKLOG.md](PRODUCT_BACKLOG.md).
 
-Double-click `Launch Tessera.command` in Finder. The first launch may take a few minutes while the Rust service is built. Later launches reuse the compiled service and open `http://127.0.0.1:3322/` directly.
+Double-click `Launch Tessera.command` in Finder. The first launch builds the console bundle (`web/dist`) and the Rust service; later launches reuse both and open `http://127.0.0.1:8787/`. The console is a static single-page bundle served by the Rust service on the same origin as the API, so there is one process and no Node runtime once it is built. For UI work, `npm run dev` in `web/` serves the bundle on 5173 with hot reload and proxies `/api` to the running service.
 
 The initial vertical slice provides:
 
@@ -79,13 +79,15 @@ Run the API from the repository root:
 cargo run --bin tessera-ui
 ```
 
-Run the browser application in a second terminal for development:
+For UI development with hot reload, run the Vite dev server in a second terminal; it serves the
+console on `http://127.0.0.1:5173/` and proxies `/api`, `/reports`, and `/artifacts` to the service:
 
 ```sh
 cd web
-npm run dev -- --host 127.0.0.1 --port 3322
+npm run dev
 ```
 
-The double-click launcher uses the built production server (`npm run build` followed by `npm run start`) so it is independent of any development server. It stages disposable web dependencies and build output under `~/Library/Caches/Tessera/web-runtime`; source code, the SQLite catalog, and immutable run artifacts stay in the Tessera project. This avoids macOS cloud-storage eviction of `node_modules` when the project is under Documents.
+`npm run build` writes the production bundle to `web/dist` (git-ignored), which the Rust service
+serves; the launcher runs it when the bundle is missing or older than the source.
 
 The service health check is `http://127.0.0.1:8787/api/health`. Runtime logs for the double-click launcher are written under `data/ui/logs/`.
