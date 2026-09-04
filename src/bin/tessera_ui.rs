@@ -40,6 +40,8 @@ struct AppState {
     instruments: Arc<Mutex<Option<InstrumentIndex>>>,
     sdk_manifests:
         Arc<Mutex<std::collections::HashMap<PathBuf, (std::time::SystemTime, Vec<SdkManifest>)>>>,
+    /// Inventory of configured data sources (sizes and coverage), refreshed every ten minutes.
+    data_sources: Arc<Mutex<Option<(std::time::Instant, DataSourcesResponse)>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -589,6 +591,7 @@ async fn main() -> Result<()> {
         workers: Arc::new(Semaphore::new(2)),
         instruments: Arc::new(Mutex::new(None)),
         sdk_manifests: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        data_sources: Arc::new(Mutex::new(None)),
     };
     import_legacy_reports(&state)?;
     let metrics_state = state.clone();
@@ -673,6 +676,7 @@ async fn main() -> Result<()> {
         .route("/api/automations/{id}/toggle", post(toggle_automation))
         .route("/api/automations/{id}/run", post(run_automation_now))
         .route("/api/data/status", get(data_status))
+        .route("/api/data/sources", get(data_sources))
         .route("/api/instruments", get(search_instrument_catalog))
         .route(
             "/api/strategy-drafts/{id}/build",
@@ -3624,6 +3628,341 @@ async fn run_report(
     .context("this run does not have an HTML report")?;
     let report_path = checked_artifact_path(&state.root, &report_path)?;
     Ok(Html(fs::read_to_string(report_path)?))
+}
+
+// ---------------------------------------------------------------------------
+// Data sources inventory: what the console is configured to read, with coverage.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+struct FeedInventory {
+    feed: String,
+    path: String,
+    exists: bool,
+    files: usize,
+    bytes: u64,
+    first_date: Option<String>,
+    last_date: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CatalogInventory {
+    path: String,
+    exists: bool,
+    catalog_rows: usize,
+    stocks: usize,
+    etfs: usize,
+    extra_lists: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CsvLibraryInventory {
+    provider: String,
+    calendar_symbol: String,
+    feeds: Vec<FeedInventory>,
+    catalog: CatalogInventory,
+    freshness_file: Option<String>,
+    freshness: Option<serde_json::Value>,
+    update_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LakeInventory {
+    path: String,
+    exists: bool,
+    feeds: Vec<FeedInventory>,
+    instruments: Vec<tessera::lake::LakeInstrument>,
+    total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigInventory {
+    local_toml: String,
+    local_toml_exists: bool,
+    bundled_example: bool,
+    env_overrides: Vec<String>,
+    memory_budget_gb: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DataSourcesResponse {
+    generated_at: String,
+    config: ConfigInventory,
+    csv_library: CsvLibraryInventory,
+    lake: Option<LakeInventory>,
+}
+
+fn dir_stats(dir: &Path, extension: Option<&str>) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if extension.is_none_or(|ext| path.extension().is_some_and(|e| e == ext)) {
+                files += 1;
+                bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    (files, bytes)
+}
+
+fn csv_row_date(line: &str) -> Option<String> {
+    let first = line.split(',').next()?.trim();
+    if NaiveDate::parse_from_str(first, "%Y-%m-%d").is_ok() {
+        return Some(first.to_owned());
+    }
+    let epoch: i64 = first.parse().ok()?;
+    Some(
+        chrono::DateTime::from_timestamp(epoch, 0)?
+            .date_naive()
+            .to_string(),
+    )
+}
+
+fn first_csv_date(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let file = fs::File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+    lines.next();
+    csv_row_date(&lines.next()?.ok()?)
+}
+
+fn last_csv_row_date(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail = len.min(4096);
+    file.seek(SeekFrom::Start(len - tail)).ok()?;
+    let mut buf = vec![0u8; tail as usize];
+    file.read_exact(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(csv_row_date)
+}
+
+fn count_lines(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn build_data_sources(state: &AppState) -> Result<DataSourcesResponse> {
+    let data = &state.local.data;
+    let calendar = format!("{}.csv", data.calendar_symbol);
+    let mut feeds = Vec::new();
+    for (feed, dir) in [
+        ("daily", &data.daily_dir),
+        ("5m", &data.five_minute_dir),
+        ("1m", &data.one_minute_dir),
+    ] {
+        let exists = dir.is_dir();
+        let (files, bytes) = if exists {
+            dir_stats(dir, Some("csv"))
+        } else {
+            (0, 0)
+        };
+        let sample = dir.join(&calendar);
+        let (first_date, last_date, note) = if sample.is_file() {
+            (
+                first_csv_date(&sample),
+                last_csv_row_date(&sample),
+                Some(format!("coverage from {calendar}")),
+            )
+        } else {
+            (
+                None,
+                None,
+                exists.then(|| format!("{calendar} not present; coverage unknown")),
+            )
+        };
+        feeds.push(FeedInventory {
+            feed: feed.to_owned(),
+            path: dir.display().to_string(),
+            exists,
+            files,
+            bytes,
+            first_date,
+            last_date,
+            note,
+        });
+    }
+    let catalog_dir = &data.catalog_dir;
+    let mut extra_lists = Vec::new();
+    if let Ok(entries) = fs::read_dir(catalog_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".txt") && name != "stocks.txt" && name != "etfs.txt" {
+                extra_lists.push(format!("{name} ({})", count_lines(&entry.path())));
+            } else if entry.path().is_dir() {
+                extra_lists.push(format!("{name}/"));
+            }
+        }
+    }
+    extra_lists.sort();
+    let catalog = CatalogInventory {
+        path: catalog_dir.display().to_string(),
+        exists: catalog_dir.is_dir(),
+        catalog_rows: count_lines(&catalog_dir.join("catalog.csv")).saturating_sub(1),
+        stocks: count_lines(&data.stock_universe()),
+        etfs: count_lines(&data.etf_universe()),
+        extra_lists,
+    };
+    let freshness = data
+        .freshness_file
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let csv_library = CsvLibraryInventory {
+        provider: data.provider.clone(),
+        calendar_symbol: data.calendar_symbol.clone(),
+        feeds,
+        catalog,
+        freshness_file: data
+            .freshness_file
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        freshness,
+        update_command: data.update_command.clone(),
+    };
+    let lake = data.lake_dir.as_ref().map(|root| {
+        let mut feeds = Vec::new();
+        let mut total_bytes = 0u64;
+        for feed in [
+            "trades",
+            "book_snapshots",
+            "book_events",
+            "funding",
+            "open_interest",
+        ] {
+            let dir = root.join(feed);
+            let exists = dir.is_dir();
+            let (files, bytes) = if exists {
+                dir_stats(&dir, Some("parquet"))
+            } else {
+                (0, 0)
+            };
+            total_bytes += bytes;
+            let mut dates: Vec<String> = Vec::new();
+            let mut symbols = 0usize;
+            if let Ok(exchanges) = fs::read_dir(&dir) {
+                for exchange in exchanges.flatten() {
+                    if let Ok(syms) = fs::read_dir(exchange.path()) {
+                        for sym in syms.flatten() {
+                            symbols += 1;
+                            if let Ok(days) = fs::read_dir(sym.path()) {
+                                for day in days.flatten() {
+                                    let name = day.file_name().to_string_lossy().to_string();
+                                    if let Some(date) = name.strip_prefix("date=") {
+                                        dates.push(date.to_owned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dates.sort();
+            feeds.push(FeedInventory {
+                feed: feed.to_owned(),
+                path: dir.display().to_string(),
+                exists,
+                files,
+                bytes,
+                first_date: dates.first().cloned(),
+                last_date: dates.last().cloned(),
+                note: exists.then(|| format!("{symbols} exchange/symbol partitions")),
+            });
+        }
+        LakeInventory {
+            path: root.display().to_string(),
+            exists: root.is_dir(),
+            instruments: tessera::lake::discover(root).unwrap_or_default(),
+            feeds,
+            total_bytes,
+        }
+    });
+    let local_toml = state.root.join(tessera::local_config::LOCAL_FILE);
+    let env_overrides = [
+        "TESSERA_DATA_ROOT",
+        "TESSERA_ENGINE",
+        "TESSERA_STRATEGY_DIRS",
+        "TESSERA_MEMORY_BUDGET_GB",
+    ]
+    .into_iter()
+    .filter(|name| std::env::var_os(name).is_some())
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let memory_budget_gb = std::env::var("TESSERA_MEMORY_BUDGET_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                })
+                .map_or(8.0, |bytes| bytes * 0.5 / 1e9)
+        });
+    Ok(DataSourcesResponse {
+        generated_at: Utc::now().to_rfc3339(),
+        config: ConfigInventory {
+            local_toml: local_toml.display().to_string(),
+            local_toml_exists: local_toml.is_file(),
+            bundled_example: data.provider == "bundled-example",
+            env_overrides,
+            memory_budget_gb,
+        },
+        csv_library,
+        lake,
+    })
+}
+
+async fn data_sources(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<DataSourcesResponse>, ApiError> {
+    let refresh = query
+        .get("refresh")
+        .is_some_and(|v| v == "1" || v == "true");
+    if !refresh {
+        let cache = state
+            .data_sources
+            .lock()
+            .expect("data sources lock poisoned");
+        if let Some((built, response)) = cache.as_ref() {
+            if built.elapsed() < std::time::Duration::from_secs(600) {
+                return Ok(Json(response.clone()));
+            }
+        }
+    }
+    let worker = state.clone();
+    let response = tokio::task::spawn_blocking(move || build_data_sources(&worker))
+        .await
+        .context("data sources task failed")??;
+    *state
+        .data_sources
+        .lock()
+        .expect("data sources lock poisoned") = Some((std::time::Instant::now(), response.clone()));
+    Ok(Json(response))
 }
 
 async fn data_status(State(state): State<AppState>) -> Result<Json<DataStatusResponse>, ApiError> {

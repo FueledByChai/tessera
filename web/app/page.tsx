@@ -1629,6 +1629,192 @@ function StudiesWorkspace() {
   );
 }
 
+type FeedInventory = {
+  feed: string;
+  path: string;
+  exists: boolean;
+  files: number;
+  bytes: number;
+  first_date?: string | null;
+  last_date?: string | null;
+  note?: string | null;
+};
+type DataSources = {
+  generated_at: string;
+  config: {
+    local_toml: string;
+    local_toml_exists: boolean;
+    bundled_example: boolean;
+    env_overrides: string[];
+    memory_budget_gb: number;
+  };
+  csv_library: {
+    provider: string;
+    calendar_symbol: string;
+    feeds: FeedInventory[];
+    catalog: { path: string; exists: boolean; catalog_rows: number; stocks: number; etfs: number; extra_lists: string[] };
+    freshness_file?: string | null;
+    freshness?: Record<string, unknown> | null;
+    update_command?: string | null;
+  };
+  lake?: {
+    path: string;
+    exists: boolean;
+    feeds: FeedInventory[];
+    instruments: LakeInstrument[];
+    total_bytes: number;
+  } | null;
+};
+
+function gb(bytes: number) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  return `${(bytes / 1e3).toFixed(0)} KB`;
+}
+
+const LOCAL_TOML_TEMPLATE = `[data]
+daily_dir = "/path/to/eod"            # <SYMBOL>.csv  Date,Open,High,Low,Close,Adjusted_close,Volume
+five_minute_dir = "/path/to/5m"       # <SYMBOL>.csv  Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume
+one_minute_dir = "/path/to/1m"
+catalog_dir = "/path/to/catalog"      # catalog.csv + stocks.txt / etfs.txt universe lists
+calendar_symbol = "SPY.US"            # daily file whose dates define the trading calendar
+freshness_file = "/path/to/state.json"    # optional, shown as Updated
+update_command = "python3 /path/to/refresh.py"   # optional, the Run update button
+provider = "eodhd"
+lake_dir = "/path/to/lake"            # optional parquet tick lake (trades, book_snapshots, book_events)
+
+[strategies]
+dirs = ["../my-private-strategies"]`;
+
+/** Everything the console is configured to read, with coverage, and how to change it. */
+function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources | null; onRefresh: () => void; busy: boolean }) {
+  const [showConfig, setShowConfig] = useState(false);
+  if (!sources) {
+    return (
+      <section className="panel data-sources-panel">
+        <div className="terminal-panel-title"><span>SRC</span> DATA SOURCES</div>
+        <div className="empty-state">Scanning configured sources…</div>
+      </section>
+    );
+  }
+  const csv = sources.csv_library;
+  const lake = sources.lake;
+  const csvTotal = csv.feeds.reduce((sum, f) => sum + f.bytes, 0);
+  return (
+    <>
+      <section className="panel data-sources-panel">
+        <div className="terminal-panel-title">
+          <span>SRC</span> DATA SOURCES
+          <small>scanned {sources.generated_at.slice(0, 19).replace("T", " ")} UTC</small>
+          <button type="button" className="text-action source-filter" disabled={busy} onClick={onRefresh}>Rescan</button>
+          <button type="button" className="text-action source-filter" onClick={() => setShowConfig((v) => !v)}>
+            {showConfig ? "Hide configuration" : "Configure sources"}
+          </button>
+        </div>
+        {sources.config.bundled_example && (
+          <div className="run-failure">
+            <strong>Bundled example data</strong>
+            <span>No local.toml was found at {sources.config.local_toml}, so the console is reading the synthetic dataset under examples/data. Copy local.example.toml to local.toml and point it at your library.</span>
+          </div>
+        )}
+        <div className="source-block">
+          <div className="source-head">
+            <strong>CSV bar library</strong>
+            <span>provider {csv.provider} · calendar {csv.calendar_symbol} · {gb(csvTotal)}</span>
+          </div>
+          <div className="table-wrap"><table>
+            <thead><tr><th>Feed</th><th>Path</th><th>Files</th><th>Size</th><th>First</th><th>Last</th><th>Note</th></tr></thead>
+            <tbody>{csv.feeds.map((f) => (
+              <tr key={f.feed} className={f.exists ? "" : "source-missing"}>
+                <td>{f.feed}</td>
+                <td className="source-path">{f.path}</td>
+                <td>{f.exists ? f.files.toLocaleString() : "missing"}</td>
+                <td>{f.exists ? gb(f.bytes) : "—"}</td>
+                <td>{f.first_date ?? "—"}</td>
+                <td>{f.last_date ?? "—"}</td>
+                <td className="source-note">{f.note ?? ""}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+          <div className="source-facts">
+            <span><strong>Catalog</strong> {csv.catalog.exists ? `${csv.catalog.catalog_rows.toLocaleString()} rows · stocks.txt ${csv.catalog.stocks.toLocaleString()} · etfs.txt ${csv.catalog.etfs.toLocaleString()}${csv.catalog.extra_lists.length ? " · " + csv.catalog.extra_lists.join(", ") : ""}` : "missing"} <em className="source-path">{csv.catalog.path}</em></span>
+            <span><strong>Freshness</strong> {csv.freshness_file ? <>{csv.freshness ? JSON.stringify(csv.freshness).slice(0, 160) : "file not readable"} <em className="source-path">{csv.freshness_file}</em></> : "no freshness_file configured"}</span>
+            <span><strong>Update command</strong> {csv.update_command ? <code>{csv.update_command}</code> : "none configured"}</span>
+          </div>
+        </div>
+        <div className="source-block">
+          <div className="source-head">
+            <strong>Parquet tick lake</strong>
+            <span>{lake ? `${lake.instruments.length} instruments · ${gb(lake.total_bytes)}` : "not configured"}</span>
+          </div>
+          {lake ? (
+            <>
+              <div className="table-wrap"><table>
+                <thead><tr><th>Feed</th><th>Path</th><th>Files</th><th>Size</th><th>First</th><th>Last</th><th>Note</th></tr></thead>
+                <tbody>{lake.feeds.map((f) => (
+                  <tr key={f.feed} className={f.exists ? "" : "source-missing"}>
+                    <td>{f.feed}</td>
+                    <td className="source-path">{f.path}</td>
+                    <td>{f.exists ? f.files.toLocaleString() : "missing"}</td>
+                    <td>{f.exists ? gb(f.bytes) : "—"}</td>
+                    <td>{f.first_date ?? "—"}</td>
+                    <td>{f.last_date ?? "—"}</td>
+                    <td className="source-note">{f.note ?? ""}</td>
+                  </tr>
+                ))}</tbody>
+              </table></div>
+              <div className="table-wrap"><table>
+                <thead><tr><th>Instrument</th><th>Exchange</th><th>First</th><th>Last</th><th>Days</th><th>Feeds</th></tr></thead>
+                <tbody>{lake.instruments.map((i) => (
+                  <tr key={`${i.exchange}:${i.symbol}`}>
+                    <td>{i.exchange}:{i.symbol}</td>
+                    <td>{i.exchange}</td>
+                    <td>{i.first_date}</td>
+                    <td>{i.last_date}</td>
+                    <td>{i.days}</td>
+                    <td>trades{i.has_book ? " · L2 book" : ""}</td>
+                  </tr>
+                ))}</tbody>
+              </table></div>
+            </>
+          ) : (
+            <p className="source-note">Set <code>lake_dir</code> in local.toml to a folder holding <code>trades/</code>, <code>book_snapshots/</code>, and <code>book_events/</code> partitioned as <code>exchange=…/symbol=…/date=…/*.parquet</code> to enable EXCHANGE:SYMBOL instruments, 1s–30s bars, and studies.</p>
+          )}
+        </div>
+        <div className="source-facts">
+          <span><strong>Config file</strong> <em className="source-path">{sources.config.local_toml}</em> {sources.config.local_toml_exists ? "(present)" : "(missing)"}</span>
+          <span><strong>Environment overrides</strong> {sources.config.env_overrides.length ? sources.config.env_overrides.join(", ") : "none"} · memory budget {sources.config.memory_budget_gb.toFixed(1)} GB</span>
+        </div>
+      </section>
+      {showConfig && (
+        <section className="panel data-sources-panel">
+          <div className="terminal-panel-title"><span>CFG</span> CONFIGURING SOURCES</div>
+          <div className="source-config-grid">
+            <div>
+              <h3>Two source types</h3>
+              <p><strong>CSV bar library</strong> — one file per symbol per resolution. Daily rows are <code>Date,Open,High,Low,Close,Adjusted_close,Volume</code>; intraday rows are <code>Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume</code> with UTC epoch seconds. Any vendor works once exported to this layout; the catalog folder supplies names and the stocks/etfs universe lists.</p>
+              <p><strong>Parquet tick lake</strong> — trades, book snapshots, and L2 book events partitioned by exchange, symbol, and date. Enables second-resolution bars, order-book features on every bar, and feature studies.</p>
+              <h3>To add a source</h3>
+              <ol>
+                <li>Export or record it into one of the two layouts above (a new folder per feed).</li>
+                <li>Point the matching key in <code>local.toml</code> at it: <code>daily_dir</code>, <code>five_minute_dir</code>, <code>one_minute_dir</code>, <code>catalog_dir</code>, or <code>lake_dir</code>.</li>
+                <li>Restart the local service (relaunch Tessera). Rescan here to confirm files, sizes, and coverage.</li>
+                <li>Optional: set <code>freshness_file</code> and <code>update_command</code> so the Data page can show when the library was refreshed and run the refresh for you.</li>
+              </ol>
+              <p>A vendor with a different shape (a different CSV layout, a database, an API) needs a reader in the engine; see <code>docs/DATA_SOURCES.md</code> for where the two existing readers live and what a third one has to provide.</p>
+            </div>
+            <div>
+              <h3>local.toml</h3>
+              <pre className="source-template">{LOCAL_TOML_TEMPLATE}</pre>
+              <p className="source-note">Environment overrides: <code>TESSERA_DATA_ROOT</code> (a folder holding eod/, 5m/, 1m/, catalog/), <code>TESSERA_ENGINE</code>, <code>TESSERA_STRATEGY_DIRS</code>, <code>TESSERA_MEMORY_BUDGET_GB</code>.</p>
+            </div>
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
 type SweepOption = { value: string; label: string; suggested: string };
 
 /** Numeric manifest parameters become sweep axes, with a 3-point grid around the default. */
@@ -4366,6 +4552,11 @@ export default function Home() {
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [coverageDetail, setCoverageDetail] = useState<RunDetail | null>(null);
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
+  const [dataSources, setDataSources] = useState<DataSources | null>(null);
+  const loadDataSources = useCallback(async (refresh = false) => {
+    const response = await fetch(`${API}/data/sources${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
+    if (response.ok) setDataSources(await response.json());
+  }, []);
   const [sweeps, setSweeps] = useState<SweepRecord[]>([]);
   const [sweepDetail, setSweepDetail] = useState<SweepDetail | null>(null);
   const [compareDetails, setCompareDetails] = useState<RunDetail[]>([]);
@@ -4609,13 +4800,15 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (view !== "data") return;
+    const sources = window.setTimeout(() => void loadDataSources(), 0);
     const initial = window.setTimeout(() => void refreshDataStatus(), 0);
     const timer = window.setInterval(() => void refreshDataStatus(), 30_000);
     return () => {
+      window.clearTimeout(sources);
       window.clearTimeout(initial);
       window.clearInterval(timer);
     };
-  }, [view, refreshDataStatus]);
+  }, [view, refreshDataStatus, loadDataSources]);
   const openRun = useCallback(async (id: string) => {
     setBusy(true);
     setError("");
@@ -5535,6 +5728,7 @@ export default function Home() {
 
           {view === "data" && (
             <>
+              <DataSourcesPanel sources={dataSources} busy={busy} onRefresh={() => void loadDataSources(true)} />
               <section className="panel data-library-panel">
                 <div className="terminal-panel-title">
                   <span>LIB</span> DATA LIBRARY

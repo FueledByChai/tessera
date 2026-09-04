@@ -145,10 +145,24 @@ fn day_files(lake: &Path, sym: &LakeSymbol, feed: &str, date: NaiveDate) -> Resu
     Ok(files)
 }
 
-fn read_frame(path: &Path) -> Result<DataFrame> {
-    ParquetReader::new(fs::File::open(path).with_context(|| path.display().to_string())?)
-        .finish()
-        .with_context(|| format!("failed to read {}", path.display()))
+/// Reads one parquet part. A recorder that was stopped mid-write leaves a truncated or empty
+/// part behind (the last day of a capture typically has one); those are skipped with a warning
+/// rather than failing the whole symbol-day.
+fn read_frame(path: &Path) -> Option<DataFrame> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("warning: skipping {}: {error}", path.display());
+            return None;
+        }
+    };
+    match ParquetReader::new(file).finish() {
+        Ok(frame) => Some(frame),
+        Err(error) => {
+            eprintln!("warning: skipping unreadable {}: {error}", path.display());
+            None
+        }
+    }
 }
 
 fn f64_column(frame: &DataFrame, name: &str) -> Result<Vec<Option<f64>>> {
@@ -201,7 +215,9 @@ pub struct Trade {
 pub fn read_trades(lake: &Path, sym: &LakeSymbol, date: NaiveDate) -> Result<Vec<Trade>> {
     let mut trades = Vec::new();
     for path in day_files(lake, sym, "trades", date)? {
-        let frame = read_frame(&path)?;
+        let Some(frame) = read_frame(&path) else {
+            continue;
+        };
         let recv = i64_column(&frame, "recvTimestampMicros")?;
         let price = f64_column(&frame, "price")?;
         let size = f64_column(&frame, "size")?;
@@ -262,7 +278,9 @@ fn ladder(frame: &DataFrame, name: &str) -> Result<Vec<Vec<(f64, f64)>>> {
 pub fn read_snapshots(lake: &Path, sym: &LakeSymbol, date: NaiveDate) -> Result<Vec<Snapshot>> {
     let mut snapshots = Vec::new();
     for path in day_files(lake, sym, "book_snapshots", date)? {
-        let frame = read_frame(&path)?;
+        let Some(frame) = read_frame(&path) else {
+            continue;
+        };
         let recv = i64_column(&frame, "recvTimestampMicros")?;
         let epoch = i64_column(&frame, "bookEpoch")?;
         let bids = ladder(&frame, "bids")?;
@@ -297,7 +315,9 @@ pub struct BookEvent {
 pub fn read_book_events(lake: &Path, sym: &LakeSymbol, date: NaiveDate) -> Result<Vec<BookEvent>> {
     let mut events = Vec::new();
     for path in day_files(lake, sym, "book_events", date)? {
-        let frame = read_frame(&path)?;
+        let Some(frame) = read_frame(&path) else {
+            continue;
+        };
         let recv = i64_column(&frame, "recvTimestampMicros")?;
         let epoch = i64_column(&frame, "bookEpoch")?;
         let price = f64_column(&frame, "price")?;
@@ -699,6 +719,24 @@ pub fn diagnose_day(lake: &Path, sym: &LakeSymbol, date: NaiveDate) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_parts_are_skipped_not_fatal() {
+        let dir = std::env::temp_dir().join(format!("tessera-lake-test-{}", std::process::id()));
+        let day = dir
+            .join("trades")
+            .join("exchange=TEST")
+            .join("symbol=X")
+            .join("date=2026-01-02");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("part-000.parquet"), b"").unwrap();
+        fs::write(day.join("part-001.parquet"), b"PAR1garbage").unwrap();
+        let sym = LakeSymbol::parse("TEST:X").unwrap();
+        let trades = read_trades(&dir, &sym, NaiveDate::from_ymd_opt(2026, 1, 2).unwrap())
+            .expect("corrupt parts are warnings, not errors");
+        assert!(trades.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_lake_symbols() {

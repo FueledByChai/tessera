@@ -112,6 +112,9 @@ Daily bars are adjusted with `Adjusted_close / Close`; intraday bars are raw, an
 exposes both so strategies can compare a previous adjusted close with a raw intraday open
 correctly. Any provider works as long as it can be exported to this layout.
 
+The Data page lists every configured source with coverage; `docs/DATA_SOURCES.md` covers the
+layouts and how to add a source.
+
 ## Private strategies
 
 Keep proprietary strategies out of the repository by listing extra folders in `local.toml`:
