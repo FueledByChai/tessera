@@ -395,6 +395,7 @@ struct DashboardResponse {
     recent_runs: Vec<RunRecord>,
     jobs: Vec<JobRecord>,
     production_strategies: usize,
+    archived_strategies: usize,
     historical_reports: usize,
     active_jobs: usize,
     worker_capacity: usize,
@@ -971,9 +972,10 @@ fn ensure_column(
 
 fn seed_strategies(connection: &Connection) -> Result<()> {
     // Strategies come from compiled SDK manifests (see sync_sdk_strategies). Rows left behind
-    // by earlier builds stay visible for their run history but can no longer be queued.
+    // by earlier builds are archived: not runnable, hidden from the catalog by default, but kept
+    // so their runs, reports, and portfolios still resolve.
     connection.execute(
-        "UPDATE strategies SET runnable = 0
+        "UPDATE strategies SET runnable = 0, status = 'Archived'
          WHERE id != 'sdk' AND (base_strategy_id IS NULL OR base_strategy_id != 'sdk')",
         [],
     )?;
@@ -4693,15 +4695,21 @@ fn load_dashboard(state: &AppState) -> Result<DashboardResponse> {
         [],
         |row| row.get::<_, i64>(0),
     )? as usize;
+    // Archived rows (pre-SDK strategies kept for run history) stay out of the headline counts.
     let production_strategies = strategies
         .iter()
         .filter(|item| item.status == "Production")
+        .count();
+    let archived_strategies = strategies
+        .iter()
+        .filter(|item| item.status == "Archived")
         .count();
     Ok(DashboardResponse {
         strategies,
         recent_runs,
         jobs,
         production_strategies,
+        archived_strategies,
         historical_reports,
         active_jobs,
         worker_capacity: 2,

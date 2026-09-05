@@ -15,6 +15,14 @@ if ! curl -fsS "$HEALTH" >/dev/null 2>&1; then
   # Console bundle: build when missing or when the source is newer than the bundle.
   if [ ! -f "$ROOT/web/dist/index.html" ] || [ -n "$(find "$ROOT/web/app" "$ROOT/web/src" -newer "$ROOT/web/dist/index.html" 2>/dev/null | head -1)" ]; then
     osascript -e 'display notification "Building the console bundle" with title "Tessera"' >/dev/null 2>&1 || true
+    # node_modules lives outside iCloud-synced folders: macOS evicts large files there and
+    # tools stall while they re-download. Keep it under ~/Library/Caches behind a symlink.
+    NODE_CACHE="$HOME/Library/Caches/Tessera/web-node_modules"
+    if [ ! -L "$ROOT/web/node_modules" ]; then
+      rm -rf "$ROOT/web/node_modules"
+      mkdir -p "$NODE_CACHE"
+      ln -s "$NODE_CACHE" "$ROOT/web/node_modules"
+    fi
     if [ ! -x "$ROOT/web/node_modules/.bin/vite" ]; then
       (cd "$ROOT/web" && npm ci --no-audit --no-fund) >"$LOG_DIR/npm-install.log" 2>&1
     fi

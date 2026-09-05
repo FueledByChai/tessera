@@ -2841,6 +2841,7 @@ function catalogStatusClass(status: string) {
   if (key === "production") return "catalog-status production";
   if (key === "research") return "catalog-status research";
   if (key === "sample") return "catalog-status sample";
+  if (key === "archived") return "catalog-status archived";
   return "catalog-status blocked";
 }
 
@@ -3237,6 +3238,7 @@ function StrategyCatalog({
   const [query, setQuery] = useState("");
   const [groupBy, setGroupBy] = useState<CatalogGroupBy>("asset");
   const [statusFilter, setStatusFilter] = useState("all");
+  const [showArchived, setShowArchived] = useState(false);
   const [sortKey, setSortKey] = useState<CatalogSortKey>("name");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [collapsed, setCollapsed] = useState<string[]>([]);
@@ -3266,6 +3268,8 @@ function StrategyCatalog({
   const groups = useMemo<CatalogGroup[]>(() => {
     const needle = query.trim().toLowerCase();
     const visible = strategies.filter((strategy) => {
+      // Archived rows are pre-SDK strategies kept for their run history; hide them unless asked.
+      if (strategy.status === "Archived" && !showArchived && statusFilter !== "Archived") return false;
       if (statusFilter !== "all" && strategy.status !== statusFilter) return false;
       if (!needle) return true;
       return [
@@ -3304,7 +3308,7 @@ function StrategyCatalog({
       label: key,
       rows: orderCatalogRows(buckets.get(key) ?? [], sortKey, sortDir, runStats),
     }));
-  }, [strategies, query, statusFilter, groupBy, sortKey, sortDir, runStats]);
+  }, [strategies, query, statusFilter, showArchived, groupBy, sortKey, sortDir, runStats]);
 
   const visibleRows = useMemo(
     () => groups.flatMap((group) => (collapsed.includes(group.key) ? [] : group.rows)),
@@ -3412,8 +3416,12 @@ function StrategyCatalog({
             ))}
           </select>
         </label>
+        <label className="catalog-select catalog-toggle">
+          <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+          <span>Show archived ({strategies.filter((s) => s.status === "Archived").length})</span>
+        </label>
         <span className="catalog-count">
-          {matchCount} / {strategies.length} strategies
+          {matchCount} / {strategies.filter((s) => s.status !== "Archived" || showArchived).length} strategies
         </span>
       </div>
       <div className="catalog-layout">
@@ -5487,7 +5495,7 @@ export default function Home() {
                 <strong>Research console</strong>
                 <span className="fn-context">
                   {connected ? "ENGINE READY" : "START API"} ·{" "}
-                  {dashboard.strategies.length} STRATEGIES ·{" "}
+                  {dashboard.strategies.filter((s) => s.status !== "Archived").length} STRATEGIES ·{" "}
                   {dashboard.historical_reports} HISTORICAL REPORTS ·{" "}
                   {dashboard.active_jobs}/{dashboard.worker_capacity} WORKERS BUSY
                 </span>
@@ -5510,7 +5518,7 @@ export default function Home() {
                 />
                 <Metric
                   label="Runnable in UI"
-                  value={`${dashboard.strategies.filter((item) => item.runnable).length} / ${dashboard.strategies.length}`}
+                  value={`${dashboard.strategies.filter((item) => item.runnable).length} / ${dashboard.strategies.filter((s) => s.status !== "Archived").length}`}
                   note="Stocks, ETFs, FX, and crypto"
                 />
               </section>
@@ -5529,7 +5537,7 @@ export default function Home() {
                     </button>
                   </div>
                   <div className="strategy-list">
-                    {dashboard.strategies.map((strategy) => (
+                    {dashboard.strategies.filter((s) => s.status !== "Archived").map((strategy) => (
                       <article className="strategy-row" key={strategy.id}>
                         <span className="strategy-icon">
                           {strategy.name.slice(0, 2).toUpperCase()}
