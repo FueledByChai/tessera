@@ -123,6 +123,9 @@ pub struct LimitRules {
     /// Opening-only (like a broker's limit-on-open): fills only if the first observed open
     /// is through the limit; otherwise the order is cancelled instead of resting in the bar.
     pub open_only: bool,
+    /// Cap the filled notional: when the fill price is better than the limit (a gap through
+    /// it), the quantity is reduced so `quantity x fill price` stays within this budget.
+    pub max_notional: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -668,7 +671,13 @@ impl SimulatedBroker {
     /// Rounds to the tick grid and never returns a price below one tick: fixed-tick
     /// slippage on a sub-penny print must not produce a zero or negative fill.
     fn round_tick(&self, value: f64) -> f64 {
-        let rounded = (value / self.costs.tick_size).round() * self.costs.tick_size;
+        // The basis-point cost model has no tick slippage, so prints keep their precision
+        // (sub-penny opens are real); the tick model rounds to the grid. Never below a tick.
+        let rounded = if self.costs.all_in_round_trip_bps.is_some() {
+            value
+        } else {
+            (value / self.costs.tick_size).round() * self.costs.tick_size
+        };
         if self.costs.tick_size > 0.0 {
             rounded.max(self.costs.tick_size)
         } else {
@@ -683,41 +692,52 @@ impl SimulatedBroker {
         reference_price: f64,
         intent: OrderIntent,
     ) -> BrokerEvent {
-        let (symbol, side, quantity, stop, stop_percent, target, time_exit, metadata, limit_cap) =
-            match intent {
-                OrderIntent::EnterBracket {
-                    symbol,
-                    side,
-                    quantity,
-                    stop,
-                    target,
-                    metadata,
-                    ..
-                } => (
-                    symbol, side, quantity, stop, None, target, None, metadata, None,
-                ),
-                OrderIntent::EnterLimit {
-                    symbol,
-                    side,
-                    quantity,
-                    rules,
-                    stop_percent,
-                    target,
-                    time_exit,
-                    metadata,
-                } => (
-                    symbol,
-                    side,
-                    quantity,
-                    None,
-                    stop_percent,
-                    target,
-                    time_exit,
-                    metadata,
-                    Some(rules.limit),
-                ),
-                _ => unreachable!("open_position requires an entry intent"),
-            };
+        let (
+            symbol,
+            side,
+            quantity,
+            stop,
+            stop_percent,
+            target,
+            time_exit,
+            metadata,
+            limit_cap,
+            max_notional,
+        ) = match intent {
+            OrderIntent::EnterBracket {
+                symbol,
+                side,
+                quantity,
+                stop,
+                target,
+                metadata,
+                ..
+            } => (
+                symbol, side, quantity, stop, None, target, None, metadata, None, None,
+            ),
+            OrderIntent::EnterLimit {
+                symbol,
+                side,
+                quantity,
+                rules,
+                stop_percent,
+                target,
+                time_exit,
+                metadata,
+            } => (
+                symbol,
+                side,
+                quantity,
+                None,
+                stop_percent,
+                target,
+                time_exit,
+                metadata,
+                Some(rules.limit),
+                rules.max_notional,
+            ),
+            _ => unreachable!("open_position requires an entry intent"),
+        };
         if quantity <= 0.0 || !quantity.is_finite() || self.positions.contains_key(&symbol) {
             return BrokerEvent::OrderRejected {
                 symbol,
@@ -745,6 +765,18 @@ impl SimulatedBroker {
             };
         }
         let mut quantity = quantity;
+        if let Some(budget) = max_notional {
+            // Sized against the limit; the actual fill may be better, so respect the budget.
+            let affordable = budget / entry_price;
+            let affordable = if quantity.fract() == 0.0 {
+                affordable.floor()
+            } else {
+                affordable
+            };
+            if affordable < quantity && affordable > 0.0 {
+                quantity = affordable;
+            }
+        }
         if let Some(cap) = self.limits.max_gross_exposure {
             let available = equity * cap - self.gross_notional();
             let notional = entry_price * quantity;
@@ -1838,6 +1870,7 @@ mod tests {
                 cancel_if_first_open_within: None,
                 expires_at: None,
                 open_only: true,
+                max_notional: None,
             },
             stop_percent: None,
             target: None,

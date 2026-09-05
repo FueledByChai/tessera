@@ -481,6 +481,11 @@ impl Ctx {
                 limit: order.limit,
                 cancel_if_first_open_within: order.cancel_if_first_open_within,
                 open_only: order.open_only,
+                max_notional: match size {
+                    Size::Units(_) => None,
+                    Size::Percent(fraction) => Some(self.equity * fraction),
+                    Size::Default => Some(self.equity * self.sizing.position_percent),
+                },
                 expires_at: order.expires_at,
             },
             stop_percent: order.stop_percent,

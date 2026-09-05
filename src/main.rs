@@ -90,6 +90,9 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value_t = 5)]
         rows: usize,
+        /// Also write the whole table as CSV to this path.
+        #[arg(long)]
+        csv_out: Option<PathBuf>,
     },
 }
 
@@ -228,9 +231,17 @@ fn main() -> Result<()> {
                 .context("symbol must look like EXCHANGE:SYMBOL")?;
             print!("{}", tessera::lake::diagnose_day(&lake, &sym, date)?);
         }
-        Command::ParquetSchema { path, rows } => {
+        Command::ParquetSchema {
+            path,
+            rows,
+            csv_out,
+        } => {
             use polars::prelude::*;
-            let frame = ParquetReader::new(std::fs::File::open(&path)?).finish()?;
+            let mut frame = ParquetReader::new(std::fs::File::open(&path)?).finish()?;
+            if let Some(out) = csv_out {
+                CsvWriter::new(std::fs::File::create(&out)?).finish(&mut frame)?;
+                println!("wrote {}", out.display());
+            }
             println!("{} rows x {} columns", frame.height(), frame.width());
             for (name, dtype) in frame.get_column_names().iter().zip(frame.dtypes()) {
                 println!("  {name}: {dtype:?}");
