@@ -120,6 +120,9 @@ pub struct LimitRules {
     pub cancel_if_first_open_within: Option<f64>,
     /// Stop working at this time (no fills at or after it).
     pub expires_at: Option<NaiveTime>,
+    /// Opening-only (like a broker's limit-on-open): fills only if the first observed open
+    /// is through the limit; otherwise the order is cancelled instead of resting in the bar.
+    pub open_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,7 +130,7 @@ pub enum OrderIntent {
     EnterBracket {
         symbol: String,
         side: Side,
-        quantity: usize,
+        quantity: f64,
         timing: ExecutionTiming,
         stop: Option<f64>,
         target: Option<f64>,
@@ -138,7 +141,7 @@ pub enum OrderIntent {
     EnterLimit {
         symbol: String,
         side: Side,
-        quantity: usize,
+        quantity: f64,
         rules: LimitRules,
         stop_percent: Option<f64>,
         target: Option<f64>,
@@ -193,7 +196,7 @@ impl OrderIntent {
 pub struct PositionSnapshot {
     pub symbol: String,
     pub side: Side,
-    pub quantity: usize,
+    pub quantity: f64,
     pub entry_price: f64,
     pub stop: Option<f64>,
     pub target: Option<f64>,
@@ -212,7 +215,7 @@ pub struct PortfolioSnapshot {
 pub struct CompletedTrade {
     pub symbol: String,
     pub side: Side,
-    pub quantity: usize,
+    pub quantity: f64,
     pub entry_date: NaiveDate,
     pub entry_time: NaiveTime,
     pub exit_date: NaiveDate,
@@ -548,26 +551,26 @@ impl SimulatedBroker {
         &self.completed_trades
     }
 
-    fn entry_commission_for(&self, price: f64, quantity: usize) -> f64 {
+    fn entry_commission_for(&self, price: f64, quantity: f64) -> f64 {
         match self.costs.all_in_round_trip_bps {
-            Some(bps) => price * quantity as f64 * bps / 20_000.0,
+            Some(bps) => price * quantity * bps / 20_000.0,
             None => self.capped_unit_commission(price, quantity),
         }
     }
 
-    fn exit_commission_for(&self, entry_price: f64, quantity: usize) -> f64 {
+    fn exit_commission_for(&self, entry_price: f64, quantity: f64) -> f64 {
         match self.costs.all_in_round_trip_bps {
-            Some(bps) => entry_price * quantity as f64 * bps / 20_000.0,
+            Some(bps) => entry_price * quantity * bps / 20_000.0,
             None => self.capped_unit_commission(entry_price, quantity),
         }
     }
 
     /// Per-unit commission, capped at `max_commission_percent_of_notional` of the fill.
-    fn capped_unit_commission(&self, price: f64, quantity: usize) -> f64 {
-        let raw = quantity as f64 * self.costs.commission_per_unit_per_fill;
+    fn capped_unit_commission(&self, price: f64, quantity: f64) -> f64 {
+        let raw = quantity * self.costs.commission_per_unit_per_fill;
         match self.costs.max_commission_percent_of_notional {
             Some(percent) if percent.is_finite() && percent >= 0.0 => {
-                raw.min(price * quantity as f64 * percent / 100.0)
+                raw.min(price * quantity * percent / 100.0)
             }
             _ => raw,
         }
@@ -585,7 +588,7 @@ impl SimulatedBroker {
                     .map_or(position.snapshot.entry_price, |(_, _, price)| *price);
                 position.snapshot.side.sign()
                     * (mark - position.snapshot.entry_price)
-                    * position.snapshot.quantity as f64
+                    * position.snapshot.quantity
                     - position.entry_commission
             })
             .sum::<f64>();
@@ -596,7 +599,7 @@ impl SimulatedBroker {
     fn gross_notional(&self) -> f64 {
         self.positions
             .values()
-            .map(|position| position.snapshot.entry_price * position.snapshot.quantity as f64)
+            .map(|position| position.snapshot.entry_price * position.snapshot.quantity)
             .sum()
     }
 
@@ -715,7 +718,7 @@ impl SimulatedBroker {
                 ),
                 _ => unreachable!("open_position requires an entry intent"),
             };
-        if quantity == 0 || self.positions.contains_key(&symbol) {
+        if quantity <= 0.0 || !quantity.is_finite() || self.positions.contains_key(&symbol) {
             return BrokerEvent::OrderRejected {
                 symbol,
                 reason: "zero quantity or existing position".to_owned(),
@@ -744,14 +747,20 @@ impl SimulatedBroker {
         let mut quantity = quantity;
         if let Some(cap) = self.limits.max_gross_exposure {
             let available = equity * cap - self.gross_notional();
-            let notional = entry_price * quantity as f64;
+            let notional = entry_price * quantity;
             if notional > available {
+                // Whole-unit orders are cut to whole units; fractional orders keep fractions.
                 let affordable = if available > 0.0 && entry_price > 0.0 {
-                    (available / entry_price).floor() as usize
+                    let raw = available / entry_price;
+                    if quantity.fract() == 0.0 {
+                        raw.floor()
+                    } else {
+                        raw
+                    }
                 } else {
-                    0
+                    0.0
                 };
-                if affordable == 0 {
+                if affordable <= 0.0 {
                     return BrokerEvent::OrderRejected {
                         symbol,
                         reason: format!(
@@ -816,7 +825,7 @@ impl SimulatedBroker {
             self.exit_commission_for(position.snapshot.entry_price, position.snapshot.quantity);
         let gross_pnl = position.snapshot.side.sign()
             * (exit_price - position.snapshot.entry_price)
-            * position.snapshot.quantity as f64;
+            * position.snapshot.quantity;
         let commission = position.entry_commission + exit_commission;
         let pnl = gross_pnl - commission;
         self.realized_equity += pnl;
@@ -922,6 +931,12 @@ impl SimulatedBroker {
             if through {
                 let pending = self.pending_limits.remove(&symbol).expect("pending limit");
                 fillable.push(pending.intent);
+            } else if rules.open_only {
+                self.pending_limits.remove(&symbol);
+                events.push(BrokerEvent::OrderRejected {
+                    symbol,
+                    reason: "open_only_not_through".to_owned(),
+                });
             }
         }
         let (allowed, dropped) = self.arbitrate_entries(date, fillable);
@@ -974,6 +989,10 @@ impl SimulatedBroker {
                 continue;
             };
             if rules.expires_at.is_some_and(|expiry| time >= expiry) {
+                continue;
+            }
+            if rules.open_only {
+                // Never fills inside a bar; it either filled at the open or was cancelled.
                 continue;
             }
             pending.first_open_seen = true;
@@ -1547,7 +1566,7 @@ mod tests {
                 return Ok(vec![OrderIntent::EnterBracket {
                     symbol: self.symbol.clone(),
                     side: Side::Buy,
-                    quantity: 10,
+                    quantity: 10.0,
                     timing: ExecutionTiming::NextBarOpen,
                     stop: None,
                     target: None,
@@ -1615,7 +1634,7 @@ mod tests {
         }
     }
 
-    fn market_entry(symbol: &str, quantity: usize) -> OrderIntent {
+    fn market_entry(symbol: &str, quantity: f64) -> OrderIntent {
         OrderIntent::EnterBracket {
             symbol: symbol.to_owned(),
             side: Side::Buy,
@@ -1662,7 +1681,7 @@ mod tests {
         let mut broker = SimulatedBroker::new(173_650.0, guard_costs()).unwrap();
         let session_close = close_event(date.pred_opt().unwrap(), 0.0001, "ADTC");
         broker
-            .submit(&session_close, vec![market_entry("ADTC", 173_650_494)])
+            .submit(&session_close, vec![market_entry("ADTC", 173_650_494.0)])
             .unwrap();
         let events = broker
             .on_market_event(&open_event(date, 0.0001, "ADTC"))
@@ -1674,7 +1693,7 @@ mod tests {
                 _ => None,
             })
             .expect("legacy behaviour fills the order");
-        let notional = opened.entry_price * opened.quantity as f64;
+        let notional = opened.entry_price * opened.quantity;
         assert!(notional / 173_650.0 > 8.0, "notional was {notional}");
     }
 
@@ -1689,7 +1708,7 @@ mod tests {
             });
         let session_close = close_event(date.pred_opt().unwrap(), 0.0001, "ADTC");
         broker
-            .submit(&session_close, vec![market_entry("ADTC", 173_650_494)])
+            .submit(&session_close, vec![market_entry("ADTC", 173_650_494.0)])
             .unwrap();
         let events = broker
             .on_market_event(&open_event(date, 0.0001, "ADTC"))
@@ -1701,9 +1720,9 @@ mod tests {
                 _ => None,
             })
             .expect("the entry still fills, at a size the account can carry");
-        let notional = opened.entry_price * opened.quantity as f64;
+        let notional = opened.entry_price * opened.quantity;
         assert!(notional <= 173_650.0 + 0.01, "notional was {notional}");
-        assert_eq!(opened.quantity, 17_365_000);
+        assert!((opened.quantity - 17_365_000.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1718,7 +1737,7 @@ mod tests {
         let prior = close_event(date.pred_opt().unwrap(), 100.0, "AAA");
         // 900 shares at ~$100 uses 90% of buying power.
         broker
-            .submit(&prior, vec![market_entry("AAA", 900)])
+            .submit(&prior, vec![market_entry("AAA", 900.0)])
             .unwrap();
         broker
             .on_market_event(&open_event(date, 100.0, "AAA"))
@@ -1726,7 +1745,7 @@ mod tests {
         // A second symbol asking for another 50% is cut to what remains (~10%).
         let prior_b = close_event(date, 100.0, "BBB");
         broker
-            .submit(&prior_b, vec![market_entry("BBB", 500)])
+            .submit(&prior_b, vec![market_entry("BBB", 500.0)])
             .unwrap();
         let next = date.succ_opt().unwrap();
         let events = broker
@@ -1739,7 +1758,7 @@ mod tests {
                 _ => None,
             })
             .expect("fills within remaining buying power");
-        assert!(opened.quantity < 110, "quantity was {}", opened.quantity);
+        assert!(opened.quantity < 110.0, "quantity was {}", opened.quantity);
         assert!(broker.gross_notional() <= broker.total_equity() * 1.0 + 0.01);
     }
 
@@ -1753,7 +1772,7 @@ mod tests {
         let mut broker = SimulatedBroker::new(1_000.0, costs).unwrap();
         let prior = close_event(date.pred_opt().unwrap(), 10.0, "AAA");
         broker
-            .submit(&prior, vec![market_entry("AAA", 100)])
+            .submit(&prior, vec![market_entry("AAA", 100.0)])
             .unwrap();
         broker
             .on_market_event(&open_event(date, 10.0, "AAA"))
@@ -1774,7 +1793,9 @@ mod tests {
             "equity {}",
             broker.total_equity()
         );
-        broker.submit(&close, vec![market_entry("BBB", 1)]).unwrap();
+        broker
+            .submit(&close, vec![market_entry("BBB", 1.0)])
+            .unwrap();
         let next = date.succ_opt().unwrap();
         let events = broker
             .on_market_event(&open_event(next, 10.0, "BBB"))
@@ -1797,11 +1818,72 @@ mod tests {
         costs.max_commission_percent_of_notional = Some(1.0);
         let broker = SimulatedBroker::new(100_000.0, costs).unwrap();
         // 1,000,000 shares at $0.01: raw commission $5,000 vs 1% of $10,000 notional = $100.
-        assert!((broker.entry_commission_for(0.01, 1_000_000) - 100.0).abs() < 1e-9);
+        assert!((broker.entry_commission_for(0.01, 1_000_000.0) - 100.0).abs() < 1e-9);
         // A normal fill is unaffected: 100 shares at $50 -> $0.50 raw vs $50 cap.
-        assert!((broker.entry_commission_for(50.0, 100) - 0.5).abs() < 1e-9);
+        assert!((broker.entry_commission_for(50.0, 100.0) - 0.5).abs() < 1e-9);
         let uncapped = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
-        assert!((uncapped.entry_commission_for(0.01, 1_000_000) - 5_000.0).abs() < 1e-9);
+        assert!((uncapped.entry_commission_for(0.01, 1_000_000.0) - 5_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn open_only_limit_fills_at_the_open_or_is_cancelled() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        let mut broker = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
+        let sell_limit = |symbol: &str| OrderIntent::EnterLimit {
+            symbol: symbol.to_owned(),
+            side: Side::Sell,
+            quantity: 10.0,
+            rules: LimitRules {
+                limit: 100.0,
+                cancel_if_first_open_within: None,
+                expires_at: None,
+                open_only: true,
+            },
+            stop_percent: None,
+            target: None,
+            time_exit: None,
+            metadata: BTreeMap::new(),
+        };
+        let start = MarketEvent::SessionStart {
+            date,
+            symbols: Arc::from(vec!["UP".to_owned(), "DOWN".to_owned()]),
+        };
+        broker
+            .submit(&start, vec![sell_limit("UP"), sell_limit("DOWN")])
+            .unwrap();
+        // UP opens above the limit (gap up): the short fills at the open. DOWN opens below:
+        // cancelled even though the bar later trades through the limit.
+        let open = MarketEvent::BarOpen {
+            date,
+            time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            prices: BTreeMap::from([
+                ("UP".to_owned(), MarketOpen { price: 101.0 }),
+                ("DOWN".to_owned(), MarketOpen { price: 99.0 }),
+            ]),
+        };
+        let events = broker.on_market_event(&open).unwrap();
+        assert!(events.iter().any(|e| matches!(e, BrokerEvent::PositionOpened { position } if position.symbol == "UP" && (position.entry_price - 101.0).abs() < 0.02)));
+        assert!(events.iter().any(|e| matches!(e, BrokerEvent::OrderRejected { symbol, reason } if symbol == "DOWN" && reason == "open_only_not_through")));
+        let close = MarketEvent::BarClose {
+            date,
+            time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            bars: BTreeMap::from([(
+                "DOWN".to_owned(),
+                MarketBar {
+                    open: 99.0,
+                    high: 102.0,
+                    low: 98.0,
+                    close: 101.0,
+                    volume: 1.0,
+                },
+            )]),
+        };
+        let events = broker.on_market_event(&close).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, BrokerEvent::PositionOpened { .. }))
+        );
     }
 
     #[test]
@@ -1896,7 +1978,7 @@ mod tests {
                 vec![OrderIntent::EnterBracket {
                     symbol: "AAA".to_owned(),
                     side: Side::Buy,
-                    quantity: 10,
+                    quantity: 10.0,
                     timing: ExecutionTiming::Immediate,
                     stop: Some(95.0),
                     target: Some(105.0),
@@ -1947,7 +2029,7 @@ mod tests {
                 vec![OrderIntent::EnterBracket {
                     symbol: "AAA".to_owned(),
                     side: Side::Buy,
-                    quantity: 10,
+                    quantity: 10.0,
                     timing: ExecutionTiming::Immediate,
                     stop: None,
                     target: None,

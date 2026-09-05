@@ -1881,6 +1881,7 @@ const SDK_PLATFORM_KEYS: &[&str] = &[
     "session",
     "position_percent",
     "min_price",
+    "fractional_units",
     "initial_capital",
     "max_entries_per_day",
     "max_open_positions",
@@ -2316,6 +2317,9 @@ fn build_sdk_run_config(
             initial_capital,
             position_percent,
             min_price,
+            fractional_units: object
+                .get("fractional_units")
+                .and_then(serde_json::Value::as_bool),
         },
         costs,
         limits,

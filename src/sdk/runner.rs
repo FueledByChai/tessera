@@ -134,6 +134,9 @@ pub struct SdkSizingConfig {
     /// Fraction of equity per `Size::Default` entry, for example `1.0` for fully invested.
     #[serde(default = "default_position_percent")]
     pub position_percent: f64,
+    /// Size in fractional units (crypto, FX). Defaults to the strategy manifest's declaration.
+    #[serde(default)]
+    pub fractional_units: Option<bool>,
     /// Entries are skipped when the reference price is below this. Sub-dollar prices make
     /// fixed-tick slippage and per-share commission meaningless, and a $0.0001 print can
     /// otherwise turn a 5% allocation into tens of millions of shares. Set to 0 to disable.
@@ -157,6 +160,7 @@ impl Default for SdkSizingConfig {
             initial_capital: default_capital(),
             position_percent: default_position_percent(),
             min_price: default_min_price(),
+            fractional_units: None,
         }
     }
 }
@@ -757,7 +761,7 @@ struct TradeRow {
     exit_time: NaiveTime,
     entry_price: f64,
     exit_price: f64,
-    quantity: usize,
+    quantity: f64,
     gross_pnl: f64,
     commission: f64,
     pnl: f64,
@@ -819,6 +823,10 @@ fn make_instance(
             sizing: SizingPolicy {
                 position_percent: config.sizing.position_percent,
                 min_price: config.sizing.min_price,
+                fractional_units: config
+                    .sizing
+                    .fractional_units
+                    .unwrap_or(entry.manifest.fractional_units),
             },
             allows_short: entry.manifest.allows_short,
             live_from: start,
@@ -1530,7 +1538,7 @@ pub fn run(
         .completed_trades()
         .iter()
         .map(|trade| {
-            let notional = trade.entry_price * trade.quantity as f64;
+            let notional = trade.entry_price * trade.quantity;
             StandardTradeRecord {
                 symbol: trade.symbol.clone(),
                 direction: match trade.side {
@@ -1549,7 +1557,7 @@ pub fn run(
                 leverage: (trade.equity_at_entry > 0.0).then(|| notional / trade.equity_at_entry),
                 entry_price: Some(trade.entry_price),
                 exit_price: Some(trade.exit_price),
-                quantity: Some(trade.quantity as f64),
+                quantity: Some(trade.quantity),
             }
         })
         .collect::<Vec<_>>();

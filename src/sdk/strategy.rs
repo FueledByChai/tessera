@@ -60,7 +60,7 @@ pub enum Size {
     /// A fraction of current total equity, for example `0.5` for half.
     Percent(f64),
     /// An explicit unit count.
-    Units(usize),
+    Units(f64),
 }
 
 /// When an entry or exit should execute.
@@ -90,6 +90,7 @@ pub struct LimitOrder {
     pub stop_percent: Option<f64>,
     pub target: Option<f64>,
     pub time_exit: Option<TimeExit>,
+    pub open_only: bool,
 }
 
 impl LimitOrder {
@@ -101,9 +102,15 @@ impl LimitOrder {
             stop_percent: None,
             target: None,
             time_exit: None,
+            open_only: false,
         }
     }
     /// Stop working at this wall-clock time.
+    /// Fill only at the first open (limit-on-open); cancelled if the open is not through.
+    pub fn open_only(mut self) -> Self {
+        self.open_only = true;
+        self
+    }
     pub fn expires_at(mut self, time: NaiveTime) -> Self {
         self.expires_at = Some(time);
         self
@@ -139,7 +146,7 @@ impl LimitOrder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Position {
     pub side: Side,
-    pub quantity: usize,
+    pub quantity: f64,
     pub entry_price: f64,
     pub stop: Option<f64>,
     pub target: Option<f64>,
@@ -160,7 +167,7 @@ pub enum Fill {
     Opened(Position),
     Closed {
         side: Side,
-        quantity: usize,
+        quantity: f64,
         entry_price: f64,
         exit_price: f64,
         pnl: f64,
@@ -177,6 +184,8 @@ pub struct SizingPolicy {
     pub position_percent: f64,
     /// Entries below this reference price are skipped (platform data-quality guard).
     pub min_price: f64,
+    /// Size in fractional units (crypto, FX) instead of whole shares.
+    pub fractional_units: bool,
 }
 
 /// Run-wide scratch space visible to every strategy instance.
@@ -211,6 +220,7 @@ pub struct Ctx {
     shared: SharedState,
     orders: Vec<OrderIntent>,
     tags: BTreeMap<String, String>,
+    exit_requested: bool,
 }
 
 impl Ctx {
@@ -364,6 +374,13 @@ impl Ctx {
             timing: exec.into(),
             reason: reason.to_owned(),
         });
+        // The position is on its way out, so a fresh entry may be queued in the same bar
+        // (close at this bar's close, re-enter at the next open is a common pattern).
+        self.exit_requested = true;
+    }
+
+    fn holds_position(&self) -> bool {
+        self.position.is_some() && !self.exit_requested
     }
     /// Move the protective stop of the open position.
     pub fn set_stop(&mut self, price: f64) {
@@ -397,7 +414,7 @@ impl Ctx {
         });
     }
 
-    fn quantity_for(&self, size: Size, reference_price: f64) -> usize {
+    fn quantity_for(&self, size: Size, reference_price: f64) -> f64 {
         match size {
             Size::Units(units) => units,
             Size::Percent(fraction) => self.units_for(fraction, reference_price),
@@ -413,7 +430,7 @@ impl Ctx {
         stop: Option<f64>,
         target: Option<f64>,
     ) {
-        if self.warming_up || self.screening || self.position.is_some() {
+        if self.warming_up || self.screening || self.holds_position() {
             return;
         }
         if side == Side::Sell && !self.allows_short {
@@ -423,7 +440,7 @@ impl Ctx {
             return;
         }
         let quantity = self.quantity_for(size, self.last_price);
-        if quantity == 0 {
+        if quantity <= 0.0 {
             return;
         }
         let metadata = std::mem::take(&mut self.tags);
@@ -439,7 +456,7 @@ impl Ctx {
     }
 
     fn enter_limit(&mut self, side: Side, size: Size, order: LimitOrder) {
-        if self.warming_up || self.screening || self.position.is_some() {
+        if self.warming_up || self.screening || self.holds_position() {
             return;
         }
         if side == Side::Sell && !self.allows_short {
@@ -452,7 +469,7 @@ impl Ctx {
             return;
         }
         let quantity = self.quantity_for(size, order.limit);
-        if quantity == 0 {
+        if quantity <= 0.0 {
             return;
         }
         let metadata = std::mem::take(&mut self.tags);
@@ -463,6 +480,7 @@ impl Ctx {
             rules: LimitRules {
                 limit: order.limit,
                 cancel_if_first_open_within: order.cancel_if_first_open_within,
+                open_only: order.open_only,
                 expires_at: order.expires_at,
             },
             stop_percent: order.stop_percent,
@@ -472,11 +490,17 @@ impl Ctx {
         });
     }
 
-    fn units_for(&self, fraction: f64, price: f64) -> usize {
+    fn units_for(&self, fraction: f64, price: f64) -> f64 {
         if !(fraction.is_finite() && fraction > 0.0 && price > 0.0) {
-            return 0;
+            return 0.0;
         }
-        (self.equity * fraction / price).floor().max(0.0) as usize
+        let units = self.equity * fraction / price;
+        if self.sizing.fractional_units {
+            // Crypto and FX trade fractional units; keep eight decimals like most venues.
+            (units * 1e8).floor() / 1e8
+        } else {
+            units.floor().max(0.0)
+        }
     }
 }
 
@@ -691,6 +715,7 @@ impl SdkInstance {
             shared: Arc::clone(&self.shared),
             orders: Vec::new(),
             tags: BTreeMap::new(),
+            exit_requested: false,
         }
     }
 

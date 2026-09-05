@@ -167,6 +167,9 @@ pub struct Manifest {
     /// `max(1, position_percent x max_open_positions)`.
     #[serde(default)]
     pub default_max_gross_exposure: Option<f64>,
+    /// The instrument trades in fractional units (crypto, FX); runs default to this.
+    #[serde(default)]
+    pub fractional_units: bool,
     /// Default tie-break when more entries compete than slots: priority, random, alphabetical.
     #[serde(default)]
     pub default_tie_break: Option<String>,
@@ -201,6 +204,7 @@ impl Manifest {
             screen_universe: false,
             default_max_entries_per_day: None,
             default_max_gross_exposure: None,
+            fractional_units: false,
             default_tie_break: None,
             default_seed: 0,
             default_symbols: Vec::new(),
@@ -246,6 +250,12 @@ impl Manifest {
         self
     }
     /// Default daily entry cap and tie-break (`priority`, `random`, or `alphabetical`).
+    /// Declares that positions are sized in fractional units rather than whole shares.
+    pub fn fractional_units(mut self) -> Self {
+        self.fractional_units = true;
+        self
+    }
+
     /// Declares the buying power (multiple of equity) this strategy's sizing can reach.
     pub fn max_gross_exposure(mut self, times_equity: f64) -> Self {
         self.default_max_gross_exposure = Some(times_equity);
