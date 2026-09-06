@@ -120,6 +120,12 @@ better than it is.
 applies account guards at fill time, because the fill price can differ from the price the strategy
 sized against:
 
+- **Raw prices.** Bars are split- and dividend-adjusted, so `bar.close` is comparable across time
+  but not to a price floor or a dollar-volume threshold. `bar.raw_close()` returns the unadjusted
+  print in every hook (`on_bar`, `on_daily_bar`, `screen`); the host carries each symbol's
+  adjustment factor as a step function, so a name that reverse-split 1:20,000 shows its true
+  $0.0025 print, not the adjusted $50. Use it for liquidity (`raw_close() * volume`) and for
+  strategy-level price floors.
 - **Minimum price.** Entries are skipped when the reference price is below the run's `min_price`
   (default $1.00, set 0 to disable). Sub-dollar prints make fixed-tick slippage and per-share
   commission meaningless.
