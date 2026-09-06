@@ -715,6 +715,29 @@ fn load_intraday(
     Ok(bars)
 }
 
+/// The dates where the adjusted/raw factor changes (splits, dividends), as a compact
+/// step function the host can look up per bar.
+pub fn adjustment_changes(bars: &[Bar]) -> Vec<(NaiveDate, f64)> {
+    let mut changes: Vec<(NaiveDate, f64)> = Vec::new();
+    for bar in bars {
+        let factor = if bar.adjustment > 0.0 {
+            bar.adjustment
+        } else {
+            1.0
+        };
+        if changes
+            .last()
+            .is_none_or(|(_, last)| (last - factor).abs() > 1e-12 * factor.abs())
+        {
+            changes.push((bar.date, factor));
+        }
+    }
+    if changes.len() == 1 && (changes[0].1 - 1.0).abs() < 1e-12 {
+        changes.clear();
+    }
+    changes
+}
+
 fn market_bar(bar: &Bar) -> MarketBar {
     MarketBar {
         open: bar.open,
@@ -812,6 +835,7 @@ fn make_instance(
     shared: &Arc<Mutex<Shared>>,
     records_equity: bool,
     book: Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
+    adjustments: Arc<Vec<(NaiveDate, f64)>>,
 ) -> Result<SdkInstance> {
     let inner = (entry.factory)(params, symbol)?;
     Ok(SdkInstance::new(
@@ -833,6 +857,7 @@ fn make_instance(
             daily,
             shared: Arc::clone(shared),
             records_equity,
+            adjustments,
             book,
         },
         inner,
@@ -981,8 +1006,17 @@ fn plan_standard(
         String,
         Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
     > = BTreeMap::new();
+    let mut adjustment_series: BTreeMap<String, Arc<Vec<(NaiveDate, f64)>>> = BTreeMap::new();
     for (symbol, bars, daily, book) in loaded.into_iter().flatten() {
         active.push(symbol.clone());
+        // Daily replays adjust per bar; intraday replays borrow the daily series' factors.
+        let changes = match &daily {
+            Some(daily) => adjustment_changes(daily),
+            None => adjustment_changes(&bars),
+        };
+        if !changes.is_empty() {
+            adjustment_series.insert(symbol.clone(), Arc::new(changes));
+        }
         if !book.is_empty() {
             book_series.insert(symbol.clone(), Arc::new(book));
         }
@@ -1079,6 +1113,9 @@ fn plan_standard(
                 book_series
                     .remove(symbol)
                     .unwrap_or_else(|| Arc::new(Vec::new())),
+                adjustment_series
+                    .remove(symbol)
+                    .unwrap_or_else(|| Arc::new(Vec::new())),
             )?,
         );
     }
@@ -1160,6 +1197,7 @@ fn plan_screened(
                 shared,
                 false,
                 Arc::new(Vec::new()),
+                Arc::new(adjustment_changes(&daily)),
             )?;
             let mut selected = Vec::new();
             for bar in &daily {
@@ -1633,6 +1671,36 @@ pub fn print_summary(summary: &SdkRunSummary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjustment_changes_keep_only_the_steps() {
+        let bar = |day: u32, close: f64, adjustment: f64| Bar {
+            date: NaiveDate::from_ymd_opt(2023, 12, day).unwrap(),
+            time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1.0,
+            adjustment,
+            book: None,
+        };
+        // Unadjusted history collapses to nothing (the host treats "unknown" as 1.0).
+        assert!(adjustment_changes(&[bar(1, 10.0, 1.0), bar(4, 10.0, 1.0)]).is_empty());
+        // A 1:20000 reverse split (COSG, Dec 2023): raw 0.0025 shows as an adjusted 50.
+        let changes = adjustment_changes(&[
+            bar(1, 50.0, 20000.0),
+            bar(4, 50.0, 20000.0),
+            bar(5, 1.0, 1.0),
+        ]);
+        assert_eq!(
+            changes,
+            vec![
+                (NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(), 20000.0),
+                (NaiveDate::from_ymd_opt(2023, 12, 5).unwrap(), 1.0),
+            ]
+        );
+    }
 
     #[test]
     fn exposure_default_covers_the_allowed_positions_but_never_below_cash() {

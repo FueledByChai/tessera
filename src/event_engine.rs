@@ -1158,16 +1158,41 @@ impl BrokerAdapter for SimulatedBroker {
                 events
             }
             MarketEvent::SessionStart { .. } => Vec::new(),
-            MarketEvent::SessionEnd { .. } => {
+            MarketEvent::SessionEnd { date, .. } => {
                 // Day orders: anything still resting is cancelled at the close.
                 let expired = std::mem::take(&mut self.pending_limits);
-                expired
+                let mut events: Vec<BrokerEvent> = expired
                     .into_keys()
                     .map(|symbol| BrokerEvent::OrderRejected {
                         symbol,
                         reason: "day_order_expired".to_owned(),
                     })
-                    .collect()
+                    .collect();
+                // A symbol that stopped printing (delisted, halted for good) cannot be traded
+                // out of later; close it at its last mark rather than carrying it to the end
+                // of the replay. Ten calendar days covers holidays and short halts.
+                let stale: Vec<(String, NaiveDate, NaiveTime, f64)> = self
+                    .positions
+                    .keys()
+                    .filter_map(|symbol| {
+                        let (mark_date, mark_time, price) = *self.last_marks.get(symbol)?;
+                        ((*date - mark_date).num_days() > 10)
+                            .then(|| (symbol.clone(), mark_date, mark_time, price))
+                    })
+                    .collect();
+                for (symbol, mark_date, mark_time, price) in stale {
+                    if let Some(event) = self.close_position(
+                        &symbol,
+                        mark_date,
+                        mark_time,
+                        price,
+                        "no_further_data".to_owned(),
+                        false,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                events
             }
         })
     }
@@ -1916,6 +1941,96 @@ mod tests {
             !events
                 .iter()
                 .any(|e| matches!(e, BrokerEvent::PositionOpened { .. }))
+        );
+    }
+
+    /// A short in a name that then stops printing (delisted) must not sit open until the end of
+    /// the replay; it closes at the last mark once the data gap is clearly permanent.
+    #[test]
+    fn positions_in_symbols_that_stop_printing_are_closed_at_the_last_mark() {
+        let mut broker = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2026, 3, 2).unwrap();
+        broker
+            .submit(
+                &close_event(d1.pred_opt().unwrap(), 10.0, "GONE"),
+                vec![market_entry("GONE", 100.0)],
+            )
+            .unwrap();
+        broker
+            .on_market_event(&open_event(d1, 10.0, "GONE"))
+            .unwrap();
+        broker
+            .on_market_event(&close_event(d1, 8.0, "GONE"))
+            .unwrap();
+        assert_eq!(broker.positions.len(), 1);
+        // Sessions continue for other symbols; GONE never prints again.
+        let quiet = |date: NaiveDate| MarketEvent::SessionEnd {
+            date,
+            symbols: Arc::from(vec!["OTHER".to_owned()]),
+        };
+        let soon = broker
+            .on_market_event(&quiet(d1 + chrono::Duration::days(5)))
+            .unwrap();
+        assert!(
+            soon.is_empty() && broker.positions.len() == 1,
+            "a short gap is not a delisting"
+        );
+        let later = broker
+            .on_market_event(&quiet(d1 + chrono::Duration::days(12)))
+            .unwrap();
+        assert!(later.iter().any(|e| matches!(e, BrokerEvent::PositionClosed { trade } if trade.symbol == "GONE" && trade.exit_reason == "no_further_data" && (trade.exit_price - 8.0).abs() < 1e-9)), "{later:?}");
+        assert!(broker.positions.is_empty());
+    }
+
+    /// Flipping a position in one bar: an exit at this close and an opposite entry at this
+    /// close arrive in the same batch and must be applied in that order.
+    #[test]
+    fn exit_then_opposite_entry_in_one_close_batch_flips_the_position() {
+        let mut broker = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        broker
+            .submit(
+                &close_event(date.pred_opt().unwrap(), 100.0, "H"),
+                vec![market_entry("H", 10.0)],
+            )
+            .unwrap();
+        broker
+            .on_market_event(&open_event(date, 100.0, "H"))
+            .unwrap();
+        let close = close_event(date, 101.0, "H");
+        let events = broker
+            .submit(
+                &close,
+                vec![
+                    OrderIntent::ExitPosition {
+                        symbol: "H".to_owned(),
+                        timing: ExecutionTiming::ThisBarClose,
+                        reason: "flip".to_owned(),
+                    },
+                    OrderIntent::EnterBracket {
+                        symbol: "H".to_owned(),
+                        side: Side::Sell,
+                        quantity: 10.0,
+                        timing: ExecutionTiming::ThisBarClose,
+                        stop: None,
+                        target: None,
+                        metadata: BTreeMap::new(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BrokerEvent::PositionClosed { .. })),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, BrokerEvent::PositionOpened { position } if position.side == Side::Sell)), "{events:?}");
+        assert!(
+            broker
+                .positions
+                .get("H")
+                .is_some_and(|p| p.snapshot.side == Side::Sell)
         );
     }
 

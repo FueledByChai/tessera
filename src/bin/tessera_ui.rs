@@ -1898,6 +1898,8 @@ fn expand_sdk_universe(state: &AppState, values: &[serde_json::Value]) -> Result
     let data = &state.local.data;
     let stock_universe = data.stock_universe();
     let etf_universe = data.etf_universe();
+    // Active plus delisted common stocks, when the catalog provides the combined list.
+    let all_stocks_universe = data.catalog_dir.join("all_stocks.txt");
     let mut symbols = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |symbol: String| {
@@ -1911,12 +1913,13 @@ fn expand_sdk_universe(state: &AppState, values: &[serde_json::Value]) -> Result
         if let Some(universe) = lowered.strip_prefix("universe:") {
             let files: Vec<&Path> = match universe {
                 "stocks" | "us_common_stocks" | "common" => vec![stock_universe.as_path()],
+                "all_stocks" | "stocks_with_delisted" => vec![all_stocks_universe.as_path()],
                 "etfs" | "us_etfs" => vec![etf_universe.as_path()],
                 "all" | "stocks_and_etfs" => {
                     vec![stock_universe.as_path(), etf_universe.as_path()]
                 }
                 other => bail!(
-                    "unknown universe {other:?}; use universe:stocks, universe:etfs, or universe:all"
+                    "unknown universe {other:?}; use universe:stocks, universe:all_stocks (active plus delisted), universe:etfs, or universe:all"
                 ),
             };
             for file in files {

@@ -586,6 +586,9 @@ pub struct InstanceSpec {
     /// Book features per bar for tick-built symbols, in replay order (empty otherwise).
     /// The engine's market bars carry prices only, so features ride alongside.
     pub book: Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
+    /// Split/dividend factor changes by date (adjusted / raw), so `Bar::raw_close` works
+    /// inside `on_bar`; engine bars carry adjusted prices only.
+    pub adjustments: Arc<Vec<(NaiveDate, f64)>>,
 }
 
 /// Wraps one strategy instance for one symbol and speaks the engine's event protocol.
@@ -604,6 +607,7 @@ pub struct SdkInstance {
     daily_cursor: usize,
     book: Arc<Vec<(NaiveDate, NaiveTime, crate::lake::BookFeatures)>>,
     book_cursor: usize,
+    adjustments: Arc<Vec<(NaiveDate, f64)>>,
     shared: SharedState,
     records_equity: bool,
     pub daily_equity: Vec<(NaiveDate, f64)>,
@@ -653,6 +657,7 @@ impl SdkInstance {
             daily_cursor: 0,
             book: spec.book,
             book_cursor: 0,
+            adjustments: spec.adjustments,
             shared: spec.shared,
             records_equity: spec.records_equity,
             daily_equity: Vec::new(),
@@ -755,6 +760,15 @@ impl SdkInstance {
         Ok(())
     }
 
+    /// The adjusted/raw factor in force on `date` (1.0 when unknown).
+    fn adjustment_at(&self, date: NaiveDate) -> f64 {
+        let index = self.adjustments.partition_point(|(d, _)| *d <= date);
+        index
+            .checked_sub(1)
+            .and_then(|i| self.adjustments.get(i))
+            .map_or(1.0, |(_, factor)| *factor)
+    }
+
     /// Advances the book cursor to this bar and returns its features, if any.
     fn book_features_at(
         &mut self,
@@ -848,6 +862,7 @@ impl EventStrategy for SdkInstance {
                     return Ok(Vec::new());
                 };
                 let mut bar = bar_from(*date, *time, market_bar);
+                bar.adjustment = self.adjustment_at(*date);
                 bar.book = self.book_features_at(*date, *time);
                 let mut ctx = self.ctx(*date, *time, portfolio, bar.close);
                 for fill in std::mem::take(&mut self.pending_fills) {
@@ -932,5 +947,92 @@ impl EventStrategy for SdkInstance {
         let mut ctx = self.ctx_from_account(self.last_date, self.last_time, &account, last_price);
         self.inner.on_fill(&mut ctx, &fill)?;
         Ok(ctx.orders)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_engine::{EventStrategy, MarketBar, MarketEvent};
+    use crate::sdk::manifest::Params;
+
+    /// Records what `on_bar` sees as the raw close.
+    struct RawProbe;
+
+    impl Strategy for RawProbe {
+        fn manifest() -> Manifest {
+            Manifest::new("raw_probe", "Raw probe", "v1")
+        }
+        fn new(_params: &Params, _symbol: &str) -> Result<Self> {
+            Ok(Self)
+        }
+        fn on_bar(&mut self, ctx: &mut Ctx, bar: &Bar) -> Result<()> {
+            ctx.shared_set("raw", bar.raw_close());
+            ctx.shared_set("adjusted", bar.close);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn on_bar_sees_the_raw_close_through_the_adjustment_series() {
+        let date = NaiveDate::from_ymd_opt(2023, 12, 7).unwrap();
+        let time = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        let shared: SharedState = Arc::new(Mutex::new(Shared::default()));
+        let mut host = SdkInstance::new(
+            InstanceSpec {
+                id: "raw_probe",
+                symbol: "COSG.US".to_owned(),
+                symbol_index: 0,
+                symbol_count: 1,
+                sizing: SizingPolicy {
+                    position_percent: 0.1,
+                    min_price: 0.0,
+                    fractional_units: false,
+                },
+                allows_short: true,
+                live_from: date,
+                daily: Arc::new(Vec::new()),
+                shared: Arc::clone(&shared),
+                records_equity: false,
+                book: Arc::new(Vec::new()),
+                // A 1:20000 reverse split in force since 2023-12-01.
+                adjustments: Arc::new(vec![(
+                    NaiveDate::from_ymd_opt(2023, 12, 1).unwrap(),
+                    20000.0,
+                )]),
+            },
+            Box::new(RawProbe),
+        );
+        let portfolio = PortfolioSnapshot {
+            realized_equity: 100_000.0,
+            total_equity: 100_000.0,
+            positions: BTreeMap::new(),
+        };
+        let symbols: Arc<[String]> = Arc::from(vec!["COSG.US".to_owned()]);
+        host.on_market_event(&MarketEvent::SessionStart { date, symbols }, &portfolio)
+            .unwrap();
+        let bar = MarketBar {
+            open: 50.0,
+            high: 50.0,
+            low: 50.0,
+            close: 50.0,
+            volume: 4.0,
+        };
+        host.on_market_event(
+            &MarketEvent::BarClose {
+                date,
+                time,
+                bars: BTreeMap::from([("COSG.US".to_owned(), bar)]),
+            },
+            &portfolio,
+        )
+        .unwrap();
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.numbers["adjusted"], 50.0);
+        assert!(
+            (shared.numbers["raw"] - 0.0025).abs() < 1e-12,
+            "{:?}",
+            shared.numbers
+        );
     }
 }
