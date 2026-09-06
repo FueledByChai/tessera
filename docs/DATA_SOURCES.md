@@ -81,3 +81,13 @@ the console reads the synthetic dataset under `examples/data`.
 3. **Instrument search.** `build_instrument_index` in the API decides what the picker shows and
    which resolutions each record satisfies; a new source should add its records there so runs can
    be validated before they are queued.
+
+## Sanitation before replay
+
+Vendor daily files contain prints that are not market data: closes on market holidays, one-bar
+spikes that revert the next session, and segments where the whole price scale changes overnight
+and stays changed. The SDK runner cleans daily series as it loads them (`[data] sanitize_prices`,
+default on; the calendar symbol's own dates define the session calendar), drops the first two
+kinds, skips symbols with the third, and prints the counts in the run log. For a standalone
+audit of a library, `research/scripts/scan_bad_prints.py` in the private repo lists every
+suspect file with its first bad date.

@@ -118,6 +118,13 @@ pub struct SdkDataConfig {
     /// Daily file whose dates define the session calendar for screened runs.
     #[serde(default = "default_calendar_symbol")]
     pub calendar_symbol: String,
+    /// Drop prints that cannot be market data before replay (see `sanitize_daily`).
+    #[serde(default = "default_true")]
+    pub sanitize_prices: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_session() -> SessionKind {
@@ -662,6 +669,79 @@ pub fn load_daily(path: &Path) -> Result<Vec<Bar>> {
     Ok(bars)
 }
 
+/// What `sanitize_daily` removed from one file.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DailySanitation {
+    /// Rows on dates the calendar symbol did not trade (holiday junk rows).
+    pub off_calendar: usize,
+    /// Single bars more than 4x away from both neighbours (a print that reverts next bar).
+    pub spikes: usize,
+}
+
+/// Removes prints that cannot be market data from a daily series, in place.
+///
+/// EODHD files carry three kinds of impossible rows: closes on dates the market was shut
+/// (a $1,000,000 close on New Year's Day), one-bar spikes that revert next session (CAA
+/// 2005: 35 → 993 → 35), and segments where the whole scale changes overnight and stays
+/// changed (NCR 1998: 12 → 183). The first two are dropped and counted; the third rejects
+/// the symbol with a reason, because nothing after such a jump can be trusted. Ratios are
+/// judged on the adjusted close the engine trades at, ignoring sub-dollar prints where a
+/// tick of rounding is already a 4x move. `calendar` only applies inside the calendar's own
+/// date range, so files older than the calendar symbol keep their early history.
+pub fn sanitize_daily(
+    bars: &mut Vec<Bar>,
+    calendar: Option<&BTreeSet<NaiveDate>>,
+) -> std::result::Result<DailySanitation, String> {
+    let mut report = DailySanitation::default();
+    if let Some(calendar) = calendar {
+        if let (Some(first), Some(last)) = (calendar.first(), calendar.last()) {
+            let before = bars.len();
+            bars.retain(|bar| {
+                bar.date < *first || bar.date > *last || calendar.contains(&bar.date)
+            });
+            report.off_calendar = before - bars.len();
+        }
+    }
+    const SPIKE: f64 = 4.0;
+    const SCALE_BREAK: f64 = 8.0;
+    let material = |a: f64, b: f64| a.max(b) >= 1.0;
+    // One pass: a bar that is a spike against the previous kept bar and the next bar is
+    // dropped; the next bar is then compared with the bar before the spike.
+    let mut kept: Vec<Bar> = Vec::with_capacity(bars.len());
+    let mut index = 0;
+    while index < bars.len() {
+        let bar = &bars[index];
+        if let Some(prev) = kept.last() {
+            let ratio = bar.close / prev.close;
+            if material(bar.close, prev.close) && !(1.0 / SPIKE..=SPIKE).contains(&ratio) {
+                let reverts = bars.get(index + 1).map(|next| {
+                    let back = next.close / bar.close;
+                    (ratio > 1.0 && back < 1.0 / SPIKE) || (ratio < 1.0 && back > SPIKE)
+                });
+                match reverts {
+                    // Spike with a neighbour that comes back, or a jump on the very last bar.
+                    Some(true) | None => {
+                        report.spikes += 1;
+                        index += 1;
+                        continue;
+                    }
+                    Some(false) if !(1.0 / SCALE_BREAK..=SCALE_BREAK).contains(&ratio) => {
+                        return Err(format!(
+                            "impossible print: close moved {ratio:.1}x on {} and stayed there",
+                            bar.date
+                        ));
+                    }
+                    Some(false) => {}
+                }
+            }
+        }
+        kept.push(bar.clone());
+        index += 1;
+    }
+    *bars = kept;
+    Ok(report)
+}
+
 /// Intraday bars in New York time, optionally restricted to the regular session and to
 /// a set of dates.
 fn load_intraday(
@@ -934,6 +1014,45 @@ fn plan_standard(
     let load_started = std::time::Instant::now();
     let load_last_report = Mutex::new(std::time::Instant::now());
     let total_symbols = config.data.symbols.len();
+    // Session calendar for the sanitation pass: the calendar symbol's own trading dates.
+    let calendar: Option<BTreeSet<NaiveDate>> = if config.data.sanitize_prices {
+        let calendar_path = config.daily_file(&config.data.calendar_symbol);
+        calendar_path
+            .is_file()
+            .then(|| load_daily(&calendar_path))
+            .transpose()?
+            .map(|bars| bars.into_iter().map(|bar| bar.date).collect())
+    } else {
+        None
+    };
+    let sanitation = (
+        std::sync::atomic::AtomicUsize::new(0), // off-calendar rows
+        std::sync::atomic::AtomicUsize::new(0), // spike rows
+        std::sync::atomic::AtomicUsize::new(0), // rejected symbols
+    );
+    let sanitize = |symbol: &str, bars: &mut Vec<Bar>| -> bool {
+        if !config.data.sanitize_prices {
+            return true;
+        }
+        match sanitize_daily(bars, calendar.as_ref()) {
+            Ok(report) => {
+                sanitation
+                    .0
+                    .fetch_add(report.off_calendar, std::sync::atomic::Ordering::Relaxed);
+                sanitation
+                    .1
+                    .fetch_add(report.spikes, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            Err(reason) => {
+                sanitation
+                    .2
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("warning: skipping {symbol}: {reason}");
+                false
+            }
+        }
+    };
     let loaded = config
         .data
         .symbols
@@ -1008,7 +1127,13 @@ fn plan_standard(
                     }
                 }
                 let mut bars = match config.data.resolution {
-                    Resolution::Daily => load_daily(&path)?,
+                    Resolution::Daily => {
+                        let mut bars = load_daily(&path)?;
+                        if !sanitize(symbol, &mut bars) {
+                            return Ok(None);
+                        }
+                        bars
+                    }
                     Resolution::FiveMinute | Resolution::OneMinute => {
                         load_intraday(&path, config.data.session, None)?
                     }
@@ -1027,7 +1152,11 @@ fn plan_standard(
                         daily_path.is_file(),
                         "daily data is not available for {symbol} (required for daily context)"
                     );
-                    Some(Arc::new(load_daily(&daily_path)?))
+                    let mut daily = load_daily(&daily_path)?;
+                    if !sanitize(symbol, &mut daily) {
+                        return Ok(None);
+                    }
+                    Some(Arc::new(daily))
                 } else {
                     None
                 };
@@ -1041,6 +1170,18 @@ fn plan_standard(
         loaded.len(),
         load_started.elapsed().as_secs()
     );
+    {
+        let (off_calendar, spikes, rejected) = (
+            sanitation.0.into_inner(),
+            sanitation.1.into_inner(),
+            sanitation.2.into_inner(),
+        );
+        if off_calendar + spikes + rejected > 0 {
+            eprintln!(
+                "sanitized daily data: dropped {off_calendar} off-calendar rows and {spikes} one-bar spikes; skipped {rejected} symbols with a persistent scale break"
+            );
+        }
+    }
     let mut active: Vec<String> = Vec::new();
     let mut book_series: BTreeMap<
         String,
@@ -1196,6 +1337,7 @@ fn plan_screened(
         .collect::<Vec<_>>();
     let next_session: BTreeMap<NaiveDate, NaiveDate> =
         calendar.windows(2).map(|pair| (pair[0], pair[1])).collect();
+    let calendar_dates: BTreeSet<NaiveDate> = calendar.iter().copied().collect();
     let session_dates = calendar
         .iter()
         .copied()
@@ -1220,7 +1362,13 @@ fn plan_screened(
             if !path.is_file() {
                 return Ok(None);
             }
-            let daily = load_daily(&path)?;
+            let mut daily = load_daily(&path)?;
+            if config.data.sanitize_prices {
+                if let Err(reason) = sanitize_daily(&mut daily, Some(&calendar_dates)) {
+                    eprintln!("warning: skipping {symbol}: {reason}");
+                    return Ok(None);
+                }
+            }
             if daily.is_empty() {
                 return Ok(None);
             }
@@ -1719,6 +1867,92 @@ pub fn print_summary(summary: &SdkRunSummary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn daily(day: u32, close: f64) -> Bar {
+        Bar {
+            date: NaiveDate::from_ymd_opt(2025, 1, day).unwrap(),
+            time: NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 100.0,
+            adjustment: 1.0,
+            book: None,
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_holiday_rows_inside_the_calendar_only() {
+        // Calendar: Dec 31, Jan 2, 3. Jan 1 is a holiday; Dec 30 predates the calendar.
+        let calendar: BTreeSet<NaiveDate> = [
+            NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
+        ]
+        .into_iter()
+        .collect();
+        let mut bars = vec![
+            Bar {
+                date: NaiveDate::from_ymd_opt(2024, 12, 30).unwrap(),
+                ..daily(2, 0.125)
+            },
+            Bar {
+                date: NaiveDate::from_ymd_opt(2024, 12, 31).unwrap(),
+                ..daily(2, 0.125)
+            },
+            daily(1, 999_999.9999), // FNAUF 2025-01-01
+            daily(2, 0.125),
+            daily(3, 0.125),
+        ];
+        let report = sanitize_daily(&mut bars, Some(&calendar)).unwrap();
+        assert_eq!(
+            report,
+            DailySanitation {
+                off_calendar: 1,
+                spikes: 0
+            }
+        );
+        assert_eq!(bars.len(), 4);
+        assert_eq!(bars[0].date, NaiveDate::from_ymd_opt(2024, 12, 30).unwrap());
+    }
+
+    #[test]
+    fn sanitize_drops_one_bar_spikes_and_rejects_scale_breaks() {
+        // CAA 2005: 35 -> 993 -> 35 is one bad print.
+        let mut bars = vec![
+            daily(2, 35.0),
+            daily(3, 993.0),
+            daily(6, 35.2),
+            daily(7, 36.0),
+        ];
+        let report = sanitize_daily(&mut bars, None).unwrap();
+        assert_eq!(report.spikes, 1);
+        assert_eq!(
+            bars.iter().map(|b| b.close).collect::<Vec<_>>(),
+            vec![35.0, 35.2, 36.0]
+        );
+        // A jump on the final bar with nothing after it is treated as a spike too.
+        let mut bars = vec![daily(2, 35.0), daily(3, 35.5), daily(6, 993.0)];
+        assert_eq!(sanitize_daily(&mut bars, None).unwrap().spikes, 1);
+        assert_eq!(bars.len(), 2);
+        // NCR 1998: 12 -> 183 and it stays: the file is mis-scaled from there on.
+        let mut bars = vec![
+            daily(2, 12.0),
+            daily(3, 183.0),
+            daily(6, 177.0),
+            daily(7, 176.0),
+        ];
+        let err = sanitize_daily(&mut bars, None).unwrap_err();
+        assert!(err.contains("15.2x"), "{err}");
+        // A genuine 5x gap that holds (biotech) is kept; only 8x+ is a scale break.
+        let mut bars = vec![daily(2, 2.0), daily(3, 10.0), daily(6, 9.5), daily(7, 11.0)];
+        assert_eq!(sanitize_daily(&mut bars, None).unwrap().spikes, 0);
+        assert_eq!(bars.len(), 4);
+        // Sub-dollar rounding noise is not judged.
+        let mut bars = vec![daily(2, 0.0001), daily(3, 0.0005), daily(6, 0.0001)];
+        assert_eq!(sanitize_daily(&mut bars, None).unwrap().spikes, 0);
+    }
 
     #[test]
     fn adjustment_changes_keep_only_the_steps() {

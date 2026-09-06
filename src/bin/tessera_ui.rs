@@ -1903,6 +1903,11 @@ fn expand_sdk_universe(state: &AppState, values: &[serde_json::Value]) -> Result
     let mut symbols = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut push = |symbol: String| {
+        // Nasdaq test symbols (ZVZZT, ZWZZT, ZXZZT, ZJZZT, TESTA...) ship in the catalog files
+        // and print at whatever the test harness sent that day.
+        if is_test_symbol(&symbol) {
+            return;
+        }
         if seen.insert(symbol.clone()) {
             symbols.push(symbol);
         }
@@ -1937,6 +1942,11 @@ fn expand_sdk_universe(state: &AppState, values: &[serde_json::Value]) -> Result
         }
     }
     Ok(symbols)
+}
+
+fn is_test_symbol(symbol: &str) -> bool {
+    let base = symbol.strip_suffix(".US").unwrap_or(symbol);
+    (base.len() == 5 && base.starts_with('Z') && base.ends_with("ZZT")) || base.starts_with("TEST")
 }
 
 fn default_engine_path(state: &AppState) -> PathBuf {
@@ -2316,6 +2326,7 @@ fn build_sdk_run_config(
             one_minute_dir: state.local.data.one_minute_dir.clone(),
             symbols,
             calendar_symbol: state.local.data.calendar_symbol.clone(),
+            sanitize_prices: true,
             lake_dir: state.local.data.lake_dir.clone(),
         },
         sizing: SdkSizingConfig {

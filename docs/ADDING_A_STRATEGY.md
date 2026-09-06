@@ -120,6 +120,12 @@ better than it is.
 applies account guards at fill time, because the fill price can differ from the price the strategy
 sized against:
 
+- **Sanitized prints.** Daily files are cleaned before replay (`[data] sanitize_prices`, default
+  on): rows on dates the calendar symbol did not trade are dropped (a $1,000,000 close on New
+  Year's Day), one-bar spikes that revert next session are dropped (35 → 993 → 35), and a symbol
+  whose close moves more than 8x overnight and stays there is skipped with a warning, because
+  the file is mis-scaled from that day on. Sub-dollar prints are not judged. The run log
+  reports the counts. Nasdaq test symbols (ZVZZT and friends) never enter a universe.
 - **Raw prices.** Bars are split- and dividend-adjusted, so `bar.close` is comparable across time
   but not to a price floor or a dollar-volume threshold. `bar.raw_close()` returns the unadjusted
   print in every hook (`on_bar`, `on_daily_bar`, `screen`); the host carries each symbol's
