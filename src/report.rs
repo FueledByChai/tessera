@@ -119,7 +119,7 @@ struct TradePoint {
     quantity: Option<f64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Coverage {
     covered: usize,
     missing_file: usize,
@@ -194,7 +194,7 @@ pub struct ReportView {
     pub yearly_returns: Vec<ReportYearView>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ReportCoverageRowView {
     pub trade_date: String,
     pub symbol: String,
@@ -203,7 +203,7 @@ pub struct ReportCoverageRowView {
 
 /// Coverage aggregated per symbol or per year, computed server-side so a universe-sized
 /// run (tens of millions of symbol-days) never ships its raw rows to the browser.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ReportCoverageBucket {
     pub key: String,
     pub covered: usize,
@@ -213,7 +213,11 @@ pub struct ReportCoverageBucket {
 /// Maximum missing symbol-date rows included in a report view.
 pub const COVERAGE_ROW_CAP: usize = 5_000;
 
-#[derive(Debug, Default)]
+/// Sidecar beside `coverage.parquet` holding this summary, written at run time (or cached after
+/// the first read) so reopening a universe-sized run never rescans 10^8 symbol-days.
+pub const COVERAGE_SUMMARY_FILE: &str = "coverage_summary.json";
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CoverageSummary {
     pub coverage: Coverage,
     pub missing_rows: Vec<ReportCoverageRowView>,
@@ -572,26 +576,21 @@ fn load_trades(path: &Path) -> Result<Vec<TradePoint>> {
     Ok(rows)
 }
 
-fn load_coverage(path: &Path) -> Result<CoverageSummary> {
-    let frame = ParquetReader::new(File::open(path)?).finish()?;
-    let dates = frame.column("trade_date")?.str()?;
-    let symbols = frame.column("symbol")?.str()?;
-    let statuses = frame.column("status")?.str()?;
+/// Aggregates coverage rows `(trade_date, symbol, status)` into the report's counts, the
+/// per-symbol and per-year buckets, and the capped list of missing symbol-dates.
+pub fn summarize_coverage<'a>(
+    rows: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+) -> CoverageSummary {
     let mut summary = CoverageSummary::default();
     let mut by_symbol: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut by_year: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-    for index in 0..frame.height() {
-        let Some(status) = statuses.get(index) else {
-            continue;
-        };
+    for (date, symbol, status) in rows {
         let covered = status == "covered";
         match status {
             "covered" => summary.coverage.covered += 1,
             "missing_file" => summary.coverage.missing_file += 1,
             _ => summary.coverage.missing_session += 1,
         }
-        let symbol = symbols.get(index).unwrap_or_default();
-        let date = dates.get(index).unwrap_or_default();
         let entry = by_symbol.entry(symbol).or_default();
         entry.1 += 1;
         if covered {
@@ -621,6 +620,46 @@ fn load_coverage(path: &Path) -> Result<CoverageSummary> {
     };
     summary.by_symbol = by_symbol.into_iter().map(bucket).collect();
     summary.by_year = by_year.into_iter().map(bucket).collect();
+    summary
+}
+
+pub fn write_coverage_summary(results_dir: &Path, summary: &CoverageSummary) -> Result<()> {
+    let path = results_dir.join(COVERAGE_SUMMARY_FILE);
+    fs::write(&path, serde_json::to_vec(summary)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn load_coverage(path: &Path) -> Result<CoverageSummary> {
+    // Trust the sidecar only when it is at least as new as the parquet it summarizes.
+    let sidecar = path.with_file_name(COVERAGE_SUMMARY_FILE);
+    let newer_sidecar = match (fs::metadata(&sidecar), fs::metadata(path)) {
+        (Ok(side), Ok(table)) => side.modified().ok() >= table.modified().ok(),
+        _ => false,
+    };
+    if newer_sidecar {
+        if let Some(summary) = fs::read(&sidecar)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CoverageSummary>(&bytes).ok())
+        {
+            return Ok(summary);
+        }
+    }
+    let frame = ParquetReader::new(File::open(path)?).finish()?;
+    let dates = frame.column("trade_date")?.str()?;
+    let symbols = frame.column("symbol")?.str()?;
+    let statuses = frame.column("status")?.str()?;
+    let summary = summarize_coverage((0..frame.height()).filter_map(|index| {
+        let status = statuses.get(index)?;
+        Some((
+            dates.get(index).unwrap_or_default(),
+            symbols.get(index).unwrap_or_default(),
+            status,
+        ))
+    }));
+    // Cache for the next open; a failure here only costs the next reader a rescan.
+    if let Some(dir) = path.parent() {
+        let _ = write_coverage_summary(dir, &summary);
+    }
     Ok(summary)
 }
 

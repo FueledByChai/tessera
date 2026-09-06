@@ -5811,7 +5811,12 @@ async fn run_job(state: AppState, job_id: String) -> Result<()> {
     }
     let report_path = output_dir.join("report.html");
     let needs_standard_report = matches!(plan, JobExecutionPlan::Standard(_));
-    if needs_standard_report && outputs.iter().all(|(_, output)| output.status.success()) {
+    // `run-strategy` writes its own report; rebuilding it here reloaded a universe-sized
+    // coverage table a second time. Only build when the simulation left none behind.
+    if needs_standard_report
+        && outputs.iter().all(|(_, output)| output.status.success())
+        && !report_path.is_file()
+    {
         let report = Command::new(&engine)
             .current_dir(&state.root)
             .arg("report")

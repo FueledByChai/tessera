@@ -31,8 +31,8 @@ use crate::report::{generate_report, load_report_view};
 use crate::sdk::manifest::Manifest;
 use crate::sdk::strategy::{Bar, InstanceSpec, SdkInstance, Shared, SizingPolicy, StrategyEntry};
 use crate::strategy::{
-    StandardArtifactBundle, StandardCoverageRecord, StandardDailyRecord, StandardRunMetadata,
-    StandardTradeRecord, write_standard_artifacts,
+    StandardArtifactBundle, StandardDailyRecord, StandardRunMetadata, StandardTradeRecord,
+    coverage_frame, write_standard_artifacts_with_coverage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,11 +791,51 @@ struct TradeRow {
     exit_reason: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CoverageRow {
-    symbol: String,
-    date: NaiveDate,
-    status: &'static str,
+/// Coverage as parallel columns over interned symbol and date text. A universe-sized daily
+/// run has 10^8 symbol-days; one struct with a `String` per row cost gigabytes and a minute
+/// of `free()` at exit.
+#[derive(Debug, Default)]
+struct CoverageTable {
+    dates: Vec<String>,
+    symbols: Vec<String>,
+    date_index: Vec<u32>,
+    symbol_index: Vec<u32>,
+    status: Vec<u8>,
+}
+
+const COVERAGE_STATUS: [&str; 3] = ["covered", "missing_session", "missing_file"];
+const COVERED: u8 = 0;
+const MISSING_SESSION: u8 = 1;
+const MISSING_FILE: u8 = 2;
+
+impl CoverageTable {
+    fn intern(pool: &mut Vec<String>, seen: &mut BTreeMap<String, u32>, text: &str) -> u32 {
+        if let Some(index) = seen.get(text) {
+            return *index;
+        }
+        let index = u32::try_from(pool.len()).expect("coverage vocabulary fits u32");
+        pool.push(text.to_owned());
+        seen.insert(text.to_owned(), index);
+        index
+    }
+    fn push(&mut self, date: u32, symbol: u32, status: u8) {
+        self.date_index.push(date);
+        self.symbol_index.push(symbol);
+        self.status.push(status);
+    }
+    fn len(&self) -> usize {
+        self.status.len()
+    }
+    /// Rows as `(trade_date, symbol, status)` text, in insertion order.
+    fn iter(&self) -> impl Iterator<Item = (&str, &str, &str)> + '_ {
+        (0..self.len()).map(move |i| {
+            (
+                self.dates[self.date_index[i] as usize].as_str(),
+                self.symbols[self.symbol_index[i] as usize].as_str(),
+                COVERAGE_STATUS[self.status[i] as usize],
+            )
+        })
+    }
 }
 
 fn write_csv<T: Serialize>(path: PathBuf, rows: &[T]) -> Result<()> {
@@ -815,7 +855,7 @@ fn eastern_timestamp(date: NaiveDate, time: NaiveTime) -> String {
 /// Everything the replay phase needs, regardless of how the sessions were assembled.
 struct ReplayPlan {
     sessions: Vec<HistoricalSession>,
-    coverage: Vec<CoverageRow>,
+    coverage: CoverageTable,
     instances: BTreeMap<String, SdkInstance>,
     equity_symbol: String,
     /// Description of the symbol set for the report.
@@ -1059,20 +1099,20 @@ fn plan_standard(
         !requested_dates.is_empty(),
         "no bars were available in the requested window"
     );
-    let mut coverage = Vec::new();
-    for date in &requested_dates {
+    let mut coverage = CoverageTable {
+        dates: requested_dates.iter().map(NaiveDate::to_string).collect(),
+        symbols: active.clone(),
+        ..CoverageTable::default()
+    };
+    for (date_index, date) in requested_dates.iter().enumerate() {
         let times = &by_date[date];
-        for symbol in &active {
+        for (symbol_index, symbol) in active.iter().enumerate() {
             let present = times.values().any(|bars| bars.contains_key(symbol));
-            coverage.push(CoverageRow {
-                symbol: symbol.clone(),
-                date: *date,
-                status: if present {
-                    "covered"
-                } else {
-                    "missing_session"
-                },
-            });
+            coverage.push(
+                date_index as u32,
+                symbol_index as u32,
+                if present { COVERED } else { MISSING_SESSION },
+            );
         }
     }
     anyhow::ensure!(
@@ -1300,20 +1340,22 @@ fn plan_screened(
                 .insert(symbol.clone(), market_bar(&bar));
         }
     }
-    let mut coverage = Vec::new();
+    let mut coverage = CoverageTable::default();
+    let mut date_ids = BTreeMap::new();
+    let mut symbol_ids = BTreeMap::new();
     for (symbol, dates) in &candidates {
+        let symbol_id = CoverageTable::intern(&mut coverage.symbols, &mut symbol_ids, symbol);
         for date in dates {
-            coverage.push(CoverageRow {
-                symbol: symbol.clone(),
-                date: *date,
-                status: if covered.contains(&(*date, symbol.clone())) {
-                    "covered"
-                } else if has_file.contains(symbol) {
-                    "missing_session"
-                } else {
-                    "missing_file"
-                },
-            });
+            let date_id =
+                CoverageTable::intern(&mut coverage.dates, &mut date_ids, &date.to_string());
+            let status = if covered.contains(&(*date, symbol.clone())) {
+                COVERED
+            } else if has_file.contains(symbol) {
+                MISSING_SESSION
+            } else {
+                MISSING_FILE
+            };
+            coverage.push(date_id, symbol_id, status);
         }
     }
     let equity_symbol = instances
@@ -1497,7 +1539,14 @@ pub fn run(
     // to hundreds of megabytes for universe-sized symbol lists, so it is skipped past a cap.
     const COVERAGE_CSV_ROW_CAP: usize = 2_000_000;
     if coverage.len() <= COVERAGE_CSV_ROW_CAP {
-        write_csv(output_dir.join("coverage.csv"), &coverage)?;
+        let path = output_dir.join("coverage.csv");
+        let mut writer = csv::Writer::from_path(&path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        writer.write_record(["symbol", "date", "status"])?;
+        for (date, symbol, status) in coverage.iter() {
+            writer.write_record([symbol, date, status])?;
+        }
+        writer.flush()?;
     } else {
         eprintln!(
             "coverage.csv skipped ({} rows exceed the {COVERAGE_CSV_ROW_CAP} row cap); coverage.parquet holds the full table",
@@ -1599,22 +1648,21 @@ pub fn run(
             }
         })
         .collect::<Vec<_>>();
-    let standard_coverage = coverage
-        .iter()
-        .map(|row| StandardCoverageRecord {
-            trade_date: row.date,
-            symbol: row.symbol.clone(),
-            status: row.status.to_owned(),
-        })
-        .collect::<Vec<_>>();
-    write_standard_artifacts(
+    // Coverage goes out as a pre-built column table plus its summary sidecar, so neither the
+    // writer nor any later reader of a universe-sized run walks the rows again.
+    let coverage_summary = crate::report::summarize_coverage(coverage.iter());
+    let coverage_table = coverage_frame(coverage.iter())?;
+    drop(coverage);
+    write_standard_artifacts_with_coverage(
         output_dir,
         &StandardArtifactBundle {
             metadata: &metadata,
             daily: &standard_daily,
             trades: &standard_trades,
-            coverage: &standard_coverage,
+            coverage: &[],
         },
+        coverage_table,
+        Some(&coverage_summary),
     )?;
     fs::write(
         output_dir.join("strategy_config.toml"),

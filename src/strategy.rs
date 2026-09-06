@@ -77,6 +77,51 @@ pub fn write_standard_artifacts(
     output_dir: &Path,
     bundle: &StandardArtifactBundle<'_>,
 ) -> Result<()> {
+    let date_text: BTreeMap<NaiveDate, String> = bundle
+        .coverage
+        .iter()
+        .map(|row| (row.trade_date, row.trade_date.to_string()))
+        .collect();
+    let coverage = coverage_frame(bundle.coverage.iter().map(|row| {
+        (
+            date_text[&row.trade_date].as_str(),
+            row.symbol.as_str(),
+            row.status.as_str(),
+        )
+    }))?;
+    write_standard_artifacts_with_coverage(output_dir, bundle, coverage, None)
+}
+
+/// Builds the coverage table column by column so a universe-sized run (10^8 symbol-days)
+/// never materializes a row vector of strings.
+pub fn coverage_frame<'a>(
+    rows: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+) -> Result<DataFrame> {
+    let (lower, _) = rows.size_hint();
+    let mut dates = StringChunkedBuilder::new("trade_date".into(), lower);
+    let mut symbols = StringChunkedBuilder::new("symbol".into(), lower);
+    let mut statuses = StringChunkedBuilder::new("status".into(), lower);
+    for (date, symbol, status) in rows {
+        dates.append_value(date);
+        symbols.append_value(symbol);
+        statuses.append_value(status);
+    }
+    Ok(DataFrame::new_infer_height(vec![
+        dates.finish().into_series().into_column(),
+        symbols.finish().into_series().into_column(),
+        statuses.finish().into_series().into_column(),
+    ])?)
+}
+
+/// `write_standard_artifacts` with the coverage table pre-built (see `coverage_frame`) and,
+/// optionally, its summary so the validation pass reads the sidecar instead of the table.
+/// `bundle.coverage` is ignored.
+pub fn write_standard_artifacts_with_coverage(
+    output_dir: &Path,
+    bundle: &StandardArtifactBundle<'_>,
+    mut coverage: DataFrame,
+    coverage_summary: Option<&crate::report::CoverageSummary>,
+) -> Result<()> {
     anyhow::ensure!(
         !bundle.daily.is_empty(),
         "standard daily results cannot be empty"
@@ -123,12 +168,11 @@ pub fn write_standard_artifacts(
     )?;
     write_parquet(&mut trades, &output_dir.join("trades.parquet"))?;
 
-    let mut coverage = df!(
-        "trade_date" => bundle.coverage.iter().map(|row| row.trade_date.to_string()).collect::<Vec<_>>(),
-        "symbol" => bundle.coverage.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(),
-        "status" => bundle.coverage.iter().map(|row| row.status.as_str()).collect::<Vec<_>>()
-    )?;
     write_parquet(&mut coverage, &output_dir.join("coverage.parquet"))?;
+    drop(coverage);
+    if let Some(summary) = coverage_summary {
+        crate::report::write_coverage_summary(output_dir, summary)?;
+    }
     validate_standard_artifacts(output_dir)
 }
 
