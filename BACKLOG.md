@@ -124,3 +124,25 @@ working HK-01 in a worktree.
 **Done when:** `scripts/check.sh` run from a worktree resolves the private checkout through the
 repository's common git dir (or `TESSERA_PRIVATE_ROOT`), copies or points at the main `local.toml`,
 and a test run from a worktree reports the private checks as run, not skipped.
+
+### HK-05 Ticket state derived from git — `todo`
+Every ticket edits this file to write `done <date> <sha>`, which is the one line two parallel
+loops always collide on, and the sha cannot be known before the commit exists. Make git the
+record: a ticket is `done` when a commit whose subject starts with its id is on `main`. This
+file keeps only `todo`, `doing`, and `blocked` (`doing` stays as the claim; the loop clears it in
+the ticket's commit). Add `scripts/backlog-status.sh` that prints every ticket with its derived
+state, date, and short sha, and update `CLAUDE.md` and `.claude/commands/next-ticket.md` so the
+loop stops writing `done` lines and picks the first `todo` whose blockers have a commit on `main`.
+**Done when:** the status script lists HK-01 and WB-02 as done with their dates and shas while
+their lines here carry no state, and a test fixture repo in the script's tests shows a `doing`
+ticket with a landed commit reported as done.
+
+### HK-06 Release notes from commits and a changelog archive — `todo` — Blocked by HK-05
+`scripts/release-notes.sh <from-ref> [<to-ref>]` lists commits whose subject starts with a
+ticket id, grouped by prefix (WB, HK) with date and short sha, as Markdown. `--archive <tag>`
+moves the completed tickets' entries out of this file into `CHANGELOG.md` under the tag's
+heading, so the queue holds only open work and the changelog is the record of what shipped
+when. Tag releases; the notes are the diff between tags.
+**Done when:** the script over `3022548..main` lists HK-01 and WB-02 under their sections with
+dates; `--archive` on a scratch copy produces a `CHANGELOG.md` containing them and a
+`BACKLOG.md` without them; `scripts/check.sh --quick` runs the script's self-test.
