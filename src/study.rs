@@ -4,9 +4,12 @@
 //! `step_secs` bars from the tick lake, computes the requested features at each bar close,
 //! measures forward mid-price returns `h` bars ahead, then reports per feature and horizon:
 //! Spearman rank correlation (information coefficient), the mean forward return by feature
-//! decile, and a t-statistic for top-minus-bottom decile. `decision_delay_bars` shifts every
-//! feature by that many bars before measuring, which models the time between observing the
-//! book and being able to act on it.
+//! decile, a t-statistic for top-minus-bottom decile, and a costless trading curve: the
+//! feature's z-score (clipped, or just its sign) as the position, times the forward return,
+//! with no costs. Its Sharpe, turnover, and breakeven cost say what the edge is worth before
+//! any strategy is written. `decision_delay_bars` shifts every feature by that many bars
+//! before measuring, which models the time between observing the book and being able to act
+//! on it.
 //!
 //! Features are expressions (see [`crate::feature_expr`]): a base series such as `obi_l1`
 //! or `trade_count`, optionally followed by streaming transforms, e.g.
@@ -90,7 +93,148 @@ pub struct StudyCell {
     /// Top-minus-bottom bucket mean forward return, basis points.
     pub top_minus_bottom_bps: f64,
     pub top_minus_bottom_t: f64,
+    /// Annualized Sharpe of the clipped z-score position (the `zscore` curve).
+    pub sharpe: f64,
+    /// Mean absolute position change per bar of the `zscore` curve.
+    pub turnover: f64,
+    /// Cost per unit traded, in bps, at which the `zscore` curve's mean P&L is zero.
+    pub breakeven_bps: f64,
     pub buckets: Vec<BucketRow>,
+    /// Costless curves: `zscore` first, then `sign`.
+    pub curves: Vec<CostlessCurve>,
+}
+
+/// One costless trading rule on a cell: a position taken from the feature at every bar, paid
+/// the forward return over the horizon, with no costs. Overlapping holds are averaged, so the
+/// P&L per bar is that of one tranche held for the horizon.
+#[derive(Debug, Clone, Serialize)]
+pub struct CostlessCurve {
+    /// `zscore`: the feature's z-score clipped to +-3; `sign`: the sign of that z-score.
+    pub variant: String,
+    /// Mean P&L per bar, basis points per unit of position.
+    pub mean_bps: f64,
+    /// Sharpe of the per-bar P&L annualized as one independent period per horizon.
+    pub sharpe: f64,
+    /// Mean absolute position change per bar.
+    pub turnover: f64,
+    /// `mean_bps / turnover`: the cost per unit traded, in bps, that would zero the mean P&L.
+    pub breakeven_bps: f64,
+    /// Cumulative P&L at the last observation, bps.
+    pub final_bps: f64,
+    /// Cumulative P&L sampled at up to [`CURVE_POINTS`] observations.
+    pub curve: Vec<CurvePoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CurvePoint {
+    /// Index into the cell's aligned (feature, forward return) pairs.
+    pub observation: usize,
+    pub cumulative_bps: f64,
+}
+
+/// Points kept per curve; enough for a chart, small enough for thousands of cells.
+pub const CURVE_POINTS: usize = 400;
+
+/// Z-scores beyond this many standard deviations hold the same position as at the clip.
+const Z_CLIP: f64 = 3.0;
+
+/// Independent periods per year for annualizing a horizon on a grid, assuming a market that
+/// never closes (the lake holds crypto perpetuals).
+fn periods_per_year(step_secs: u32, horizon: usize) -> f64 {
+    365.25 * 86_400.0 / (step_secs as f64 * horizon.max(1) as f64)
+}
+
+/// The costless curve for one variant over aligned (feature, forward return in bps) pairs.
+pub fn costless_curve(
+    variant: &str,
+    xs: &[f64],
+    ys: &[f64],
+    periods_per_year: f64,
+) -> CostlessCurve {
+    let n = xs.len();
+    let positions: Vec<f64> = if n < 2 {
+        vec![0.0; n]
+    } else {
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let sd = (xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
+        xs.iter()
+            .map(|x| {
+                if sd <= 0.0 {
+                    return 0.0;
+                }
+                let z = (x - mean) / sd;
+                match variant {
+                    "sign" => {
+                        if z > 0.0 {
+                            1.0
+                        } else if z < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    _ => z.clamp(-Z_CLIP, Z_CLIP),
+                }
+            })
+            .collect()
+    };
+    let pnl: Vec<f64> = positions.iter().zip(ys).map(|(p, y)| p * y).collect();
+    let (mean_bps, se) = mean_and_se(&pnl);
+    let sd = se * (n as f64).sqrt();
+    let sharpe = if sd > 0.0 {
+        mean_bps / sd * periods_per_year.sqrt()
+    } else {
+        f64::NAN
+    };
+    let turnover = if n < 2 {
+        0.0
+    } else {
+        positions
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .sum::<f64>()
+            / (n - 1) as f64
+    };
+    let breakeven_bps = if turnover > 0.0 {
+        mean_bps / turnover
+    } else {
+        f64::NAN
+    };
+    let mut cumulative = Vec::with_capacity(n);
+    let mut total = 0.0;
+    for value in &pnl {
+        total += value;
+        cumulative.push(total);
+    }
+    let curve = if n <= CURVE_POINTS {
+        cumulative
+            .iter()
+            .enumerate()
+            .map(|(observation, &cumulative_bps)| CurvePoint {
+                observation,
+                cumulative_bps,
+            })
+            .collect()
+    } else {
+        (0..CURVE_POINTS)
+            .map(|k| {
+                let observation = k * (n - 1) / (CURVE_POINTS - 1);
+                CurvePoint {
+                    observation,
+                    cumulative_bps: cumulative[observation],
+                }
+            })
+            .collect()
+    };
+    CostlessCurve {
+        variant: variant.to_owned(),
+        mean_bps: if n == 0 { f64::NAN } else { mean_bps },
+        sharpe,
+        turnover,
+        breakeven_bps,
+        final_bps: cumulative.last().copied().unwrap_or(f64::NAN),
+        curve,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -309,6 +453,11 @@ fn cell(
     let (bottom_mean, bottom_se) = mean_and_se(&bottom);
     let diff = top_mean - bottom_mean;
     let se = (top_se * top_se + bottom_se * bottom_se).sqrt();
+    let per_year = periods_per_year(step, horizon);
+    let curves = vec![
+        costless_curve("zscore", xs, ys, per_year),
+        costless_curve("sign", xs, ys, per_year),
+    ];
     StudyCell {
         symbol: symbol.to_owned(),
         feature: feature.to_owned(),
@@ -318,7 +467,11 @@ fn cell(
         ic,
         top_minus_bottom_bps: diff,
         top_minus_bottom_t: if se > 0.0 { diff / se } else { f64::NAN },
+        sharpe: curves[0].sharpe,
+        turnover: curves[0].turnover,
+        breakeven_bps: curves[0].breakeven_bps,
         buckets: rows,
+        curves,
     }
 }
 
@@ -417,21 +570,45 @@ pub fn run(
         serde_json::to_string_pretty(&result)?,
     )?;
     let mut csv = String::from(
-        "symbol,feature,horizon_secs,observations,ic,top_minus_bottom_bps,top_minus_bottom_t\n",
+        "symbol,feature,horizon_secs,observations,ic,top_minus_bottom_bps,top_minus_bottom_t,\
+         sharpe,turnover,breakeven_bps,sign_sharpe,sign_turnover,sign_breakeven_bps\n",
     );
+    let mut curves =
+        String::from("symbol,feature,horizon_secs,variant,observation,cumulative_bps\n");
     for c in &result.cells {
+        let sign = &c.curves[1];
         csv.push_str(&format!(
-            "{},{},{},{},{:.5},{:.3},{:.2}\n",
+            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{:.3},{:.4},{:.4}\n",
             c.symbol,
             c.feature,
             c.horizon_secs,
             c.observations,
             c.ic,
             c.top_minus_bottom_bps,
-            c.top_minus_bottom_t
+            c.top_minus_bottom_t,
+            c.sharpe,
+            c.turnover,
+            c.breakeven_bps,
+            sign.sharpe,
+            sign.turnover,
+            sign.breakeven_bps
         ));
+        for curve in &c.curves {
+            for point in &curve.curve {
+                curves.push_str(&format!(
+                    "{},{},{},{},{},{:.4}\n",
+                    c.symbol,
+                    c.feature,
+                    c.horizon_secs,
+                    curve.variant,
+                    point.observation,
+                    point.cumulative_bps
+                ));
+            }
+        }
     }
     fs::write(output_dir.join("study.csv"), csv)?;
+    fs::write(output_dir.join("curves.csv"), curves)?;
     Ok(result)
 }
 
@@ -446,19 +623,21 @@ pub fn summary_table(result: &StudyResult) -> String {
     };
     let _ = writeln!(
         out,
-        "{:<16} {:>8} {:>10} {:>9} {:>12} {:>8}",
-        "feature", "horizon", "obs", "IC", "top-bot bps", "t"
+        "{:<16} {:>8} {:>10} {:>9} {:>12} {:>8} {:>8} {:>10}",
+        "feature", "horizon", "obs", "IC", "top-bot bps", "t", "sharpe", "brkeven bp"
     );
     for c in result.cells.iter().filter(|c| c.symbol == symbol) {
         let _ = writeln!(
             out,
-            "{:<16} {:>7}s {:>10} {:>+9.4} {:>+12.3} {:>+8.1}",
+            "{:<16} {:>7}s {:>10} {:>+9.4} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4}",
             c.feature,
             c.horizon_secs,
             c.observations,
             c.ic,
             c.top_minus_bottom_bps,
-            c.top_minus_bottom_t
+            c.top_minus_bottom_t,
+            c.sharpe,
+            c.breakeven_bps
         );
     }
     out
@@ -624,5 +803,97 @@ mod tests {
         assert!(c.buckets[9].forward_bps > c.buckets[0].forward_bps);
         assert!(c.top_minus_bottom_bps > 0.0 && c.top_minus_bottom_t > 5.0);
         assert!((c.ic - 1.0).abs() < 1e-9);
+        // The costless curves ride on the cell: a monotone edge pays, in both variants.
+        assert_eq!(c.curves.len(), 2);
+        assert_eq!(c.curves[0].variant, "zscore");
+        assert_eq!(c.curves[1].variant, "sign");
+        assert!(c.breakeven_bps > 0.0 && c.sharpe > 0.0 && c.turnover > 0.0);
+        assert!(c.curves[1].final_bps > 0.0);
+        assert_eq!(c.breakeven_bps, c.curves[0].breakeven_bps);
+    }
+
+    /// Standard normal draws from a seeded xorshift and Box-Muller.
+    fn gaussians(mut seed: u64, count: usize) -> Vec<f64> {
+        let mut uniform = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        (0..count)
+            .map(|_| {
+                let u = uniform();
+                let v = uniform();
+                (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noisy_copy_of_the_forward_return_earns_the_analytic_sharpe() {
+        // y ~ N(0, 1) bps, feature x = y + N(0, 1). With position = z(x) the per-period Sharpe
+        // is E[zy] / sd(zy) = (1/sqrt2) / sqrt(2 - 1/2) = 1/sqrt3; clipping at 3 sd barely
+        // moves it. With position = sign(x): E[y sign(x)] = rho sqrt(2/pi), rho = 1/sqrt2.
+        let n = 40_000;
+        let ys = gaussians(0x9e37_79b9_7f4a_7c15, n);
+        let noise = gaussians(0xd1b5_4a32_d192_ed03, n);
+        let xs: Vec<f64> = ys.iter().zip(&noise).map(|(y, e)| y + e).collect();
+
+        let z = costless_curve("zscore", &xs, &ys, 1.0);
+        let expected_z = 1.0 / 3f64.sqrt();
+        assert!(
+            (z.sharpe - expected_z).abs() < 0.04,
+            "zscore sharpe {} vs analytic {expected_z}",
+            z.sharpe
+        );
+        let sign = costless_curve("sign", &xs, &ys, 1.0);
+        let mean_sign = (1.0 / 2f64.sqrt()) * (2.0 / std::f64::consts::PI).sqrt();
+        let expected_sign = mean_sign / (1.0 - mean_sign * mean_sign).sqrt();
+        assert!(
+            (sign.sharpe - expected_sign).abs() < 0.04,
+            "sign sharpe {} vs analytic {expected_sign}",
+            sign.sharpe
+        );
+        assert!((sign.mean_bps - mean_sign).abs() < 0.03);
+        // Both rules pay, so both tolerate a positive cost, and the curve ends where it says.
+        assert!(z.breakeven_bps > 0.0 && sign.breakeven_bps > 0.0);
+        assert!(z.final_bps > 0.0 && (z.final_bps - z.mean_bps * n as f64).abs() < 1e-6);
+        assert_eq!(z.curve.len(), CURVE_POINTS);
+        assert_eq!(z.curve[0].observation, 0);
+        assert_eq!(z.curve[CURVE_POINTS - 1].observation, n - 1);
+        assert_eq!(z.curve[CURVE_POINTS - 1].cumulative_bps, z.final_bps);
+        // Annualization scales with the square root of the periods per year.
+        let yearly = costless_curve("zscore", &xs, &ys, 4.0);
+        assert!((yearly.sharpe - 2.0 * z.sharpe).abs() < 1e-9);
+        assert!((periods_per_year(1, 60) - 525_960.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pure_noise_feature_has_breakeven_near_zero() {
+        let n = 40_000;
+        let ys = gaussians(0x2545_f491_4f6c_dd1d, n);
+        let xs = gaussians(0x1234_5678_9abc_def1, n);
+        for variant in ["zscore", "sign"] {
+            let curve = costless_curve(variant, &xs, &ys, 1.0);
+            assert!(
+                curve.breakeven_bps.abs() < 0.03,
+                "{variant} breakeven {} should be near zero",
+                curve.breakeven_bps
+            );
+            assert!(
+                curve.sharpe.abs() < 0.03,
+                "{variant} sharpe {}",
+                curve.sharpe
+            );
+            assert!(curve.turnover > 0.5, "{variant} trades every bar");
+        }
+        // An iid z-score changes by N(0, 2) per bar: mean absolute change 2/sqrt(pi).
+        let z = costless_curve("zscore", &xs, &ys, 1.0);
+        assert!((z.turnover - 2.0 / std::f64::consts::PI.sqrt()).abs() < 0.03);
+        // A constant feature takes no position and reports no breakeven.
+        let flat = costless_curve("zscore", &vec![1.0; 50], &ys[..50], 1.0);
+        assert_eq!(flat.turnover, 0.0);
+        assert!(flat.breakeven_bps.is_nan() && flat.sharpe.is_nan());
+        assert_eq!(flat.curve.len(), 50);
     }
 }

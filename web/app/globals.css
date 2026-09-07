@@ -4071,6 +4071,13 @@ nav {
 .sweep-heatmap td small { display: block; font-size: 11px; opacity: 0.8; }
 .sweep-heatmap td.positive { color: #32c832; }
 .sweep-heatmap td.negative { color: #e03040; }
+.studies-workspace .sweep-heatmap td { cursor: pointer; }
+.study-curve { padding-top: 6px; }
+.study-curve .chart-readout { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
+.ranked-cells tbody tr { cursor: pointer; }
+.ranked-cells tbody tr.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+.ranked-cells td.positive { color: #32c832; }
+.ranked-cells td.negative { color: #e03040; }
 @media (max-width: 1100px) { .study-pick-grid { grid-template-columns: 1fr; } }
 
 /* Data sources */

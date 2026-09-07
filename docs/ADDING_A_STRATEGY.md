@@ -129,9 +129,15 @@ the list of what exists. The grammar lives in `src/feature_expr.rs`.
 
 The study reports, per symbol and pooled, the Spearman rank correlation between the feature and the
 forward mid-price return (the information coefficient), decile mean forward returns in basis
-points, and a t-statistic for top-minus-bottom decile. The UI's Studies page runs the same thing
-against the configured lake. Use receive timestamps and a non-zero delay, or the edge will look
-better than it is.
+points, and a t-statistic for top-minus-bottom decile. Each cell also carries a costless curve:
+the position is the feature's z-score clipped to +-3 (and a `sign` variant), the P&L per bar is
+that position times the forward return with no costs. From it come an annualized Sharpe (one
+independent period per horizon, a market that never closes), turnover (mean absolute position
+change per bar), and the breakeven cost in bps per unit traded (mean P&L over turnover): the
+cost at which the edge pays nothing. `study.csv` has the numbers, `curves.csv` the cumulative
+P&L series (up to 400 points per curve), and the UI's Studies page ranks cells by breakeven cost
+and draws the curve of the selected cell. Use receive timestamps and a non-zero delay, or the
+edge will look better than it is.
 
 ## Platform sizing and price guards
 

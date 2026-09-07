@@ -25,7 +25,7 @@ the current implementation (fixture from a 1-day SOL grid checked into `target/`
 Note: the parity fixture is a deterministic synthetic 1-second grid generated in the test rather
 than a checked-in SOL day; it exercises book gaps and all eight names.
 
-### WB-02 Costless equity curve and breakeven cost — `todo` — Blocked by WB-01
+### WB-02 Costless equity curve and breakeven cost — `done 2026-09-07 WB-02: costless equity curve and breakeven cost` — Blocked by WB-01
 For each feature and horizon: position = clipped z-score of the feature (and a `sign` variant),
 P&L = position x forward return with zero costs; report cumulative P&L series, Sharpe, turnover
 (mean absolute position change per bar), and breakeven cost in bps = mean P&L per unit turnover.
@@ -88,6 +88,14 @@ IC decay across horizons, decile bars, the costless equity curve, and daily IC, 
 the terminal style (see `EquityChart`).
 **Done when:** each chart renders from a fixture result in the browser without console errors and
 the study page opens at the top with the results grid first.
+
+### WB-11 Non-overlapping costless curve for slow features — `todo` — Blocked by WB-02
+The WB-02 curve pays every bar the forward return of an `h`-bar hold, so a feature whose position
+barely changes (spread_bps: turnover 0.002/bar on the SOL day) reports a breakeven of tens of bps
+that no non-overlapping execution would earn. Add a variant that rebalances every `h` bars (or
+holds until the position flips) and report its Sharpe and breakeven next to the per-bar ones.
+**Done when:** a unit test shows the per-bar and rebalanced variants agree for `h = 1` and the
+rebalanced breakeven of a constant-position feature is finite and far below the per-bar figure.
 
 ## Housekeeping
 

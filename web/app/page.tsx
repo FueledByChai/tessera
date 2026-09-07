@@ -1463,7 +1463,22 @@ type StudyCell = {
   ic: number;
   top_minus_bottom_bps: number;
   top_minus_bottom_t: number;
+  // Costless-curve summary of the clipped z-score rule (absent on studies that predate it;
+  // null where the engine had no answer, e.g. a constant feature).
+  sharpe?: number | null;
+  turnover?: number | null;
+  breakeven_bps?: number | null;
+  curves?: StudyCurve[];
   buckets: { bucket: number; count: number; feature_mean: number; forward_bps: number }[];
+};
+type StudyCurve = {
+  variant: string;
+  mean_bps: number | null;
+  sharpe: number | null;
+  turnover: number | null;
+  breakeven_bps: number | null;
+  final_bps: number | null;
+  curve: { observation: number; cumulative_bps: number }[];
 };
 type StudyResult = {
   config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number };
@@ -1496,6 +1511,55 @@ function icClass(value: number) {
   if (!Number.isFinite(value)) return "";
   if (Math.abs(value) < 0.01) return "";
   return value > 0 ? "positive" : "negative";
+}
+
+/** A number the engine could compute, else null (serde writes NaN as null). */
+function finite(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function signed(value: number | null | undefined, digits: number) {
+  const v = finite(value);
+  return v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(digits)}`;
+}
+
+/** Cumulative costless P&L of one cell's rule: clipped z-score or sign position, no costs. */
+function StudyCurveChart({ cell, variant }: { cell: StudyCell; variant: string }) {
+  const curve = cell.curves?.find((c) => c.variant === variant) ?? cell.curves?.[0];
+  if (!curve || !curve.curve.length) {
+    return <div className="empty-state">This study predates costless curves; run it again to see one.</div>;
+  }
+  const points = curve.curve;
+  const values = points.map((p) => p.cumulative_bps);
+  const min = Math.min(0, ...values);
+  const max = Math.max(0, ...values);
+  const span = Math.max(max - min, 1e-9);
+  const lastObservation = Math.max(points[points.length - 1].observation, 1);
+  const y = (bps: number) => 206 - ((bps - min) / span) * 172;
+  const line = points.map((p) => `${32 + (p.observation / lastObservation) * 736},${y(p.cumulative_bps)}`).join(" ");
+  return (
+    <div className="equity-chart study-curve">
+      <div className="chart-readout">
+        <strong>{curve.variant === "sign" ? "position = sign(z)" : "position = clip(z, ±3)"}</strong>
+        <span>Sharpe {formatNumber(finite(curve.sharpe), 2)}</span>
+        <span>turnover {formatNumber(finite(curve.turnover), 3)}/bar</span>
+        <span className={classFor(finite(curve.breakeven_bps) ?? undefined)}>breakeven {signed(curve.breakeven_bps, 4)} bps</span>
+        <span className={classFor(finite(curve.final_bps) ?? undefined)}>total {signed(curve.final_bps, 1)} bps</span>
+      </div>
+      <svg viewBox="0 0 800 240" role="img" aria-label="Cumulative costless P&L in basis points">
+        {[34, 77, 120, 163, 206].map((gy) => (
+          <g key={gy}>
+            <line x1="32" y1={gy} x2="768" y2={gy} className="chart-grid" />
+            <text x="766" y={gy - 3} textAnchor="end" className="chart-axis">{(min + ((206 - gy) / 172) * span).toFixed(1)}</text>
+          </g>
+        ))}
+        <line x1="32" y1={y(0)} x2="768" y2={y(0)} className="chart-crosshair" />
+        <polyline points={line} className="chart-line" />
+        <text x="32" y="228" className="chart-axis">obs 0</text>
+        <text x="768" y="228" textAnchor="end" className="chart-axis">obs {lastObservation.toLocaleString()}</text>
+      </svg>
+    </div>
+  );
 }
 
 /** Feature studies on the tick lake: create, list, and read IC / decile tables. */
@@ -1562,6 +1626,24 @@ function StudiesWorkspace() {
   const [bucketFeature, setBucketFeature] = useState("obi_l1");
   const [bucketHorizon, setBucketHorizon] = useState<number | null>(null);
   const bucketCell = cellFor(featureList.includes(bucketFeature) ? bucketFeature : featureList[0] ?? "", bucketHorizon ?? horizonList[1] ?? horizonList[0] ?? 1);
+  const [sortKey, setSortKey] = useState<"breakeven" | "ic" | "name">("breakeven");
+  const [curveVariant, setCurveVariant] = useState("zscore");
+  const [showAllRanked, setShowAllRanked] = useState(false);
+  // Feature rows sort by their best cell across horizons: highest breakeven cost or |IC|.
+  const bestOf = (feature: string, pick: (c: StudyCell) => number | null) =>
+    horizonList.reduce((best, h) => {
+      const value = pick(cellFor(feature, h) ?? ({} as StudyCell));
+      return value != null && value > best ? value : best;
+    }, Number.NEGATIVE_INFINITY);
+  const sortedFeatures = [...featureList].sort((a, b) => {
+    if (sortKey === "name") return a.localeCompare(b);
+    if (sortKey === "ic") return bestOf(b, (c) => (finite(c.ic) == null ? null : Math.abs(c.ic))) - bestOf(a, (c) => (finite(c.ic) == null ? null : Math.abs(c.ic)));
+    return bestOf(b, (c) => finite(c.breakeven_bps)) - bestOf(a, (c) => finite(c.breakeven_bps));
+  });
+  const ranked = cells
+    .filter((c) => finite(c.breakeven_bps) != null)
+    .sort((a, b) => (finite(b.breakeven_bps) ?? 0) - (finite(a.breakeven_bps) ?? 0));
+  const RANK_CAP = 12;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1718,6 +1800,13 @@ function StudiesWorkspace() {
                 {symbolsInResult.map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
             )}
+            {result && (
+              <select value={sortKey} onChange={(e) => setSortKey(e.target.value as "breakeven" | "ic" | "name")}>
+                <option value="breakeven">rows: breakeven cost</option>
+                <option value="ic">rows: |IC|</option>
+                <option value="name">rows: name</option>
+              </select>
+            )}
           </div>
           {!detail ? <div className="empty-state">Select a study.</div> : detail.study.status === "failed" ? (
             <div className="run-failure"><strong>Study failed</strong><span>{detail.study.error}</span></div>
@@ -1732,21 +1821,26 @@ function StudiesWorkspace() {
               </div>
               <div className="table-wrap sweep-heatmap"><table>
                 <thead><tr><th>feature ↓ / horizon →</th>{horizonList.map((h) => <th key={h}>{h * result.config.step_secs}s</th>)}</tr></thead>
-                <tbody>{featureList.map((feature) => (
+                <tbody>{sortedFeatures.map((feature) => (
                   <tr key={feature}><th>{feature}</th>
                     {horizonList.map((h) => {
                       const c = cellFor(feature, h);
                       return (
-                        <td key={h} className={c ? icClass(c.ic) : "pending-cell"} title={c ? `t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()}` : ""}>
+                        <td
+                          key={h}
+                          className={c ? icClass(c.ic) : "pending-cell"}
+                          title={c ? `t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar` : ""}
+                          onClick={() => { if (c) { setBucketFeature(feature); setBucketHorizon(h); } }}
+                        >
                           {c ? `${c.ic >= 0 ? "+" : ""}${c.ic.toFixed(4)}` : "·"}
-                          {c && <small> {c.top_minus_bottom_bps >= 0 ? "+" : ""}{c.top_minus_bottom_bps.toFixed(2)}bp</small>}
+                          {c && <small>{signed(c.top_minus_bottom_bps, 2)}bp · be {signed(c.breakeven_bps, 3)}</small>}
                         </td>
                       );
                     })}
                   </tr>
                 ))}</tbody>
               </table></div>
-              <p className="footnote">Cell: Spearman IC, then top-minus-bottom decile forward return in bps. Hover for the t-stat and observation count.</p>
+              <p className="footnote">Cell: Spearman IC, then top-minus-bottom decile forward return in bps and the breakeven cost (bps per unit traded) of the clipped z-score rule. Hover for t-stat, observations, Sharpe, and turnover; click a cell to select it below.</p>
               <div className="terminal-panel-title">
                 <span>DEC</span> DECILES
                 <select value={bucketCell?.feature ?? ""} onChange={(e) => setBucketFeature(e.target.value)}>
@@ -1768,6 +1862,45 @@ function StudiesWorkspace() {
                     </tr>
                   ))}</tbody>
                 </table></div>
+              )}
+              <div className="terminal-panel-title">
+                <span>CRV</span> COSTLESS CURVE{bucketCell ? ` · ${bucketCell.feature} · ${bucketCell.horizon_secs}s` : ""}
+                <select value={curveVariant} onChange={(e) => setCurveVariant(e.target.value)}>
+                  <option value="zscore">position: clipped z-score</option>
+                  <option value="sign">position: sign</option>
+                </select>
+              </div>
+              {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} />}
+              <p className="footnote">Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L.</p>
+              <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
+              {ranked.length ? (
+                <>
+                  <div className="table-wrap"><table className="ranked-cells">
+                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven (bps)</th><th>Sign breakeven</th></tr></thead>
+                    <tbody>{(showAllRanked ? ranked : ranked.slice(0, RANK_CAP)).map((c) => (
+                      <tr
+                        key={`${c.feature}-${c.horizon_bars}`}
+                        className={bucketCell === c ? "active" : ""}
+                        onClick={() => { setBucketFeature(c.feature); setBucketHorizon(c.horizon_bars); }}
+                      >
+                        <td>{c.feature}</td>
+                        <td>{c.horizon_secs}s</td>
+                        <td className={icClass(c.ic)}>{signed(c.ic, 4)}</td>
+                        <td className={classFor(finite(c.sharpe) ?? undefined)}>{signed(c.sharpe, 2)}</td>
+                        <td>{formatNumber(finite(c.turnover), 3)}</td>
+                        <td className={classFor(finite(c.breakeven_bps) ?? undefined)}>{signed(c.breakeven_bps, 4)}</td>
+                        <td className={classFor(finite(c.curves?.[1]?.breakeven_bps) ?? undefined)}>{signed(c.curves?.[1]?.breakeven_bps, 4)}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table></div>
+                  {ranked.length > RANK_CAP && (
+                    <button type="button" className="secondary-action" onClick={() => setShowAllRanked((v) => !v)}>
+                      {showAllRanked ? `Top ${RANK_CAP} only` : `Show all ${ranked.length}`}
+                    </button>
+                  )}
+                </>
+              ) : (
+                <div className="empty-state">No breakeven costs in this study; run it again on the current engine.</div>
               )}
             </>
           )}
