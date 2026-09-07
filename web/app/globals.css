@@ -4151,3 +4151,23 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 .symbol-filter small {
   color: var(--muted);
 }
+
+/* Study form: free-form feature expressions. */
+.expression-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.expression-box textarea {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+  padding: 8px 10px;
+  font: 500 13px var(--font-geist-mono);
+  resize: vertical;
+}
+.expression-box small {
+  color: var(--muted);
+  line-height: 1.5;
+}

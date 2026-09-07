@@ -108,6 +108,25 @@ horizons = [1, 5, 30, 60]
 decision_delay_bars = 1             # bars between observing the book and acting
 ```
 
+Features are expressions: a base series, then any number of streaming transforms joined by `|`.
+
+```text
+obi_l1                                     a base on its own
+signed_volume | zscore 30                  z-score over the last 30 bars
+trade_count | rate 1 | ratio_to sma 300    trades per second vs. their 5-minute mean
+obi_l1 | diff 1                            change since the previous bar
+obi_l1 | times (spread_bps | zscore 60)    interaction; parentheses nest a pipeline
+```
+
+Bases: `obi_l1`, `obi_l5`, `obi_l10`, `microprice_bps`, `spread_bps`, `trade_imbalance`,
+`return_1`, `signed_volume`, `bid`, `ask`, `mid`, `microprice`, `bid_size`, `ask_size`,
+`bid_depth_l5`, `ask_depth_l5`, `trade_count`, `buy_volume`, `sell_volume`, `volume`, `close`.
+Transforms: `ema n`, `sma n`, `zscore n`, `diff n`, `lag n`, `rate n` (sum over `n` bars per
+second), `ratio_to <transform>` (the value over a transform of itself), `pct_rank n`, `abs`,
+`sign`, `clip lo hi`, `times <base | (expr)>`. Windows count bars; a bar without a book is `NaN`
+and a `NaN` inside a window propagates, so a lag is always a lag in bars. Unknown names fail with
+the list of what exists. The grammar lives in `src/feature_expr.rs`.
+
 The study reports, per symbol and pooled, the Spearman rank correlation between the feature and the
 forward mid-price return (the information coefficient), decile mean forward returns in basis
 points, and a t-statistic for top-minus-bottom decile. The UI's Studies page runs the same thing

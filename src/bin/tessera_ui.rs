@@ -4373,10 +4373,8 @@ fn validate_study_request(
         buckets: 10,
     };
     for feature in &config.features {
-        anyhow::ensure!(
-            tessera::study::FEATURES.contains(&feature.as_str()),
-            "unknown feature {feature}"
-        );
+        tessera::feature_expr::parse(feature)
+            .with_context(|| format!("feature expression {feature:?}"))?;
     }
     Ok((config, start, end))
 }

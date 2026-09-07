@@ -7,6 +7,10 @@
 //! decile, and a t-statistic for top-minus-bottom decile. `decision_delay_bars` shifts every
 //! feature by that many bars before measuring, which models the time between observing the
 //! book and being able to act on it.
+//!
+//! Features are expressions (see [`crate::feature_expr`]): a base series such as `obi_l1`
+//! or `trade_count`, optionally followed by streaming transforms, e.g.
+//! `signed_volume | zscore 30` or `trade_count | rate 1 | ratio_to sma 300`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,8 +21,10 @@ use chrono::NaiveDate;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::lake::{self, BookFeatures, LakeBar, LakeSymbol};
+use crate::feature_expr::{self, BarInput, Evaluator};
+use crate::lake::{self, LakeSymbol};
 
+/// The default feature set: the plain base series a study runs when none are given.
 pub const FEATURES: &[&str] = &[
     "obi_l1",
     "obi_l5",
@@ -112,27 +118,6 @@ struct SymbolSeries {
     bars_with_book: usize,
 }
 
-fn feature_value(name: &str, book: &BookFeatures, bars: &[LakeBar], index: usize) -> Option<f64> {
-    Some(match name {
-        "obi_l1" => book.obi_l1,
-        "obi_l5" => book.obi_l5,
-        "obi_l10" => book.obi_l10,
-        "microprice_bps" => book.microprice_bps(),
-        "spread_bps" => book.spread_bps,
-        "trade_imbalance" => book.trade_imbalance(),
-        "signed_volume" => book.buy_volume - book.sell_volume,
-        "return_1" => {
-            let previous = bars.get(index.checked_sub(1)?)?.book?.mid;
-            if previous > 0.0 {
-                (book.mid / previous - 1.0) * 1e4
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    })
-}
-
 fn load_symbol(
     config: &StudyConfig,
     symbol: &str,
@@ -142,30 +127,8 @@ fn load_symbol(
     let sym =
         LakeSymbol::parse(symbol).with_context(|| format!("{symbol} is not EXCHANGE:SYMBOL"))?;
     let bars = lake::build_bars(&config.lake_dir, &sym, config.step_secs, start, end)?;
-    let mut mids = Vec::with_capacity(bars.len());
-    let mut features: BTreeMap<String, Vec<f64>> = config
-        .features
-        .iter()
-        .map(|f| (f.clone(), Vec::with_capacity(bars.len())))
-        .collect();
-    let mut bars_with_book = 0;
-    for (index, bar) in bars.iter().enumerate() {
-        match bar.book {
-            Some(book) => {
-                bars_with_book += 1;
-                mids.push(book.mid);
-                for (name, values) in &mut features {
-                    values.push(feature_value(name, &book, &bars, index).unwrap_or(f64::NAN));
-                }
-            }
-            None => {
-                mids.push(f64::NAN);
-                for values in features.values_mut() {
-                    values.push(f64::NAN);
-                }
-            }
-        }
-    }
+    let (mids, features, bars_with_book) =
+        evaluate_features(&config.features, config.step_secs, &bars)?;
     Ok(SymbolSeries {
         symbol: symbol.to_owned(),
         mids,
@@ -173,6 +136,49 @@ fn load_symbol(
         bars: bars.len(),
         bars_with_book,
     })
+}
+
+/// Runs every feature expression over the bars in one streaming pass. Returns the mid series
+/// (`NaN` where the bar has no book), the feature matrix, and the count of bars with a book.
+fn evaluate_features(
+    expressions: &[String],
+    step_secs: u32,
+    bars: &[lake::LakeBar],
+) -> Result<(Vec<f64>, BTreeMap<String, Vec<f64>>, usize)> {
+    let mut evaluators = Vec::with_capacity(expressions.len());
+    for text in expressions {
+        let expr =
+            feature_expr::parse(text).with_context(|| format!("feature expression {text:?}"))?;
+        evaluators.push((text.clone(), Evaluator::new(&expr, step_secs)));
+    }
+    let mut mids = Vec::with_capacity(bars.len());
+    let mut features: BTreeMap<String, Vec<f64>> = expressions
+        .iter()
+        .map(|f| (f.clone(), Vec::with_capacity(bars.len())))
+        .collect();
+    let mut bars_with_book = 0;
+    let mut previous_mid = None;
+    for bar in bars {
+        let input = BarInput { bar, previous_mid };
+        for (name, evaluator) in &mut evaluators {
+            let value = evaluator.next(input);
+            if let Some(values) = features.get_mut(name) {
+                values.push(value);
+            }
+        }
+        match bar.book {
+            Some(book) => {
+                bars_with_book += 1;
+                mids.push(book.mid);
+                previous_mid = Some(book.mid);
+            }
+            None => {
+                mids.push(f64::NAN);
+                previous_mid = None;
+            }
+        }
+    }
+    Ok((mids, features, bars_with_book))
 }
 
 /// Average rank with ties sharing the mean rank.
@@ -326,12 +332,7 @@ pub fn run(
         bail!("the study needs at least one EXCHANGE:SYMBOL");
     }
     for feature in &config.features {
-        if !FEATURES.contains(&feature.as_str()) {
-            bail!(
-                "unknown feature {feature:?}; choose from {}",
-                FEATURES.join(", ")
-            );
-        }
+        feature_expr::parse(feature).with_context(|| format!("feature expression {feature:?}"))?;
     }
     fs::create_dir_all(output_dir)?;
     eprintln!(
@@ -492,6 +493,126 @@ mod tests {
         );
         let (xd, _) = pairs(&feature, &mids, 5, 2);
         assert_eq!(xd.len(), 13, "delay consumes bars at the end");
+    }
+
+    /// The pre-expression feature switch, kept as the parity reference for the eight names.
+    fn legacy_feature_value(
+        name: &str,
+        book: &crate::lake::BookFeatures,
+        bars: &[lake::LakeBar],
+        index: usize,
+    ) -> Option<f64> {
+        Some(match name {
+            "obi_l1" => book.obi_l1,
+            "obi_l5" => book.obi_l5,
+            "obi_l10" => book.obi_l10,
+            "microprice_bps" => book.microprice_bps(),
+            "spread_bps" => book.spread_bps,
+            "trade_imbalance" => book.trade_imbalance(),
+            "signed_volume" => book.buy_volume - book.sell_volume,
+            "return_1" => {
+                let previous = bars.get(index.checked_sub(1)?)?.book?.mid;
+                if previous > 0.0 {
+                    (book.mid / previous - 1.0) * 1e4
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// A deterministic day of 1-second bars with a moving book and occasional gaps.
+    fn synthetic_grid() -> Vec<lake::LakeBar> {
+        let mut seed: u64 = 0x5eed;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0
+        };
+        let mut mid = 150.0;
+        (0..3_000)
+            .map(|i| {
+                mid *= 1.0 + (rand() - 0.5) * 2e-4;
+                let bid_size = 1.0 + rand() * 20.0;
+                let ask_size = 1.0 + rand() * 20.0;
+                let buy = rand() * 5.0;
+                let sell = rand() * 5.0;
+                let book = (i % 97 != 0).then(|| crate::lake::BookFeatures {
+                    bid: mid - 0.01,
+                    ask: mid + 0.01,
+                    bid_size,
+                    ask_size,
+                    mid,
+                    microprice: (mid - 0.01) * ask_size / (bid_size + ask_size)
+                        + (mid + 0.01) * bid_size / (bid_size + ask_size),
+                    spread_bps: 0.02 / mid * 1e4,
+                    obi_l1: (bid_size - ask_size) / (bid_size + ask_size),
+                    obi_l5: rand() - 0.5,
+                    obi_l10: rand() - 0.5,
+                    bid_depth_l5: bid_size * 4.0,
+                    ask_depth_l5: ask_size * 4.0,
+                    trade_count: (rand() * 8.0) as usize,
+                    buy_volume: buy,
+                    sell_volume: sell,
+                });
+                lake::LakeBar {
+                    date: NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+                    time: chrono::NaiveTime::from_num_seconds_from_midnight_opt(i, 0).unwrap(),
+                    open: mid,
+                    high: mid,
+                    low: mid,
+                    close: mid,
+                    volume: buy + sell,
+                    book,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn expressions_reproduce_the_original_eight_features_and_their_ic() {
+        let bars = synthetic_grid();
+        let names: Vec<String> = FEATURES.iter().map(|f| (*f).to_owned()).collect();
+        let (mids, features, with_book) = evaluate_features(&names, 1, &bars).unwrap();
+        assert_eq!(with_book, bars.iter().filter(|b| b.book.is_some()).count());
+        for name in FEATURES {
+            let legacy: Vec<f64> = bars
+                .iter()
+                .enumerate()
+                .map(|(i, bar)| match bar.book {
+                    Some(book) => legacy_feature_value(name, &book, &bars, i).unwrap_or(f64::NAN),
+                    None => f64::NAN,
+                })
+                .collect();
+            let fresh = &features[*name];
+            assert_eq!(fresh.len(), legacy.len());
+            for (a, b) in fresh.iter().zip(&legacy) {
+                assert!(
+                    (a.is_nan() && b.is_nan()) || a == b,
+                    "{name}: expression {a} vs legacy {b}"
+                );
+            }
+            for horizon in [1, 5, 30] {
+                let (xf, yf) = pairs(fresh, &mids, horizon, 1);
+                let (xl, yl) = pairs(&legacy, &mids, horizon, 1);
+                assert_eq!(xf, xl);
+                assert_eq!(spearman(&xf, &yf), spearman(&xl, &yl), "{name} h{horizon}");
+            }
+        }
+        // And a transformed expression runs through the same path.
+        let (_, derived, _) =
+            evaluate_features(&["obi_l1 | zscore 30".to_owned()], 1, &bars).unwrap();
+        assert!(
+            derived["obi_l1 | zscore 30"]
+                .iter()
+                .filter(|v| v.is_finite())
+                .count()
+                > 2_000
+        );
+        let err = evaluate_features(&["obi_l1 | smooth 3".to_owned()], 1, &bars).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown transform"));
     }
 
     #[test]

@@ -6,13 +6,13 @@ long-form acceptance criteria; this file is the executable queue. Protocol:
 - One ticket per commit. The commit message starts with the id. `scripts/check.sh` must pass.
 - A ticket's **Done when** line names a test, fixture, or measurable output that ships in the
   same commit. If it cannot be tested, rewrite the ticket until it can.
-- States: `todo`, `doing`, `done <date> <commit>`, `blocked <reason>`. Take the first `todo`
+- States: `todo`, `doing`, `done <date>` (the commit carries the id; `git log --grep WB-01`), `blocked <reason>`. Take the first `todo`
   whose `Blocked by` tickets are done. Never take two at once.
 - Anything discovered while working goes in as a new ticket, not into the current one.
 
 ## Feature workbench (Studies page)
 
-### WB-01 Feature expression grammar — `todo`
+### WB-01 Feature expression grammar — `done 2026-09-06`
 Replace the fixed feature list in `src/study.rs` with expressions: a base series followed by
 transforms, e.g. `trade_count | rate 1 | ratio_to sma 300`, `signed_volume | zscore 30`,
 `obi_l1 | diff 1`, `a | times b`. Bases: every `BookFeatures` field plus trade count, volume,
@@ -22,6 +22,8 @@ per symbol; unknown names produce a clear error listing what exists.
 **Done when:** unit tests cover parsing (including nested `times` and error text), each transform
 against hand-computed values, and a study over the existing eight names produces identical IC to
 the current implementation (fixture from a 1-day SOL grid checked into `target/`-free test data).
+Note: the parity fixture is a deterministic synthetic 1-second grid generated in the test rather
+than a checked-in SOL day; it exercises book gaps and all eight names.
 
 ### WB-02 Costless equity curve and breakeven cost — `todo` — Blocked by WB-01
 For each feature and horizon: position = clipped z-score of the feature (and a `sign` variant),

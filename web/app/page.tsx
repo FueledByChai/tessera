@@ -1506,6 +1506,13 @@ function StudiesWorkspace() {
   const [detail, setDetail] = useState<{ study: StudyRecord; result: StudyResult | null } | null>(null);
   const [symbols, setSymbols] = useState<string[]>([]);
   const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id));
+  // Free-form feature expressions, one per line: base series plus streaming transforms.
+  const [expressions, setExpressions] = useState("");
+  const customFeatures = useMemo(
+    () => expressions.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#")),
+    [expressions],
+  );
+  const allFeatures = useMemo(() => [...features, ...customFeatures], [features, customFeatures]);
   const [step, setStep] = useState(1);
   const [horizons, setHorizons] = useState("1,5,30,60");
   const [delay, setDelay] = useState(1);
@@ -1571,7 +1578,7 @@ function StudiesWorkspace() {
           end_date: form.get("end_date"),
           symbols,
           step_secs: step,
-          features,
+          features: allFeatures,
           horizons: horizons.split(",").map((h) => Number(h.trim())).filter((h) => h > 0),
           decision_delay_bars: delay,
         }),
@@ -1658,12 +1665,29 @@ function StudiesWorkspace() {
                     <small>{id}</small>
                   </label>
                 ))}
+                <label className="expression-box">
+                  <span>Expressions</span>
+                  <textarea
+                    rows={5}
+                    spellCheck={false}
+                    placeholder={"signed_volume | zscore 30\ntrade_count | rate 1 | ratio_to sma 300\nobi_l1 | times (spread_bps | zscore 60)"}
+                    value={expressions}
+                    onChange={(e) => setExpressions(e.target.value)}
+                  />
+                  <small>
+                    One per line: a base (obi_l1, obi_l5, obi_l10, microprice_bps, spread_bps, trade_imbalance,
+                    return_1, signed_volume, bid, ask, mid, microprice, bid_size, ask_size, bid_depth_l5,
+                    ask_depth_l5, trade_count, buy_volume, sell_volume, volume, close) then transforms:
+                    ema n, sma n, zscore n, diff n, lag n, rate n, ratio_to &lt;transform&gt;, pct_rank n, abs,
+                    sign, clip lo hi, times &lt;base | (expr)&gt;.
+                  </small>
+                </label>
               </fieldset>
             </div>
             {error && <p className="negative-text">{error}</p>}
             <div className="sweep-submit">
-              <span>{symbols.length} instruments · {features.length} features · grid {step}s</span>
-              <button className="primary-action" disabled={busy || symbols.length === 0 || features.length === 0}>
+              <span>{symbols.length} instruments · {allFeatures.length} features · grid {step}s</span>
+              <button className="primary-action" disabled={busy || symbols.length === 0 || allFeatures.length === 0}>
                 Run study →
               </button>
             </div>
