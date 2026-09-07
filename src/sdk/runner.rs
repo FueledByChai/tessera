@@ -1556,6 +1556,13 @@ fn plan_screened(
     Ok(plan)
 }
 
+/// The run config with the manifest's required symbols appended to the selected list.
+fn with_required_symbols(config: &SdkRunConfig, manifest: &Manifest) -> SdkRunConfig {
+    let mut config = config.clone();
+    config.data.symbols = manifest.with_required_symbols(&config.data.symbols);
+    config
+}
+
 /// Run one SDK strategy over the requested window and write the standard bundle.
 pub fn run(
     config: &SdkRunConfig,
@@ -1564,10 +1571,13 @@ pub fn run(
     end: NaiveDate,
     output_dir: &Path,
 ) -> Result<SdkRunSummary> {
-    config.validate()?;
-    anyhow::ensure!(start <= end, "start must not be after end");
     let manifest: &Manifest = &entry.manifest;
     manifest.validate()?;
+    // The manifest's required symbols ride along whatever the form or config listed, so the
+    // frozen config, the coverage table, and the summary all show them.
+    let config = &with_required_symbols(config, manifest);
+    config.validate()?;
+    anyhow::ensure!(start <= end, "start must not be after end");
     let params = manifest.resolve(&config.parameters)?;
     fs::create_dir_all(output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
@@ -1982,6 +1992,72 @@ mod tests {
                 (NaiveDate::from_ymd_opt(2023, 12, 5).unwrap(), 1.0),
             ]
         );
+    }
+
+    /// A strategy that trades nothing but declares a hedge symbol it cannot run without.
+    struct IdleWithHedge;
+
+    impl crate::sdk::strategy::Strategy for IdleWithHedge {
+        fn manifest() -> Manifest {
+            Manifest::new("idle_with_hedge", "Idle with hedge", "v1")
+                .run_defaults(&["DEMO.US"], "daily")
+                .required_symbols(&["ACME.US"])
+        }
+        fn new(_params: &crate::sdk::manifest::Params, _symbol: &str) -> Result<Self> {
+            Ok(Self)
+        }
+        fn on_bar(&mut self, _ctx: &mut crate::sdk::strategy::Ctx, _bar: &Bar) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn required_symbols_join_the_plan_when_the_form_omits_them() {
+        // The form (here: the frozen config) lists only DEMO.US; the manifest requires ACME.US.
+        let data = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/data/eod");
+        let config: SdkRunConfig = toml::from_str(&format!(
+            r#"
+            strategy = "idle_with_hedge"
+            [data]
+            resolution = "daily"
+            daily_dir = "{data}"
+            symbols = ["DEMO.US"]
+            calendar_symbol = "DEMO.US"
+            "#
+        ))
+        .unwrap();
+        let entry = StrategyEntry::of::<IdleWithHedge>();
+
+        let planned = with_required_symbols(&config, &entry.manifest);
+        assert_eq!(planned.data.symbols, vec!["DEMO.US", "ACME.US"]);
+        // Listing the hedge yourself changes nothing.
+        assert_eq!(
+            with_required_symbols(&planned, &entry.manifest)
+                .data
+                .symbols,
+            planned.data.symbols
+        );
+
+        // End to end: the run loads, freezes, and covers the appended symbol.
+        let out = env::temp_dir().join(format!("tessera-hk01-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let summary = run(
+            &config,
+            &entry,
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 28).unwrap(),
+            &out,
+        )
+        .unwrap();
+        assert_eq!(summary.symbols, 2);
+        let frozen = fs::read_to_string(out.join("strategy_config.toml")).unwrap();
+        assert!(
+            frozen.contains("\"ACME.US\""),
+            "frozen config lacks ACME.US:\n{frozen}"
+        );
+        let coverage = fs::read_to_string(out.join("coverage.csv")).unwrap();
+        assert!(coverage.lines().any(|line| line.starts_with("ACME.US,")));
+        let _ = fs::remove_dir_all(&out);
     }
 
     #[test]

@@ -91,7 +91,7 @@ the study page opens at the top with the results grid first.
 
 ## Housekeeping
 
-### HK-01 Required symbols from the manifest — `todo`
+### HK-01 Required symbols from the manifest — `done 2026-09-06 HK-01: required symbols from the manifest`
 A manifest can declare symbols the runner always appends (End-of-Year Dogs needs `IWM.US` for the
 hedge even when the form lists only `universe:stocks`).
 **Done when:** a test shows the appended symbol present in the plan when omitted from the form,
@@ -106,3 +106,13 @@ Overview tab, with the skipped symbols listed on the Symbols tab.
 Replace the hand-written CI steps with `scripts/check.sh --quick` plus the web job.
 **Done when:** the workflow file calls the script and a deliberate parity break fails CI locally
 with `act` or in a PR.
+
+### HK-04 check.sh works from a worktree — `todo`
+From `.claude/worktrees/<name>` the script cannot find `../Tessera-private` (so the private checks
+silently skip), a fresh worktree has no `local.toml` (so private strategies do not compile in), and
+the private legacy crate builds against the main checkout's engine, so a private strategy that uses
+a new SDK method fails the private check until the public commit reaches `main`. Found while
+working HK-01 in a worktree.
+**Done when:** `scripts/check.sh` run from a worktree resolves the private checkout through the
+repository's common git dir (or `TESSERA_PRIVATE_ROOT`), copies or points at the main `local.toml`,
+and a test run from a worktree reports the private checks as run, not skipped.

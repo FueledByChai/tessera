@@ -178,6 +178,10 @@ pub struct Manifest {
     /// Symbols pre-filled on the run form (for example the production instrument list).
     #[serde(default)]
     pub default_symbols: Vec<String>,
+    /// Symbols the runner appends to every run, whatever the form or config lists: a hedge or
+    /// benchmark instrument the strategy cannot work without. Full `SYMBOL.US` form.
+    #[serde(default)]
+    pub required_symbols: Vec<String>,
     /// Resolution pre-selected on the run form: daily, 5m, or 1m.
     #[serde(default)]
     pub default_resolution: Option<String>,
@@ -208,6 +212,7 @@ impl Manifest {
             default_tie_break: None,
             default_seed: 0,
             default_symbols: Vec::new(),
+            required_symbols: Vec::new(),
             default_resolution: None,
             params: Vec::new(),
         }
@@ -249,7 +254,24 @@ impl Manifest {
         self.default_resolution = Some(resolution.to_owned());
         self
     }
-    /// Default daily entry cap and tie-break (`priority`, `random`, or `alphabetical`).
+    /// Symbols every run includes even when the form or config omits them (for example the
+    /// hedge instrument of a universe strategy). The runner appends them after universe
+    /// expansion; `run_defaults` only pre-fills the form.
+    pub fn required_symbols(mut self, symbols: &[&str]) -> Self {
+        self.required_symbols = symbols.iter().map(|s| (*s).to_owned()).collect();
+        self
+    }
+    /// The run's symbol list with every required symbol present: `selected` in its order,
+    /// then each required symbol not already listed (matched case-insensitively).
+    pub fn with_required_symbols(&self, selected: &[String]) -> Vec<String> {
+        let mut symbols = selected.to_vec();
+        for required in &self.required_symbols {
+            if !symbols.iter().any(|s| s.eq_ignore_ascii_case(required)) {
+                symbols.push(required.clone());
+            }
+        }
+        symbols
+    }
     /// Declares that positions are sized in fractional units rather than whole shares.
     pub fn fractional_units(mut self) -> Self {
         self.fractional_units = true;
@@ -551,6 +573,29 @@ mod tests {
         );
         supplied.insert("bogus".into(), serde_json::json!(1));
         assert!(manifest.resolve(&supplied).is_err());
+    }
+
+    #[test]
+    fn required_symbols_are_appended_once_and_only_when_missing() {
+        let manifest = Manifest::new("t", "T", "v1")
+            .run_defaults(&["universe:all_stocks"], "daily")
+            .required_symbols(&["IWM.US"]);
+        // The form listed only the expanded universe: the hedge symbol rides along at the end.
+        let universe = vec!["ACME.US".to_owned(), "ZENITH.US".to_owned()];
+        assert_eq!(
+            manifest.with_required_symbols(&universe),
+            vec!["ACME.US", "ZENITH.US", "IWM.US"]
+        );
+        // Already present (any case): nothing is duplicated and the order is kept.
+        let listed = vec!["iwm.us".to_owned(), "ACME.US".to_owned()];
+        assert_eq!(
+            manifest.with_required_symbols(&listed),
+            vec!["iwm.us", "ACME.US"]
+        );
+        // No declaration: the list passes through untouched.
+        let plain = Manifest::new("t", "T", "v1");
+        assert_eq!(plain.with_required_symbols(&universe), universe);
+        assert!(plain.required_symbols.is_empty());
     }
 
     #[test]
