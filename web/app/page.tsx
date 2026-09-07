@@ -715,8 +715,37 @@ function EquityChart({ rows }: { rows: ReportView["daily"] }) {
   );
 }
 
+/// A short universe label: the names when there are a few, otherwise a count.
+function describeSymbols(symbols: string[]): string {
+  if (symbols.length <= 6) return symbols.join(", ") || "no symbols";
+  return `${symbols.length.toLocaleString()} symbols`;
+}
+
+type ReportTab = "overview" | "trades" | "symbols";
+const TRADE_PAGE = 500;
+const SYMBOL_PAGE = 2000;
+
 function RunReport({ detail }: { detail: RunDetail }) {
   const report = detail.report;
+  // Sections live on tabs so a universe-sized run (thousands of trades, ten thousand
+  // symbols) opens on its summary instead of a page that scrolls for minutes.
+  const [tab, setTab] = useState<ReportTab>("overview");
+  const [tradeLimit, setTradeLimit] = useState(TRADE_PAGE);
+  const [symbolFilter, setSymbolFilter] = useState("");
+  useEffect(() => {
+    setTab("overview");
+    setTradeLimit(TRADE_PAGE);
+    setSymbolFilter("");
+  }, [detail.run.id]);
+  const coverageBySymbol = useMemo(
+    () => new Map((report?.coverage_by_symbol ?? []).map((b) => [b.key, b] as const)),
+    [report?.coverage_by_symbol],
+  );
+  const symbolRows = useMemo(() => {
+    const query = symbolFilter.trim().toUpperCase();
+    const all = report?.symbols ?? [];
+    return query ? all.filter((symbol) => symbol.toUpperCase().includes(query)) : all;
+  }, [report?.symbols, symbolFilter]);
   if (!report && (detail.run.status === "Failed" || detail.job_error))
     return <RunFailure detail={detail} />;
   if (!report)
@@ -740,8 +769,27 @@ function RunReport({ detail }: { detail: RunDetail }) {
       </section>
     );
   const m = report.metrics;
+  const tabs: [ReportTab, string][] = [
+    ["overview", "Overview"],
+    ["trades", `Trades · ${report.trades.length.toLocaleString()}`],
+    ["symbols", `Symbols · ${report.symbols.length.toLocaleString()}`],
+  ];
   return (
     <>
+      <nav className="report-tabs" aria-label="Report sections">
+        {tabs.map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            className={tab === id ? "active" : ""}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+      {tab === "overview" && (
+        <>
       <RunFailure detail={detail} />
       {report.coverage.percent < 99.5 && (
         <div className="coverage-warning">
@@ -953,6 +1001,10 @@ function RunReport({ detail }: { detail: RunDetail }) {
           ))}
         </section>
       )}
+        </>
+      )}
+      {tab === "trades" && (
+        <>
       <section className="panel trade-panel">
         <div className="panel-head">
           <div>
@@ -978,7 +1030,7 @@ function RunReport({ detail }: { detail: RunDetail }) {
               </tr>
             </thead>
             <tbody>
-              {report.trades.map((trade, index) => (
+              {report.trades.slice(0, tradeLimit).map((trade, index) => (
                   <tr key={`${trade.trade_date}-${trade.symbol}-${index}`}>
                     <td>{trade.trade_date} {trade.entry_time.slice(11, 16)}</td>
                     <td>{trade.exit_time.slice(0, 10)} {trade.exit_time.slice(11, 16)}</td>
@@ -1001,6 +1053,14 @@ function RunReport({ detail }: { detail: RunDetail }) {
             </tbody>
           </table>
         </div>
+        {report.trades.length > tradeLimit && (
+          <div className="table-more">
+            <span>Showing the first {tradeLimit.toLocaleString()} of {report.trades.length.toLocaleString()} trades.</span>
+            <button type="button" className="secondary-action" onClick={() => setTradeLimit(report.trades.length)}>
+              Show all
+            </button>
+          </div>
+        )}
       </section>
       {report.watchlist.length > 0 && (
         <section className="panel trade-panel">
@@ -1057,6 +1117,70 @@ function RunReport({ detail }: { detail: RunDetail }) {
               </tbody>
             </table>
           </div>
+        </section>
+      )}
+        </>
+      )}
+      {tab === "symbols" && (
+        <section className="panel trade-panel">
+          <div className="panel-head">
+            <div>
+              <p className="eyebrow">Universe</p>
+              <h2>Symbols in this run</h2>
+            </div>
+            <span className="market-date">
+              {symbolRows.length.toLocaleString()} OF {report.symbols.length.toLocaleString()}
+            </span>
+          </div>
+          <div className="symbol-filter">
+            <input
+              type="search"
+              placeholder="Filter symbols…"
+              value={symbolFilter}
+              onChange={(event) => setSymbolFilter(event.target.value)}
+            />
+            {coverageBySymbol.size > 0 && (
+              <small>Coverage counts the signal sessions each symbol had bars for.</small>
+            )}
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  {coverageBySymbol.size > 0 && (
+                    <>
+                      <th>Covered</th>
+                      <th>Sessions</th>
+                      <th>Coverage</th>
+                    </>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {symbolRows.slice(0, SYMBOL_PAGE).map((symbol) => {
+                  const cov = coverageBySymbol.get(symbol);
+                  return (
+                    <tr key={symbol}>
+                      <td>{symbol}</td>
+                      {coverageBySymbol.size > 0 && (
+                        <>
+                          <td>{cov ? cov.covered.toLocaleString() : "—"}</td>
+                          <td>{cov ? cov.total.toLocaleString() : "—"}</td>
+                          <td>{cov && cov.total > 0 ? `${number((100 * cov.covered) / cov.total, 1)}%` : "—"}</td>
+                        </>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {symbolRows.length > SYMBOL_PAGE && (
+            <div className="table-more">
+              <span>Showing the first {SYMBOL_PAGE.toLocaleString()} matches; narrow the filter to see the rest.</span>
+            </div>
+          )}
         </section>
       )}
     </>
@@ -4828,6 +4952,7 @@ export default function Home() {
       if (!response.ok) throw new Error(body.error);
       setRunDetail(body);
       setView("run");
+      window.scrollTo({ top: 0 });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not load run");
     } finally {
@@ -5888,7 +6013,7 @@ export default function Home() {
                   <h2>{runDetail.run.name}</h2>
                   <p>
                     {runDetail.report
-                      ? `${runDetail.report.start} through ${runDetail.report.end} · ${runDetail.report.symbols.join(", ")}`
+                      ? `${runDetail.report.start} through ${runDetail.report.end} · ${describeSymbols(runDetail.report.symbols)}`
                       : runDetail.run.artifact_dir}
                   </p>
                 </div>

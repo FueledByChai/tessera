@@ -4097,3 +4097,57 @@ nav {
 .catalog-toggle input { accent-color: var(--accent, #f89828); }
 tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 .catalog-status.archived { color: #8a8a8a; border-color: #555; }
+
+/* Run report tabs: summary first, the long tables behind their own tab. */
+.report-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  margin: 0 0 16px;
+}
+.report-tabs button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: 600 12px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 10px 14px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+.report-tabs button:hover {
+  color: var(--ink);
+  background: var(--panel-2);
+}
+.report-tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.table-more {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.symbol-filter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.symbol-filter input {
+  flex: 0 1 280px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+  padding: 8px 10px;
+  font: 500 13px var(--font-geist-mono);
+}
+.symbol-filter small {
+  color: var(--muted);
+}
