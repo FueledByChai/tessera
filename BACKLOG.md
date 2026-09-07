@@ -10,6 +10,26 @@ long-form acceptance criteria; this file is the executable queue. Protocol:
   whose `Blocked by` tickets are done. Never take two at once.
 - Anything discovered while working goes in as a new ticket, not into the current one.
 
+## Console UI
+
+### UI-01 Terminal theme: black panels, larger aligned form controls — `todo`
+The terminal theme (`web/app/globals.css`, the block "sampled from Bloomberg screens") paints
+every panel navy: `--panel #0f0f3a`, `--panel-2 #181850`, lines `#2a2a6a`/`#1c1c50`, plus
+literal navy on fieldsets, code, and the config template. Studies, Data, and the strategy page
+read as a blue console. A Bloomberg screen's ground is black; navy is a highlight for selected
+rows and a few data panels, not the panel colour. Move the theme to black panels (`#050505`,
+`#0b0b0b`) with the existing gray and amber lines, keep navy only for selection and hover
+highlights, and fix the form controls: inputs, selects, and textareas in one form row share a
+height and top edge, dropdowns match text fields, and the control font goes from the inherited
+~12 px to 18 px with labels 10 → 15 px (the table convention), without growing the controls.
+Applies to the studies form, the run form, the strategy page, and the data page.
+**Done when:** a stylesheet check (`web/scripts/theme-check.mjs`, run from the web step of
+`scripts/check.sh`) parses the terminal-theme rules and fails on any background or border colour
+with a blue hue outside the `.active`, `:hover`, and heat-map highlight selectors, and on any
+terminal-theme input/select/textarea font-size below 18 px; the browser-automation check on the
+studies form and the strategy run form reports every control in a row within 1 px of the same
+top and bottom edge (`getBoundingClientRect`); the README screenshot is refreshed.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar — `done 2026-09-06`
