@@ -2207,6 +2207,13 @@ fn build_sdk_run_config(
         .unwrap_or_else(|| vec![serde_json::json!("SPY.US")]);
     let symbols = expand_sdk_universe(state, &requested)?;
     anyhow::ensure!(!symbols.is_empty(), "select at least one symbol");
+    // The manifest's required symbols (a hedge ETF, say) join the plan even when the form
+    // listed only a universe; the runner repeats this for frozen configs run from the CLI.
+    let symbols = manifest
+        .with_required_symbols(&symbols)
+        .iter()
+        .map(|symbol| normalize_sdk_symbol(symbol))
+        .collect::<Result<Vec<_>>>()?;
     {
         let lake_symbols = symbols
             .iter()
@@ -3509,6 +3516,12 @@ async fn strategy_detail(
                 "Replays {} warm-up bars before the requested start so indicators are ready; orders during warm-up are ignored.",
                 manifest.warmup_bars
             ));
+            if !manifest.required_symbols.is_empty() {
+                rules.push(format!(
+                    "Every run also loads {}, whether or not the symbol list includes it.",
+                    manifest.required_symbols.join(", ")
+                ));
+            }
             sdk_manifest = Some(manifest);
             (rules, defaults)
         }

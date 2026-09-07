@@ -153,6 +153,12 @@ returns whether to load intraday bars for the next session. `src/strategies/user
 is the bundled example (price and dollar-volume screen, intraday RSI, flat by the close); a month
 across all US stocks on 5-minute bars runs in about 20 seconds.
 
+**Required symbols.** A strategy that needs an instrument the run form may not list (the
+hedge ETF of a universe strategy) declares `.required_symbols(&["IWM.US"])`. The runner appends
+those symbols to every run after universe expansion, whether the run comes from the form or a
+frozen config, and skips ones already listed. Use the full `SYMBOL.US` form. `.run_defaults(...)`
+only pre-fills the form; a required symbol survives the user editing the list.
+
 **Memory budget.** Standard-mode runs hold every selected symbol's bars for the window. Before
 reading any file the runner estimates the bar count from file sizes and date spans and refuses runs
 above half of physical memory (override with `TESSERA_MEMORY_BUDGET_GB`), naming the estimate and
