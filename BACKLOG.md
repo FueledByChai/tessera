@@ -12,7 +12,7 @@ long-form acceptance criteria; this file is the executable queue. Protocol:
 
 ## Console UI
 
-### UI-01 Terminal theme: black panels, larger aligned form controls — `todo`
+### UI-01 Terminal theme: black panels, larger aligned form controls — `done 2026-09-07 UI-01: terminal theme black panels, 42/18/15 px form controls`
 The terminal theme (`web/app/globals.css`, the block "sampled from Bloomberg screens") paints
 every panel navy: `--panel #0f0f3a`, `--panel-2 #181850`, lines `#2a2a6a`/`#1c1c50`, plus
 literal navy on fieldsets, code, and the config template. Studies, Data, and the strategy page
@@ -29,6 +29,12 @@ with a blue hue outside the `.active`, `:hover`, and heat-map highlight selector
 terminal-theme input/select/textarea font-size below 18 px; the browser-automation check on the
 studies form and the strategy run form reports every control in a row within 1 px of the same
 top and bottom edge (`getBoundingClientRect`); the README screenshot is refreshed.
+
+### UI-02 Modern mode form controls match the terminal sizes — `todo`
+UI-01 sized and aligned form controls only under the terminal theme; modern mode still renders
+the base 10-14 px controls with the 40/42 px height mismatch between text and date fields.
+**Done when:** the browser alignment measurement from UI-01 passes with modern mode selected and
+`theme-check.mjs` gains a modern-mode font-size rule.
 
 ## Feature workbench (Studies page)
 

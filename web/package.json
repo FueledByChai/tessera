@@ -11,7 +11,8 @@
     "build": "tsc --noEmit -p tsconfig.json || true && vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "preview": "vite preview",
-    "lint": "eslint app src --ignore-pattern dist"
+    "lint": "eslint app src --ignore-pattern dist",
+    "theme-check": "node scripts/theme-check.mjs"
   },
   "dependencies": {
     "react": "19.2.6",

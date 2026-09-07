@@ -58,6 +58,9 @@ refresh the baseline with `scripts/check.sh --refresh-baseline` and say why in t
 ## UI conventions
 
 - Terminal look: black panels, amber accent, dense monospace tables, 18/15 px table fonts.
+  Navy only as a hover or selection highlight. Form controls are 42 px boxes with 18 px text and
+  15 px labels, bottom-anchored so a row's controls share edges. `web/scripts/theme-check.mjs`
+  (run by `scripts/check.sh`) fails on blue backgrounds or borders and on smaller control fonts.
 - Long tables go behind tabs or caps with a "show all"; a page must open at the top.
 - Relative API origin (`import.meta.env.VITE_API_ORIGIN ?? ""`); dev server on 5173 proxies `/api`.
 

@@ -313,7 +313,7 @@ a { color: inherit; text-decoration: inherit; }
 }
 .app-shell[data-theme="terminal"] .equity-chart,
 .app-shell[data-theme="terminal"] .comparison-chart {
-  background: linear-gradient(to bottom, rgba(31, 156, 255, 0.08), transparent 72%);
+  background: #050505;
 }
 .app-shell[data-theme="terminal"] .heat-positive {
   color: #001a09;
@@ -3231,7 +3231,7 @@ nav {
 }
 .app-shell[data-theme="terminal"] .equity-chart,
 .app-shell[data-theme="terminal"] .comparison-chart {
-  background: linear-gradient(to bottom, rgba(31, 156, 255, 0.08), transparent 72%);
+  background: #050505;
 }
 .app-shell[data-theme="terminal"] .heat-positive {
   color: #001a09;
@@ -3526,9 +3526,6 @@ nav {
   background: transparent;
   outline: none;
 }
-.app-shell[data-theme="terminal"] .field-grid label {
-  font-size: 10px;
-}
 /* Grids: 18px mono rows, 15px gray column headers (scaled up 50% for readability). */
 .app-shell[data-theme="terminal"] .table-wrap table,
 .app-shell[data-theme="terminal"] .activity-panel table {
@@ -3599,16 +3596,18 @@ nav {
 }
 
 /* ------------------------------------------------------------------ */
-/* Terminal palette sampled from Bloomberg screens (WEI, DES, HP, GP,  */
-/* BTMM, ECO, OVME): black ground, navy data panels, amber labels,     */
-/* white values, dark-red section bars, gray column bars, amber fields.*/
+/* Terminal palette after Bloomberg screens (WEI, DES, HP, GP, BTMM,   */
+/* ECO, OVME): black ground and black panels, amber labels, white      */
+/* values, dark-red section bars, gray column bars, amber fields. Navy */
+/* is a highlight only (hover, selection); web/scripts/theme-check.mjs */
+/* enforces that and the 18/15 px form-control sizes.                  */
 /* ------------------------------------------------------------------ */
 .app-shell[data-theme="terminal"] {
   --bg: #000000;
-  --panel: #0f0f3a;
-  --panel-2: #181850;
-  --line: #2a2a6a;
-  --line-soft: #1c1c50;
+  --panel: #050505;
+  --panel-2: #0b0b0b;
+  --line: #414141;
+  --line-soft: #262626;
   --ink: #f0f0f0;
   --muted: #b4b4b4;
   --accent: #f89828;
@@ -3898,21 +3897,21 @@ nav {
   background: var(--accent);
   color: #000;
 }
-/* Charts: navy plot, white line over a deep-blue fill, navy gridlines, white axis text. */
+/* Charts: black plot, white line over a deep-blue fill, gray gridlines, white axis text. */
 .app-shell[data-theme="terminal"] .equity-chart,
 .app-shell[data-theme="terminal"] .comparison-chart {
-  background: linear-gradient(to bottom, #0a0a34, #000030);
+  background: #000;
 }
 .app-shell[data-theme="terminal"] .chart-area {
   fill: #123c8a;
-  opacity: 0.55;
+  opacity: 0.28;
 }
 .app-shell[data-theme="terminal"] .chart-line {
   stroke: #ffffff;
   stroke-width: 1.2;
 }
 .app-shell[data-theme="terminal"] .chart-grid {
-  stroke: #2a2a6a;
+  stroke: #333;
   stroke-dasharray: none;
 }
 .app-shell[data-theme="terminal"] .chart-axis,
@@ -3923,11 +3922,11 @@ nav {
   stroke: var(--accent);
 }
 .app-shell[data-theme="terminal"] .chart-point {
-  fill: #000030;
+  fill: #000;
   stroke: #fff;
 }
 .app-shell[data-theme="terminal"] .chart-readout {
-  border-bottom: 1px solid #2a2a6a;
+  border-bottom: 1px solid #333;
   background: #000;
   color: #f0f0f0;
 }
@@ -3983,6 +3982,10 @@ nav {
   line-height: 1.4;
 }
 /* The code editor stays a dark editing surface even though inputs are amber fields. */
+.app-shell[data-theme="terminal"] .rust-editor,
+.app-shell[data-theme="terminal"] .line-numbers {
+  background: #050505;
+}
 .app-shell[data-theme="terminal"] .rust-editor textarea,
 .app-shell[data-theme="terminal"] .rust-editor textarea:focus {
   border-color: var(--line);
@@ -3990,7 +3993,78 @@ nav {
   color: #f0f0f0;
   caret-color: var(--accent);
   font-weight: 500;
+  font-size: 13px;
   outline: none;
+}
+.app-shell[data-theme="terminal"] .catalog-status.research {
+  border-color: #555;
+}
+/* Form controls (UI-01): every text field, date, number, and dropdown in a form grid is one
+   42px box with 18px text and a 15px label, the grid font sizes. The grid stretches the labels
+   in a row to one height and each label packs its rows to the bottom with the control last
+   (caption, hint, control), so controls share their top and bottom edges however long a
+   caption wraps. */
+.app-shell[data-theme="terminal"] .field-grid label,
+.app-shell[data-theme="terminal"] .sweep-form-grid label,
+.app-shell[data-theme="terminal"] .run-setup label,
+.app-shell[data-theme="terminal"] .new-draft-form label,
+.app-shell[data-theme="terminal"] .portfolio-fields > label,
+.app-shell[data-theme="terminal"] .allocation-panel > label {
+  gap: 6px;
+  align-content: end;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+.app-shell[data-theme="terminal"] .instrument-label {
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+.app-shell[data-theme="terminal"] .field-grid label > span,
+.app-shell[data-theme="terminal"] .field-grid label > small,
+.app-shell[data-theme="terminal"] .sweep-form-grid label > small,
+.app-shell[data-theme="terminal"] .instrument-label small,
+.app-shell[data-theme="terminal"] .run-submit p,
+.app-shell[data-theme="terminal"] .form-footnote {
+  font-size: 12px;
+  letter-spacing: 0;
+}
+.app-shell[data-theme="terminal"] .field-grid input:not([type="checkbox"]):not([type="radio"]),
+.app-shell[data-theme="terminal"] .field-grid select,
+.app-shell[data-theme="terminal"] .sweep-form-grid input,
+.app-shell[data-theme="terminal"] .sweep-form-grid select,
+.app-shell[data-theme="terminal"] .run-setup input,
+.app-shell[data-theme="terminal"] .run-setup select,
+.app-shell[data-theme="terminal"] .new-draft-form input,
+.app-shell[data-theme="terminal"] .new-draft-form select,
+.app-shell[data-theme="terminal"] .release-form input,
+.app-shell[data-theme="terminal"] .portfolio-fields input,
+.app-shell[data-theme="terminal"] .capital-mode input,
+.app-shell[data-theme="terminal"] .allocation-panel input,
+.app-shell[data-theme="terminal"] .instrument-search {
+  box-sizing: border-box;
+  order: 2;
+  height: 42px;
+  padding: 0 10px;
+  line-height: 40px;
+  font-size: 18px;
+}
+.app-shell[data-theme="terminal"] .instrument-search {
+  display: flex;
+  align-items: center;
+}
+.app-shell[data-theme="terminal"] .instrument-search input,
+.app-shell[data-theme="terminal"] .catalog-search input,
+.app-shell[data-theme="terminal"] .preset-save input,
+.app-shell[data-theme="terminal"] .catalog-select select,
+.app-shell[data-theme="terminal"] .terminal-panel-title select {
+  font-size: 15px;
+}
+.app-shell[data-theme="terminal"] .expression-box textarea,
+.app-shell[data-theme="terminal"] .new-draft-form textarea,
+.app-shell[data-theme="terminal"] .release-form textarea {
+  padding: 8px 10px;
+  line-height: 1.35;
+  font-size: 18px;
 }
 .app-shell[data-theme="terminal"] .rust-editor textarea::placeholder {
   color: var(--muted);
@@ -4029,8 +4103,8 @@ nav {
 }
 .job-progress-track {
   height: 8px;
-  background: #1c1c4a;
-  border: 1px solid #2a2a66;
+  background: #1a1a1a;
+  border: 1px solid var(--line, #414141);
   overflow: hidden;
 }
 .job-progress-track i {
@@ -4064,10 +4138,10 @@ nav {
 /* Studies workspace */
 .studies-workspace { display: flex; flex-direction: column; gap: 14px; }
 .study-pick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
-.study-pick-grid fieldset { border: 1px solid #2a2a66; padding: 10px 12px; margin: 0; }
-.study-pick-grid legend { color: var(--accent, #f89828); font-size: 12px; letter-spacing: 0.08em; }
-.check-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; }
-.check-row small { color: var(--text-muted, #b8b8b8); margin-left: auto; font-size: 11px; }
+.study-pick-grid fieldset { border: 1px solid var(--line, #414141); padding: 10px 12px; margin: 0; }
+.study-pick-grid legend { color: var(--accent, #f89828); font-size: 15px; letter-spacing: 0.08em; }
+.check-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 15px; }
+.check-row small { color: var(--text-muted, #b8b8b8); margin-left: auto; font-size: 12px; }
 .sweep-heatmap td small { display: block; font-size: 11px; opacity: 0.8; }
 .sweep-heatmap td.positive { color: #32c832; }
 .sweep-heatmap td.negative { color: #e03040; }
@@ -4092,11 +4166,11 @@ nav {
 .source-missing td { color: #e03040; }
 .source-facts { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .source-facts strong { color: var(--accent, #f89828); margin-right: 6px; }
-.source-facts code, .source-config-grid code { background: #14143f; padding: 1px 5px; }
+.source-facts code, .source-config-grid code { background: #1a1a1a; padding: 1px 5px; }
 .source-config-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; font-size: 13px; line-height: 1.5; }
 .source-config-grid h3 { color: var(--accent, #f89828); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; margin: 10px 0 4px; }
 .source-config-grid ol { padding-left: 20px; }
-.source-template { background: #0a0a2a; border: 1px solid #2a2a66; padding: 12px; font-size: 12px; line-height: 1.45; overflow-x: auto; white-space: pre; }
+.source-template { background: #050505; border: 1px solid var(--line, #414141); padding: 12px; font-size: 12px; line-height: 1.45; overflow-x: auto; white-space: pre; }
 @media (max-width: 1100px) { .source-config-grid { grid-template-columns: 1fr; } }
 
 /* Archived (pre-SDK) catalog rows */
