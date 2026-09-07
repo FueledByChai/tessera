@@ -3999,73 +3999,6 @@ nav {
 .app-shell[data-theme="terminal"] .catalog-status.research {
   border-color: #555;
 }
-/* Form controls (UI-01): every text field, date, number, and dropdown in a form grid is one
-   42px box with 18px text and a 15px label, the grid font sizes. The grid stretches the labels
-   in a row to one height and each label packs its rows to the bottom with the control last
-   (caption, hint, control), so controls share their top and bottom edges however long a
-   caption wraps. */
-.app-shell[data-theme="terminal"] .field-grid label,
-.app-shell[data-theme="terminal"] .sweep-form-grid label,
-.app-shell[data-theme="terminal"] .run-setup label,
-.app-shell[data-theme="terminal"] .new-draft-form label,
-.app-shell[data-theme="terminal"] .portfolio-fields > label,
-.app-shell[data-theme="terminal"] .allocation-panel > label {
-  gap: 6px;
-  align-content: end;
-  font-size: 15px;
-  letter-spacing: 0.04em;
-}
-.app-shell[data-theme="terminal"] .instrument-label {
-  font-size: 15px;
-  letter-spacing: 0.04em;
-}
-.app-shell[data-theme="terminal"] .field-grid label > span,
-.app-shell[data-theme="terminal"] .field-grid label > small,
-.app-shell[data-theme="terminal"] .sweep-form-grid label > small,
-.app-shell[data-theme="terminal"] .instrument-label small,
-.app-shell[data-theme="terminal"] .run-submit p,
-.app-shell[data-theme="terminal"] .form-footnote {
-  font-size: 12px;
-  letter-spacing: 0;
-}
-.app-shell[data-theme="terminal"] .field-grid input:not([type="checkbox"]):not([type="radio"]),
-.app-shell[data-theme="terminal"] .field-grid select,
-.app-shell[data-theme="terminal"] .sweep-form-grid input,
-.app-shell[data-theme="terminal"] .sweep-form-grid select,
-.app-shell[data-theme="terminal"] .run-setup input,
-.app-shell[data-theme="terminal"] .run-setup select,
-.app-shell[data-theme="terminal"] .new-draft-form input,
-.app-shell[data-theme="terminal"] .new-draft-form select,
-.app-shell[data-theme="terminal"] .release-form input,
-.app-shell[data-theme="terminal"] .portfolio-fields input,
-.app-shell[data-theme="terminal"] .capital-mode input,
-.app-shell[data-theme="terminal"] .allocation-panel input,
-.app-shell[data-theme="terminal"] .instrument-search {
-  box-sizing: border-box;
-  order: 2;
-  height: 42px;
-  padding: 0 10px;
-  line-height: 40px;
-  font-size: 18px;
-}
-.app-shell[data-theme="terminal"] .instrument-search {
-  display: flex;
-  align-items: center;
-}
-.app-shell[data-theme="terminal"] .instrument-search input,
-.app-shell[data-theme="terminal"] .catalog-search input,
-.app-shell[data-theme="terminal"] .preset-save input,
-.app-shell[data-theme="terminal"] .catalog-select select,
-.app-shell[data-theme="terminal"] .terminal-panel-title select {
-  font-size: 15px;
-}
-.app-shell[data-theme="terminal"] .expression-box textarea,
-.app-shell[data-theme="terminal"] .new-draft-form textarea,
-.app-shell[data-theme="terminal"] .release-form textarea {
-  padding: 8px 10px;
-  line-height: 1.35;
-  font-size: 18px;
-}
 .app-shell[data-theme="terminal"] .rust-editor textarea::placeholder {
   color: var(--muted);
 }
@@ -4251,4 +4184,72 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 .expression-box small {
   color: var(--muted);
   line-height: 1.5;
+}
+
+/* Form control sizing, both display modes (UI-01, UI-02): every text field, date, number, and
+   dropdown in a form grid is one 42px box with 18px text and a 15px label, the grid font sizes.
+   The grid stretches the labels in a row to one height and each label packs its rows to the
+   bottom with the control last (caption, hint, control), so controls share their top and bottom
+   edges however long a caption wraps. Kept last in the file: web/scripts/theme-check.mjs treats
+   the last rule that sizes a control as the effective one. */
+.app-shell .field-grid label,
+.app-shell .sweep-form-grid label,
+.app-shell .run-setup label,
+.app-shell .new-draft-form label,
+.app-shell .portfolio-fields > label,
+.app-shell .allocation-panel > label {
+  gap: 6px;
+  align-content: end;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+.app-shell .instrument-label {
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+.app-shell .field-grid label > span,
+.app-shell .field-grid label > small,
+.app-shell .sweep-form-grid label > small,
+.app-shell .instrument-label small,
+.app-shell .run-submit p,
+.app-shell .form-footnote {
+  font-size: 12px;
+  letter-spacing: 0;
+}
+.app-shell .field-grid input:not([type="checkbox"]):not([type="radio"]),
+.app-shell .field-grid select,
+.app-shell .sweep-form-grid input,
+.app-shell .sweep-form-grid select,
+.app-shell .run-setup input,
+.app-shell .run-setup select,
+.app-shell .new-draft-form input,
+.app-shell .new-draft-form select,
+.app-shell .release-form input,
+.app-shell .portfolio-fields input,
+.app-shell .allocation-panel input,
+.app-shell .instrument-search {
+  box-sizing: border-box;
+  order: 2;
+  height: 42px;
+  padding: 0 10px;
+  line-height: 40px;
+  font-size: 18px;
+}
+.app-shell .instrument-search {
+  display: flex;
+  align-items: center;
+}
+.app-shell .instrument-search input,
+.app-shell .catalog-search input,
+.app-shell .preset-save input,
+.app-shell .catalog-select select,
+.app-shell .terminal-panel-title select {
+  font-size: 15px;
+}
+.app-shell .expression-box textarea,
+.app-shell .new-draft-form textarea,
+.app-shell .release-form textarea {
+  padding: 8px 10px;
+  line-height: 1.35;
+  font-size: 18px;
 }

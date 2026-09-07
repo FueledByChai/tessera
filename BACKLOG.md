@@ -30,7 +30,7 @@ terminal-theme input/select/textarea font-size below 18 px; the browser-automati
 studies form and the strategy run form reports every control in a row within 1 px of the same
 top and bottom edge (`getBoundingClientRect`); the README screenshot is refreshed.
 
-### UI-02 Modern mode form controls match the terminal sizes — `todo`
+### UI-02 Modern mode form controls match the terminal sizes — `done 2026-09-07 UI-02: form control sizing shared by both display modes`
 UI-01 sized and aligned form controls only under the terminal theme; modern mode still renders
 the base 10-14 px controls with the 40/42 px height mismatch between text and date fields.
 **Done when:** the browser alignment measurement from UI-01 passes with modern mode selected and

@@ -4,7 +4,9 @@
 //      rule is a selection or hover highlight (.active, .selected, :hover, heat-map cells);
 //   2. a terminal-mode form control (input, select, textarea) rule sets a font-size below
 //      18px in the form grids (15px for compact toolbar controls), or a label below 15px;
-//   3. no terminal-mode rule sets the form-control size at all (the rule must exist).
+//   3. outside the terminal scope (so in modern mode, and as the base the terminal inherits)
+//      the last rule in source order that sizes a form control, compact control, or label
+//      falls below those same minimums, or no such rule exists.
 // Colours are checked in the rules scoped to [data-theme="terminal"] (with the terminal's own
 // CSS variables resolved) and in unscoped rules, which apply in terminal mode too. The modern
 // theme's token block on bare `.app-shell` and the body/html ground are its own palette.
@@ -170,8 +172,6 @@ const px = (value) => {
 const controlSelector = /(^|[\s>+~])(input|select|textarea)(?![\w-])/;
 const compactControl = /\.terminal-panel-title|\.catalog-select|\.catalog-segment|\.instrument-search|\.catalog-search|\.check-row|\.toggle-label|\.preset-save/;
 const editor = /\.rust-editor/;
-let sizedControls = 0;
-let sizedLabels = 0;
 for (const rule of rules) {
   if (!isTerminal(rule.selector)) continue;
   for (const d of rule.declarations) {
@@ -185,19 +185,40 @@ for (const rule of rules) {
         const minimum = compactControl.test(sel) ? 15 : 18;
         if (size < minimum) {
           failures.push(`form control font ${size}px < ${minimum}px at line ${rule.line}: ${sel}`);
-        } else if (minimum === 18) {
-          sizedControls += 1;
         }
       } else if (/label(?![\w-])\s*$/.test(sel) && !/\.check-row|\.toggle-label|\.comparison-picker|\.source-picker/.test(sel)) {
         // The label itself; hints inside it (label > small, label > span) are not captions.
         if (size < 15) failures.push(`form label font ${size}px < 15px at line ${rule.line}: ${sel}`);
-        else sizedLabels += 1;
       }
     }
   }
 }
-if (sizedControls === 0) failures.push("no terminal-mode rule sets form controls to 18px");
-if (sizedLabels === 0) failures.push("no terminal-mode rule sets form labels to 15px");
+
+// Both modes (UI-02): outside the terminal scope, the last rule in source order that sizes a
+// form control, a compact control, or a label is taken as the effective one and must meet the
+// same minimums. The theme-neutral sizing block therefore stays at the end of the stylesheet.
+const lastNeutral = { control: null, compact: null, label: null };
+for (const rule of rules) {
+  if (isTerminal(rule.selector) || isOtherTheme(rule.selector)) continue;
+  for (const d of rule.declarations) {
+    const size = d.property === "font-size" || d.property === "font" ? px(d.value) : null;
+    if (size == null) continue;
+    for (const sel of rule.selector.split(",").map((s) => s.trim())) {
+      if (controlSelector.test(sel) && !editor.test(sel)) {
+        lastNeutral[compactControl.test(sel) ? "compact" : "control"] = { size, line: rule.line, sel };
+      } else if (/label(?![\w-])\s*$/.test(sel) && !/\.check-row|\.toggle-label|\.comparison-picker|\.source-picker/.test(sel)) {
+        lastNeutral.label = { size, line: rule.line, sel };
+      }
+    }
+  }
+}
+for (const [kind, minimum] of [["control", 18], ["compact", 15], ["label", 15]]) {
+  const last = lastNeutral[kind];
+  if (!last) failures.push(`modern mode: no theme-neutral rule sizes form ${kind}s`);
+  else if (last.size < minimum) {
+    failures.push(`modern mode: last ${kind} size ${last.size}px < ${minimum}px at line ${last.line}: ${last.sel}`);
+  }
+}
 
 if (listAll) {
   for (const line of examined) console.log(line);
@@ -208,5 +229,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `theme-check: ok (${examined.length} colours examined, ${sizedControls} control and ${sizedLabels} label size rules)`,
+  `theme-check: ok (${examined.length} colours examined; effective sizes control ${lastNeutral.control?.size}px, compact ${lastNeutral.compact?.size}px, label ${lastNeutral.label?.size}px)`,
 );
