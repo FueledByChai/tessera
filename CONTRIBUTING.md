@@ -34,3 +34,11 @@ configuration, the date range, and the engine output. Runs against the bundled
 ## License
 
 Contributions are accepted under the repository's AGPL-3.0 license.
+
+## One command for "done"
+
+`scripts/check.sh` runs formatting, tests, the release build, a byte-for-byte parity check of the
+bundled examples against `examples/expected/`, and the web typecheck, lint, and build. Run it
+before opening a pull request. If your change intentionally alters engine results, run
+`scripts/check.sh --refresh-baseline` and explain the difference in the commit message.
+`docs/LOOP.md` describes how the ticket queue in `BACKLOG.md` and this script work together.
