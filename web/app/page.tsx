@@ -1478,6 +1478,10 @@ type StudyCell = {
   sharpe?: number | null;
   turnover?: number | null;
   breakeven_bps?: number | null;
+  // The same for the curve rebalanced every horizon (absent on older studies).
+  rebalanced_sharpe?: number | null;
+  rebalanced_turnover?: number | null;
+  rebalanced_breakeven_bps?: number | null;
   curves?: StudyCurve[];
   buckets: { bucket: number; count: number; feature_mean: number; forward_bps: number }[];
   // Cross-sectional cells carry the per-date IC statistics.
@@ -1495,6 +1499,8 @@ type StudyCell = {
 };
 type StudyCurve = {
   variant: string;
+  // Bars between positions: 1 per bar, the horizon for the `_rebalanced` variants.
+  rebalance_bars?: number;
   mean_bps: number | null;
   sharpe: number | null;
   turnover: number | null;
@@ -1592,9 +1598,12 @@ function StudyCurveChart({ cell, variant, unit }: { cell: StudyCell; variant: st
   return (
     <div className="equity-chart study-curve">
       <div className="chart-readout">
-        <strong>{curve.variant === "sign" ? "position = sign(z)" : curve.variant === "long_short" ? "long top decile, short bottom decile, rebalanced each date" : "position = clip(z, ±3)"}</strong>
+        <strong>
+          {curve.variant.startsWith("sign") ? "position = sign(z)" : curve.variant === "long_short" ? "long top decile, short bottom decile, rebalanced each date" : "position = clip(z, ±3)"}
+          {curve.variant.endsWith("_rebalanced") ? `, taken every ${curve.rebalance_bars ?? cell.horizon_bars} bars (no overlapping holds)` : curve.variant === "long_short" ? "" : ", taken every bar"}
+        </strong>
         <span>Sharpe {formatNumber(finite(curve.sharpe), 2)}</span>
-        <span>turnover {formatNumber(finite(curve.turnover), 3)}/bar</span>
+        <span>turnover {formatNumber(finite(curve.turnover), 3)}/{curve.variant.endsWith("_rebalanced") ? "hold" : "bar"}</span>
         <span className={classFor(finite(curve.breakeven_bps) ?? undefined)}>breakeven {signed(curve.breakeven_bps, 4)} {unit}</span>
         <span className={classFor(finite(curve.final_bps) ?? undefined)}>total {signed(curve.final_bps, 1)} {unit}</span>
       </div>
@@ -2071,8 +2080,10 @@ function StudiesWorkspace() {
               <div className="terminal-panel-title">
                 <span>CRV</span> COSTLESS CURVE{bucketCell ? ` · ${bucketCell.feature} · ${horizonLabel(bucketCell.horizon_bars)}` : ""}
                 <select value={curveVariant} onChange={(e) => setCurveVariant(e.target.value)}>
-                  <option value="zscore">position: clipped z-score</option>
-                  <option value="sign">position: sign</option>
+                  <option value="zscore">position: clipped z-score, every bar</option>
+                  <option value="sign">position: sign, every bar</option>
+                  <option value="zscore_rebalanced">position: clipped z-score, rebalanced every horizon</option>
+                  <option value="sign_rebalanced">position: sign, rebalanced every horizon</option>
                 </select>
                 {bucketCell && (acceptedInLibrary(bucketCell.feature) ? (
                   <em className="accepted-tag">accepted</em>
@@ -2087,13 +2098,13 @@ function StudiesWorkspace() {
                 ))}
               </div>
               {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
-              <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L."}</p>
+              <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature, paid the forward return over the horizon, zero costs; breakeven is the cost per unit traded that would zero the mean P&L. The every-bar curves pay each bar a full horizon return against that bar's sliver of turnover, which flatters a slow feature; the rebalanced curves take a position only every horizon, so no holds overlap and the breakeven is what that execution would have to beat."}</p>
               {bucketCell?.diagnostics && <StudyDiagnostics cell={bucketCell} />}
               <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
               {ranked.length ? (
                 <>
                   <div className="table-wrap"><table className="ranked-cells">
-                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven ({unit})</th><th>Sign breakeven</th></tr></thead>
+                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven ({unit})</th><th>Sign breakeven</th><th>Rebalanced Sharpe</th><th>Rebalanced breakeven</th></tr></thead>
                     <tbody>{(showAllRanked ? ranked : ranked.slice(0, RANK_CAP)).map((c) => (
                       <tr
                         key={`${c.feature}-${c.horizon_bars}`}
@@ -2107,6 +2118,8 @@ function StudiesWorkspace() {
                         <td>{formatNumber(finite(c.turnover), 3)}</td>
                         <td className={classFor(finite(c.breakeven_bps) ?? undefined)}>{signed(c.breakeven_bps, 4)}</td>
                         <td className={classFor(finite(c.curves?.[1]?.breakeven_bps) ?? undefined)}>{signed(c.curves?.[1]?.breakeven_bps, 4)}</td>
+                        <td className={classFor(finite(c.rebalanced_sharpe) ?? undefined)}>{signed(c.rebalanced_sharpe, 2)}</td>
+                        <td className={classFor(finite(c.rebalanced_breakeven_bps) ?? undefined)}>{signed(c.rebalanced_breakeven_bps, 4)}</td>
                       </tr>
                     ))}</tbody>
                   </table></div>

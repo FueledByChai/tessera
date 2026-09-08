@@ -133,7 +133,7 @@ the terminal style (see `EquityChart`).
 **Done when:** each chart renders from a fixture result in the browser without console errors and
 the study page opens at the top with the results grid first.
 
-### WB-11 Non-overlapping costless curve for slow features — `todo` — Blocked by WB-02
+### WB-11 Non-overlapping costless curve for slow features — `done 2026-09-08 WB-11: costless curve rebalanced every horizon` — Blocked by WB-02
 The WB-02 curve pays every bar the forward return of an `h`-bar hold, so a feature whose position
 barely changes (spread_bps: turnover 0.002/bar on the SOL day) reports a breakeven of tens of bps
 that no non-overlapping execution would earn. Add a variant that rebalances every `h` bars (or

@@ -548,9 +548,14 @@ pub struct StudyCell {
     pub turnover: f64,
     /// Cost per unit traded, in bps, at which the `zscore` curve's mean P&L is zero.
     pub breakeven_bps: f64,
+    /// The same three figures for the `zscore_rebalanced` curve, which takes a position only
+    /// every horizon (NaN on cross-sectional cells, which rebalance every date already).
+    pub rebalanced_sharpe: f64,
+    pub rebalanced_turnover: f64,
+    pub rebalanced_breakeven_bps: f64,
     pub buckets: Vec<BucketRow>,
-    /// Costless curves: `zscore` first, then `sign`; a single `long_short` curve on a
-    /// cross-sectional cell.
+    /// Costless curves: `zscore`, `sign`, `zscore_rebalanced`, `sign_rebalanced`; a single
+    /// `long_short` curve on a cross-sectional cell.
     pub curves: Vec<CostlessCurve>,
     /// Present on cross-sectional cells: the per-date IC statistics.
     pub cross_section: Option<CrossSection>,
@@ -877,13 +882,18 @@ pub struct CrossSection {
     pub symbols_per_date: f64,
 }
 
-/// One costless trading rule on a cell: a position taken from the feature at every bar, paid
-/// the forward return over the horizon, with no costs. Overlapping holds are averaged, so the
-/// P&L per bar is that of one tranche held for the horizon.
+/// One costless trading rule on a cell: a position taken from the feature, paid the forward
+/// return over the horizon, with no costs. The per-bar variants (`rebalance_bars` 1) take a
+/// position at every bar, so overlapping holds are averaged and the P&L per bar is that of one
+/// tranche held for the horizon; the `_rebalanced` variants take one only every horizon, so no
+/// two holds overlap and the turnover is what that execution would actually trade.
 #[derive(Debug, Clone, Serialize)]
 pub struct CostlessCurve {
-    /// `zscore`: the feature's z-score clipped to +-3; `sign`: the sign of that z-score.
+    /// `zscore`: the feature's z-score clipped to +-3; `sign`: the sign of that z-score;
+    /// `zscore_rebalanced` and `sign_rebalanced`: the same positions taken every horizon.
     pub variant: String,
+    /// Bars between positions: 1 for the per-bar curves, the horizon for the rebalanced ones.
+    pub rebalance_bars: usize,
     /// Mean P&L per bar, basis points per unit of position.
     pub mean_bps: f64,
     /// Sharpe of the per-bar P&L annualized as one independent period per horizon.
@@ -941,41 +951,56 @@ fn curve_points(cumulative: &[f64]) -> Vec<CurvePoint> {
     }
 }
 
-/// The costless curve for one variant over aligned (feature, forward return in bps) pairs.
+/// The per-bar costless curve for one variant over aligned (feature, forward return in bps)
+/// pairs: a position at every bar.
 pub fn costless_curve(
     variant: &str,
     xs: &[f64],
     ys: &[f64],
     periods_per_year: f64,
 ) -> CostlessCurve {
-    let n = xs.len();
-    let positions: Vec<f64> = if n < 2 {
-        vec![0.0; n]
-    } else {
-        let mean = xs.iter().sum::<f64>() / n as f64;
-        let sd = (xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
-        xs.iter()
-            .map(|x| {
-                if sd <= 0.0 {
-                    return 0.0;
-                }
-                let z = (x - mean) / sd;
-                match variant {
-                    "sign" => {
-                        if z > 0.0 {
-                            1.0
-                        } else if z < 0.0 {
-                            -1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    _ => z.clamp(-Z_CLIP, Z_CLIP),
-                }
-            })
-            .collect()
-    };
-    let pnl: Vec<f64> = positions.iter().zip(ys).map(|(p, y)| p * y).collect();
+    curve_core(variant, variant, xs, ys, 1, periods_per_year)
+}
+
+/// The rebalanced costless curve: the position is taken at bars 0, `every`, 2·`every`, … and
+/// each is paid its own forward return, so with `every` equal to the horizon no two holds
+/// overlap. Turnover is the mean absolute position change between rebalances, so the breakeven
+/// is the cost per unit traded that this execution would have to beat. `every` 1 is the
+/// per-bar curve under the `_rebalanced` name.
+pub fn costless_curve_every(
+    variant: &str,
+    xs: &[f64],
+    ys: &[f64],
+    every: usize,
+    periods_per_year: f64,
+) -> CostlessCurve {
+    curve_core(
+        variant,
+        &format!("{variant}_rebalanced"),
+        xs,
+        ys,
+        every.max(1),
+        periods_per_year,
+    )
+}
+
+fn curve_core(
+    variant: &str,
+    name: &str,
+    xs: &[f64],
+    ys: &[f64],
+    every: usize,
+    periods_per_year: f64,
+) -> CostlessCurve {
+    let positions = positions(variant, xs);
+    let sampled: Vec<usize> = (0..xs.len()).step_by(every).collect();
+    let positions: Vec<f64> = sampled.iter().map(|&i| positions[i]).collect();
+    let n = positions.len();
+    let pnl: Vec<f64> = sampled
+        .iter()
+        .zip(&positions)
+        .map(|(&i, p)| p * ys[i])
+        .collect();
     let (mean_bps, se) = mean_and_se(&pnl);
     let sd = se * (n as f64).sqrt();
     let sharpe = if sd > 0.0 {
@@ -1003,15 +1028,51 @@ pub fn costless_curve(
         total += value;
         cumulative.push(total);
     }
-    let curve = curve_points(&cumulative);
+    let mut curve = curve_points(&cumulative);
+    for point in &mut curve {
+        point.observation = sampled[point.observation];
+    }
     CostlessCurve {
-        variant: variant.to_owned(),
+        variant: name.to_owned(),
+        rebalance_bars: every,
         mean_bps: if n == 0 { f64::NAN } else { mean_bps },
         sharpe,
         turnover,
         breakeven_bps,
         final_bps: cumulative.last().copied().unwrap_or(f64::NAN),
         curve,
+    }
+}
+
+/// The position at every bar for a variant: the clipped z-score of the feature over the whole
+/// sample, or its sign; zero when the feature is constant.
+fn positions(variant: &str, xs: &[f64]) -> Vec<f64> {
+    let n = xs.len();
+    if n < 2 {
+        vec![0.0; n]
+    } else {
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let sd = (xs.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64).sqrt();
+        xs.iter()
+            .map(|x| {
+                if sd <= 0.0 {
+                    return 0.0;
+                }
+                let z = (x - mean) / sd;
+                match variant {
+                    "sign" => {
+                        if z > 0.0 {
+                            1.0
+                        } else if z < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    _ => z.clamp(-Z_CLIP, Z_CLIP),
+                }
+            })
+            .collect()
     }
 }
 
@@ -1580,9 +1641,13 @@ fn cross_section_cell(
         sharpe,
         turnover,
         breakeven_bps,
+        rebalanced_sharpe: f64::NAN,
+        rebalanced_turnover: f64::NAN,
+        rebalanced_breakeven_bps: f64::NAN,
         buckets: rows,
         curves: vec![CostlessCurve {
             variant: "long_short".to_owned(),
+            rebalance_bars: 1,
             mean_bps: pnl_mean,
             sharpe,
             turnover,
@@ -1657,6 +1722,8 @@ fn cell(
     let curves = vec![
         costless_curve("zscore", xs, ys, per_year),
         costless_curve("sign", xs, ys, per_year),
+        costless_curve_every("zscore", xs, ys, horizon, per_year),
+        costless_curve_every("sign", xs, ys, horizon, per_year),
     ];
     StudyCell {
         symbol: symbol.to_owned(),
@@ -1670,6 +1737,9 @@ fn cell(
         sharpe: curves[0].sharpe,
         turnover: curves[0].turnover,
         breakeven_bps: curves[0].breakeven_bps,
+        rebalanced_sharpe: curves[2].sharpe,
+        rebalanced_turnover: curves[2].turnover,
+        rebalanced_breakeven_bps: curves[2].breakeven_bps,
         buckets: rows,
         curves,
         cross_section: None,
@@ -2032,6 +2102,7 @@ fn run_study(
     let mut csv = String::from(
         "symbol,feature,horizon_secs,observations,ic,top_minus_bottom_bps,top_minus_bottom_t,\
          sharpe,turnover,breakeven_bps,sign_sharpe,sign_turnover,sign_breakeven_bps,\
+         rebalanced_sharpe,rebalanced_turnover,rebalanced_breakeven_bps,\
          dates,ic_t,ic_positive_share,incremental_ic,sign_consistency,autocorrelation_1\n",
     );
     let mut daily_csv = String::from("symbol,feature,horizon_secs,date,ic,n\n");
@@ -2042,7 +2113,7 @@ fn run_study(
         let sign = c.curves.get(1);
         let cross = c.cross_section.as_ref();
         csv.push_str(&format!(
-            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{},{},{},{:.3},{:.4},{:.4},{},{},{},{},{},{}\n",
             c.symbol,
             c.feature,
             c.horizon_secs,
@@ -2058,6 +2129,9 @@ fn run_study(
                 .unwrap_or_default(),
             sign.map(|s| format!("{:.4}", s.breakeven_bps))
                 .unwrap_or_default(),
+            c.rebalanced_sharpe,
+            c.rebalanced_turnover,
+            c.rebalanced_breakeven_bps,
             cross.map(|x| x.dates.to_string()).unwrap_or_default(),
             cross.map(|x| format!("{:.2}", x.ic_t)).unwrap_or_default(),
             cross
@@ -2238,7 +2312,7 @@ pub fn summary_table(result: &StudyResult) -> String {
     }
     let _ = writeln!(
         out,
-        "{:<16} {:>8} {:>10} {:>9} {:>9} {:>12} {:>8} {:>8} {:>10}",
+        "{:<16} {:>8} {:>10} {:>9} {:>9} {:>12} {:>8} {:>8} {:>10} {:>10}",
         "feature",
         "horizon",
         "obs",
@@ -2247,7 +2321,8 @@ pub fn summary_table(result: &StudyResult) -> String {
         format!("top-bot {unit}"),
         "t",
         "sharpe",
-        "brkeven"
+        "brkeven",
+        "rebal brk"
     );
     let horizon_text = |c: &StudyCell| match result.grid.as_str() {
         "daily" => format!("{}d", c.horizon_bars),
@@ -2264,7 +2339,7 @@ pub fn summary_table(result: &StudyResult) -> String {
             .unwrap_or_else(|| format!("{:>9}", "-"));
         let _ = writeln!(
             out,
-            "{:<16} {:>8} {:>10} {:>+9.4} {} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4}",
+            "{:<16} {:>8} {:>10} {:>+9.4} {} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4} {:>+10.4}",
             c.feature,
             horizon_text(c),
             c.observations,
@@ -2273,7 +2348,8 @@ pub fn summary_table(result: &StudyResult) -> String {
             c.top_minus_bottom_bps,
             c.top_minus_bottom_t,
             c.sharpe,
-            c.breakeven_bps
+            c.breakeven_bps,
+            c.rebalanced_breakeven_bps
         );
     }
     out
@@ -3490,7 +3566,7 @@ mod tests {
         assert!(c.top_minus_bottom_bps > 0.0 && c.top_minus_bottom_t > 5.0);
         assert!((c.ic - 1.0).abs() < 1e-9);
         // The costless curves ride on the cell: a monotone edge pays, in both variants.
-        assert_eq!(c.curves.len(), 2);
+        assert_eq!(c.curves.len(), 4);
         assert_eq!(c.curves[0].variant, "zscore");
         assert_eq!(c.curves[1].variant, "sign");
         assert!(c.breakeven_bps > 0.0 && c.sharpe > 0.0 && c.turnover > 0.0);
@@ -3553,6 +3629,105 @@ mod tests {
         assert!((yearly.sharpe - 2.0 * z.sharpe).abs() < 1e-9);
         assert!((periods_per_year(Grid::Lake { step_secs: 1 }, 60) - 525_960.0).abs() < 1e-6);
         assert_eq!(periods_per_year(Grid::Daily, 5), 252.0 / 5.0);
+    }
+
+    /// WB-11: the rebalanced curve takes a position only every `h` bars, so it is the per-bar
+    /// curve at h = 1, and a slowly drifting feature that the per-bar curve credits with a
+    /// huge breakeven (a full horizon return every bar against a sliver of turnover) gets a
+    /// finite one about h times smaller once only every h-th bar is paid.
+    #[test]
+    fn rebalanced_curve_matches_per_bar_at_h1_and_deflates_a_slow_feature() {
+        let n = 20_000;
+        let ys = gaussians(0x0bad_cafe_dead_beef, n);
+        let xs = gaussians(0x1357_9bdf_2468_ace0, n);
+        for variant in ["zscore", "sign"] {
+            let per_bar = costless_curve(variant, &xs, &ys, 252.0);
+            let rebalanced = costless_curve_every(variant, &xs, &ys, 1, 252.0);
+            assert_eq!(rebalanced.variant, format!("{variant}_rebalanced"));
+            assert_eq!(rebalanced.rebalance_bars, 1);
+            assert_eq!(rebalanced.mean_bps, per_bar.mean_bps);
+            assert_eq!(rebalanced.sharpe, per_bar.sharpe);
+            assert_eq!(rebalanced.turnover, per_bar.turnover);
+            assert_eq!(rebalanced.breakeven_bps, per_bar.breakeven_bps);
+            assert_eq!(rebalanced.final_bps, per_bar.final_bps);
+            assert_eq!(rebalanced.curve.len(), per_bar.curve.len());
+            assert_eq!(
+                rebalanced.curve.last().unwrap().observation,
+                per_bar.curve.last().unwrap().observation
+            );
+        }
+        // A slow feature: a ramp, so the position drifts by the same sliver every bar, paid a
+        // forward return that follows it (a real edge) plus noise.
+        let h = 60;
+        let ramp: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let noise = gaussians(0xfeed_face_0123_4567, n);
+        let paid: Vec<f64> = ramp
+            .iter()
+            .zip(&noise)
+            .map(|(x, e)| (2.0 * x / n as f64 - 1.0) + e)
+            .collect();
+        let per_year = periods_per_year(Grid::Lake { step_secs: 1 }, h);
+        let per_bar = costless_curve("zscore", &ramp, &paid, per_year);
+        let rebalanced = costless_curve_every("zscore", &ramp, &paid, h, per_year);
+        assert!(per_bar.breakeven_bps.is_finite() && rebalanced.breakeven_bps.is_finite());
+        assert!(rebalanced.breakeven_bps > 0.0 && rebalanced.sharpe > 0.0);
+        // Between rebalances the position moves h times further than between bars.
+        let turnover_ratio = rebalanced.turnover / per_bar.turnover;
+        assert!(
+            (turnover_ratio - h as f64).abs() < 0.01 * h as f64,
+            "turnover ratio {turnover_ratio} vs h {h}"
+        );
+        // The same edge per hold, so the breakeven falls by about h.
+        let ratio = per_bar.breakeven_bps / rebalanced.breakeven_bps;
+        assert!(
+            ratio > 0.5 * h as f64 && ratio < 2.0 * h as f64,
+            "per-bar {} rebalanced {} ratio {ratio}",
+            per_bar.breakeven_bps,
+            rebalanced.breakeven_bps
+        );
+        // The curve is plotted at the rebalance bars.
+        assert_eq!(rebalanced.rebalance_bars, h);
+        assert!(rebalanced.curve.iter().all(|p| p.observation % h == 0));
+        assert_eq!(
+            rebalanced.curve.last().unwrap().observation,
+            (n - 1) / h * h
+        );
+        // A cell carries the four curves and reports the rebalanced figures beside the per-bar ones.
+        let c = cell(
+            "T",
+            "ramp",
+            h,
+            Grid::Lake { step_secs: 1 },
+            10,
+            &ramp,
+            &paid,
+        );
+        assert_eq!(
+            c.curves
+                .iter()
+                .map(|c| c.variant.as_str())
+                .collect::<Vec<_>>(),
+            ["zscore", "sign", "zscore_rebalanced", "sign_rebalanced"]
+        );
+        assert_eq!(c.rebalanced_breakeven_bps, c.curves[2].breakeven_bps);
+        assert_eq!(c.rebalanced_sharpe, c.curves[2].sharpe);
+        assert_eq!(c.rebalanced_turnover, c.curves[2].turnover);
+        assert!(
+            c.rebalanced_breakeven_bps < c.breakeven_bps / 10.0,
+            "rebalanced {} per-bar {}",
+            c.rebalanced_breakeven_bps,
+            c.breakeven_bps
+        );
+        // Every hold is paid its own forward return: the curve's last point is the sum of them.
+        let holds: f64 = (0..n)
+            .step_by(h)
+            .map(|i| {
+                let mean = (n as f64 - 1.0) / 2.0;
+                let sd = ((0..n).map(|j| (j as f64 - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+                ((ramp[i] - mean) / sd).clamp(-3.0, 3.0) * paid[i]
+            })
+            .sum();
+        assert!((rebalanced.final_bps - holds).abs() < 1e-6);
     }
 
     #[test]

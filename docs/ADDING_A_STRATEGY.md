@@ -238,10 +238,17 @@ the position is the feature's z-score clipped to +-3 (and a `sign` variant), the
 that position times the forward return with no costs. From it come an annualized Sharpe (one
 independent period per horizon, a market that never closes), turnover (mean absolute position
 change per bar), and the breakeven cost in bps per unit traded (mean P&L over turnover): the
-cost at which the edge pays nothing. `study.csv` has the numbers, `curves.csv` the cumulative
-P&L series (up to 400 points per curve), and the UI's Studies page ranks cells by breakeven cost
-and draws the curve of the selected cell. Use receive timestamps and a non-zero delay, or the
-edge will look better than it is.
+cost at which the edge pays nothing. Those per-bar curves pay every bar a full horizon return
+against that bar's sliver of turnover, which flatters a slow feature (a spread that drifts
+0.002 per bar reports a breakeven of tens of bps no execution would earn), so each cell also
+carries `zscore_rebalanced` and `sign_rebalanced`: the same positions taken only every horizon,
+so no two holds overlap, with turnover per hold and the breakeven that execution would have to
+beat, plotted at the rebalance bars. At a horizon of one bar the two agree exactly.
+`study.csv` has the numbers (the `rebalanced_*` columns beside the per-bar ones), `curves.csv`
+the cumulative P&L series (up to 400 points per curve), and the UI's Studies page ranks cells by
+breakeven cost, shows the rebalanced Sharpe and breakeven beside it, and draws the curve of the
+selected cell in either form. Use receive timestamps and a non-zero delay, or the edge will look
+better than it is.
 
 ## Platform sizing and price guards
 
