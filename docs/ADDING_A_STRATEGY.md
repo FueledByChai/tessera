@@ -129,6 +129,15 @@ Bases: `obi_l1`, `obi_l5`, `obi_l10`, `microprice_bps`, `spread_bps`, `trade_imb
 bps, never above zero); `range_bps` is the bar's high-low range over its close; `gap_bps` is the
 open against the previous close.
 
+**Diagnostics.** Every time-series cell carries diagnostics: the incremental IC, which is
+the Spearman IC of the feature's residual after an ordinary least-squares fit on the study's
+`accepted` expressions (the form's "Accepted features"), so a feature that only restates an
+accepted one scores near zero however good its plain IC; IC per day with the share of days that
+carry the cell's sign; IC by spread tercile, trailing 60-bar realized-variance tercile, and
+hour of the bar's clock (when the study spans more than one hour); and the feature's
+autocorrelation at lag 1 and at the horizon. `daily_ic.csv` and `regimes.csv` hold the tables;
+the studies page shows the per-day IC strip and the regime table for the selected cell.
+
 **Aggregation and lifting.** On an intraday grid `agg daily` is a running intraday feature
 (today's volume so far, today's realized variance so far). On the daily grid it lifts: with
 `intraday_source = "1m"` (or `"5m"`; the service picks the finest library present) each

@@ -4247,6 +4247,9 @@ struct CreateStudyRequest {
     /// Bars either side of an event in the event-study path (default 20).
     #[serde(default)]
     event_window: Option<usize>,
+    /// Accepted feature expressions regressed out before the incremental IC.
+    #[serde(default)]
+    accepted: Vec<String>,
     /// `return` (default), `realized_variance`, `abs_move`, `spread_change`,
     /// `fair_value_residual`, or `microprice_residual`.
     #[serde(default)]
@@ -4452,6 +4455,12 @@ fn validate_study_request(
             None
         },
         event_window: request.event_window.unwrap_or(20).clamp(1, 500),
+        accepted: request
+            .accepted
+            .iter()
+            .map(|a| a.trim().to_owned())
+            .filter(|a| !a.is_empty())
+            .collect(),
     };
     // Bases may be declared series, plus the lake side feeds on the lake grid.
     let mut names: Vec<String> = data.series.iter().map(|s| s.name.clone()).collect();
@@ -4462,7 +4471,7 @@ fn validate_study_request(
                 .map(|(n, _, _)| (*n).to_owned()),
         );
     }
-    for feature in &config.features {
+    for feature in config.features.iter().chain(&config.accepted) {
         tessera::feature_expr::parse_with(feature, &names)
             .with_context(|| format!("feature expression {feature:?}"))?;
     }

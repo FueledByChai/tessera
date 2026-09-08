@@ -1472,6 +1472,16 @@ type StudyCell = {
   buckets: { bucket: number; count: number; feature_mean: number; forward_bps: number }[];
   // Cross-sectional cells carry the per-date IC statistics.
   cross_section?: { dates: number; ic_t: number | null; ic_positive_share: number; symbols_per_date: number } | null;
+  // Time-series cells: incremental IC against the accepted set, daily ICs, regimes, autocorrelation.
+  diagnostics?: {
+    accepted: string[];
+    incremental_ic: number | null;
+    daily_ic: { date: string; ic: number; n: number }[];
+    sign_consistency: number | null;
+    regimes: { regime: string; bucket: string; ic: number | null; n: number }[];
+    autocorrelation_1: number | null;
+    autocorrelation_horizon: number | null;
+  } | null;
 };
 type StudyCurve = {
   variant: string;
@@ -1592,6 +1602,66 @@ function StudyCurveChart({ cell, variant, unit }: { cell: StudyCell; variant: st
   );
 }
 
+/** Incremental IC, the per-day IC strip, the regime table, and autocorrelation of one cell. */
+function StudyDiagnostics({ cell }: { cell: StudyCell }) {
+  const d = cell.diagnostics;
+  if (!d) return null;
+  const days = d.daily_ic;
+  const peak = Math.max(0.01, ...days.map((x) => Math.abs(x.ic)));
+  const barWidth = days.length ? Math.max(2, Math.min(24, Math.floor(736 / days.length))) : 0;
+  return (
+    <>
+      <div className="terminal-panel-title"><span>DIAG</span> DIAGNOSTICS · {cell.feature}</div>
+      <div className="chart-readout diag-readout">
+        <span>IC {signed(cell.ic, 4)}</span>
+        <span className={classFor(finite(d.incremental_ic) ?? undefined)}>incremental {d.incremental_ic == null ? "— (no accepted set)" : signed(d.incremental_ic, 4)}</span>
+        {d.accepted.length > 0 && <span>vs {d.accepted.join(", ")}</span>}
+        <span>sign consistency {d.sign_consistency == null || !Number.isFinite(d.sign_consistency) ? "—" : `${Math.round(d.sign_consistency * 100)}% of ${days.length} days`}</span>
+        <span>autocorr lag 1 {signed(d.autocorrelation_1, 3)} · lag h {signed(d.autocorrelation_horizon, 3)}</span>
+      </div>
+      {days.length > 0 && (
+        <div className="equity-chart daily-ic-strip">
+          <svg viewBox="0 0 800 120" role="img" aria-label="IC per day">
+            <line x1="32" y1="60" x2="768" y2="60" className="chart-grid" />
+            <text x="34" y="14" className="chart-axis">{`+${peak.toFixed(3)}`}</text>
+            <text x="34" y="116" className="chart-axis">{`-${peak.toFixed(3)}`}</text>
+            {days.map((day, i) => {
+              const x = 32 + (i * 736) / days.length;
+              const h = (Math.abs(day.ic) / peak) * 52;
+              return (
+                <rect
+                  key={day.date}
+                  x={x}
+                  y={day.ic >= 0 ? 60 - h : 60}
+                  width={Math.max(1, barWidth - 1)}
+                  height={Math.max(1, h)}
+                  className={day.ic >= 0 ? "ic-bar positive" : "ic-bar negative"}
+                >
+                  <title>{`${day.date}: IC ${signed(day.ic, 4)} · n=${day.n.toLocaleString()}`}</title>
+                </rect>
+              );
+            })}
+          </svg>
+          <p className="footnote">IC per day ({days.length} days with enough observations); bars above the line share the cell's sign when it is positive.</p>
+        </div>
+      )}
+      {d.regimes.length > 0 && (
+        <div className="table-wrap"><table className="regime-table">
+          <thead><tr><th>Regime</th><th>Bucket</th><th>IC</th><th>Count</th></tr></thead>
+          <tbody>{d.regimes.map((r) => (
+            <tr key={`${r.regime}-${r.bucket}`}>
+              <td>{r.regime === "vol" ? "realized vol" : r.regime}</td>
+              <td>{r.bucket}</td>
+              <td className={icClass(finite(r.ic) ?? 0)}>{signed(r.ic, 4)}</td>
+              <td>{r.n.toLocaleString()}</td>
+            </tr>
+          ))}</tbody>
+        </table></div>
+      )}
+    </>
+  );
+}
+
 /** Feature studies on the tick lake: create, list, and read IC / decile tables. */
 function StudiesWorkspace() {
   const [instruments, setInstruments] = useState<LakeInstrument[]>([]);
@@ -1602,6 +1672,12 @@ function StudiesWorkspace() {
   const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id).filter((id) => BOOK_FEATURES.includes(id) || id === "return_1"));
   // Free-form feature expressions, one per line: base series plus streaming transforms.
   const [expressions, setExpressions] = useState("");
+  // The accepted set: expressions regressed out of every feature before its incremental IC.
+  const [acceptedText, setAcceptedText] = useState("");
+  const accepted = useMemo(
+    () => acceptedText.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#")),
+    [acceptedText],
+  );
   const customFeatures = useMemo(
     () => expressions.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#")),
     [expressions],
@@ -1707,6 +1783,7 @@ function StudiesWorkspace() {
           decision_delay_bars: delay,
           target,
           mode,
+          accepted,
         }),
       });
       const body = await response.json();
@@ -1832,6 +1909,20 @@ function StudiesWorkspace() {
                     value={expressions}
                     onChange={(e) => setExpressions(e.target.value)}
                   />
+                </label>
+                <label className="expression-box">
+                  <span>Accepted features</span>
+                  <textarea
+                    rows={2}
+                    spellCheck={false}
+                    placeholder={"obi_l1\nspread_bps | zscore 60"}
+                    value={acceptedText}
+                    onChange={(e) => setAcceptedText(e.target.value)}
+                  />
+                  <small>Regressed out of every feature before its incremental IC, so a new feature is scored on what it adds.</small>
+                </label>
+                <label className="expression-box">
+                  <span>Expression notes</span>
                   <small>
                     One per line: a base (obi_l1, obi_l5, obi_l10, microprice_bps, spread_bps, trade_imbalance,
                     return_n, signed_volume, bid, ask, mid, microprice, bid_size, ask_size, bid_depth_l5,
@@ -1958,6 +2049,7 @@ function StudiesWorkspace() {
               </div>
               {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
               <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L."}</p>
+              {bucketCell?.diagnostics && <StudyDiagnostics cell={bucketCell} />}
               <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
               {ranked.length ? (
                 <>

@@ -114,7 +114,7 @@ events with counts and t per offset.
 **Done when:** a test builds a daily realized variance from 1-minute fixture bars and matches a
 direct computation; an event-study fixture with a known post-event drift reproduces it.
 
-### WB-08 Diagnostics: incremental IC, stability, regime buckets — `todo` — Blocked by WB-02
+### WB-08 Diagnostics: incremental IC, stability, regime buckets — `done 2026-09-07 WB-08: diagnostics, incremental IC, stability, regimes` — Blocked by WB-02
 Incremental IC against an "accepted" feature set (regress out, score the residual); IC per day with
 sign-consistency count; IC by spread tercile, realized-vol tercile, and hour of day; feature
 autocorrelation.

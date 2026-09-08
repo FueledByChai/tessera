@@ -4085,6 +4085,12 @@ nav {
 .ranked-cells tbody tr.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
 .ranked-cells td.positive { color: #32c832; }
 .ranked-cells td.negative { color: #e03040; }
+.diag-readout { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
+.daily-ic-strip { padding-top: 4px; }
+.ic-bar.positive { fill: #32c832; }
+.ic-bar.negative { fill: #e03040; }
+.regime-table td.positive { color: #32c832; }
+.regime-table td.negative { color: #e03040; }
 @media (max-width: 1100px) { .study-pick-grid { grid-template-columns: minmax(0, 1fr); } }
 
 /* Data sources */

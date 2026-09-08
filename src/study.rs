@@ -104,7 +104,16 @@ pub struct StudyConfig {
     /// Bars before and after an event in the event-study path (default 20).
     #[serde(default = "default_event_window")]
     pub event_window: usize,
+    /// The accepted feature set: expressions regressed out of every studied feature before
+    /// its incremental IC is scored (see [`Diagnostics`]).
+    #[serde(default)]
+    pub accepted: Vec<String>,
 }
+
+/// Bars of trailing realized variance that define the volatility regime.
+const VOL_WINDOW: usize = 60;
+/// Observations a day needs before it gets its own IC.
+const MIN_DAY_OBS: usize = 30;
 
 fn default_event_window() -> usize {
     20
@@ -545,6 +554,313 @@ pub struct StudyCell {
     pub curves: Vec<CostlessCurve>,
     /// Present on cross-sectional cells: the per-date IC statistics.
     pub cross_section: Option<CrossSection>,
+    /// Time-series cells: incremental IC, stability, regimes, autocorrelation.
+    pub diagnostics: Option<Diagnostics>,
+}
+
+/// Where a feature's edge comes from and how stable it is.
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostics {
+    /// The accepted expressions regressed out (with an intercept) before scoring.
+    pub accepted: Vec<String>,
+    /// Spearman IC of the feature's OLS residual on the accepted set; `None` without one.
+    pub incremental_ic: Option<f64>,
+    /// IC per day, for days with at least [`MIN_DAY_OBS`] observations.
+    pub daily_ic: Vec<DailyIc>,
+    /// Share of those days whose IC carries the cell's sign.
+    pub sign_consistency: f64,
+    /// IC by spread tercile, trailing-realized-variance tercile, and hour of the bar's clock.
+    pub regimes: Vec<RegimeIc>,
+    /// Lag-1 autocorrelation of the feature along time (observation-weighted over symbols).
+    pub autocorrelation_1: f64,
+    /// Autocorrelation at a lag of the horizon.
+    pub autocorrelation_horizon: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyIc {
+    pub date: NaiveDate,
+    pub ic: f64,
+    pub n: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RegimeIc {
+    /// `spread`, `vol`, or `hour`.
+    pub regime: String,
+    /// `low`, `mid`, `high`, or the hour.
+    pub bucket: String,
+    pub ic: f64,
+    pub n: usize,
+}
+
+/// One aligned observation with what the diagnostics need to know about its bar.
+#[derive(Debug, Clone)]
+struct DiagObs {
+    x: f64,
+    y: f64,
+    date: NaiveDate,
+    hour: u32,
+    spread: f64,
+    vol: f64,
+    accepted: Vec<f64>,
+}
+
+/// Trailing realized variance per bar: the sum of squared bar returns (bps) over the last
+/// `window` bars, `NaN` when a bar in the window has no price.
+fn trailing_realized_variance(prices: &[f64], window: usize) -> Vec<f64> {
+    let n = prices.len();
+    let mut sum = vec![0.0; n + 1];
+    let mut gaps = vec![0usize; n + 1];
+    for k in 0..n {
+        let r2 =
+            if k > 0 && prices[k].is_finite() && prices[k - 1].is_finite() && prices[k - 1] > 0.0 {
+                let r = (prices[k] / prices[k - 1] - 1.0) * 1e4;
+                r * r
+            } else {
+                f64::NAN
+            };
+        sum[k + 1] = sum[k] + if r2.is_finite() { r2 } else { 0.0 };
+        gaps[k + 1] = gaps[k] + usize::from(!r2.is_finite());
+    }
+    (0..n)
+        .map(|i| {
+            if i + 1 < window {
+                return f64::NAN;
+            }
+            let from = i + 1 - window;
+            if gaps[i + 1] == gaps[from] {
+                sum[i + 1] - sum[from]
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+/// Pearson correlation of a series with itself `lag` bars back, over finite pairs.
+fn autocorrelation(values: &[f64], lag: usize) -> f64 {
+    if lag == 0 || values.len() <= lag {
+        return f64::NAN;
+    }
+    let mut now = Vec::new();
+    let mut then = Vec::new();
+    for i in lag..values.len() {
+        if values[i].is_finite() && values[i - lag].is_finite() {
+            now.push(values[i]);
+            then.push(values[i - lag]);
+        }
+    }
+    if now.len() < 3 {
+        return f64::NAN;
+    }
+    pearson(&now, &then)
+}
+
+/// OLS residual of `x` on the regressors plus an intercept, by Gaussian elimination on the
+/// normal equations. Rows with a non-finite regressor keep `NaN`.
+fn ols_residual(x: &[f64], regressors: &[Vec<f64>]) -> Vec<f64> {
+    let k = regressors.len() + 1;
+    let usable: Vec<usize> = (0..x.len())
+        .filter(|&i| x[i].is_finite() && regressors.iter().all(|r| r[i].is_finite()))
+        .collect();
+    if usable.len() <= k {
+        return vec![f64::NAN; x.len()];
+    }
+    let row = |i: usize| -> Vec<f64> {
+        let mut r = Vec::with_capacity(k);
+        r.push(1.0);
+        r.extend(regressors.iter().map(|reg| reg[i]));
+        r
+    };
+    let mut xtx = vec![vec![0.0; k]; k];
+    let mut xty = vec![0.0; k];
+    for &i in &usable {
+        let r = row(i);
+        for a in 0..k {
+            xty[a] += r[a] * x[i];
+            for b in 0..k {
+                xtx[a][b] += r[a] * r[b];
+            }
+        }
+    }
+    // Solve xtx * beta = xty with partial pivoting; a singular system (a regressor that is
+    // constant or collinear) drops to the intercept-only fit.
+    let mut m = xtx;
+    let mut v = xty;
+    for col in 0..k {
+        let pivot = (col..k)
+            .max_by(|&a, &b| m[a][col].abs().partial_cmp(&m[b][col].abs()).unwrap())
+            .unwrap();
+        if m[pivot][col].abs() < 1e-12 {
+            let mean = usable.iter().map(|&i| x[i]).sum::<f64>() / usable.len() as f64;
+            return x
+                .iter()
+                .map(|xi| if xi.is_finite() { xi - mean } else { f64::NAN })
+                .collect();
+        }
+        m.swap(col, pivot);
+        v.swap(col, pivot);
+        for r in col + 1..k {
+            let factor = m[r][col] / m[col][col];
+            for c in col..k {
+                m[r][c] -= factor * m[col][c];
+            }
+            v[r] -= factor * v[col];
+        }
+    }
+    let mut beta = vec![0.0; k];
+    for col in (0..k).rev() {
+        let mut acc = v[col];
+        for c in col + 1..k {
+            acc -= m[col][c] * beta[c];
+        }
+        beta[col] = acc / m[col][col];
+    }
+    let mut residual = vec![f64::NAN; x.len()];
+    for &i in &usable {
+        let fitted: f64 = row(i).iter().zip(&beta).map(|(a, b)| a * b).sum();
+        residual[i] = x[i] - fitted;
+    }
+    residual
+}
+
+/// IC within each tercile of `by` (low, mid, high by rank), for the named regime.
+fn tercile_regimes(regime: &str, obs: &[DiagObs], by: impl Fn(&DiagObs) -> f64) -> Vec<RegimeIc> {
+    let mut order: Vec<usize> = (0..obs.len())
+        .filter(|&i| by(&obs[i]).is_finite())
+        .collect();
+    if order.len() < 3 * MIN_DAY_OBS {
+        return Vec::new();
+    }
+    order.sort_by(|a, b| {
+        by(&obs[*a])
+            .partial_cmp(&by(&obs[*b]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let third = order.len() / 3;
+    [
+        ("low", 0..third),
+        ("mid", third..2 * third),
+        ("high", 2 * third..order.len()),
+    ]
+    .into_iter()
+    .map(|(bucket, range)| {
+        let xs: Vec<f64> = order[range.clone()].iter().map(|&i| obs[i].x).collect();
+        let ys: Vec<f64> = order[range].iter().map(|&i| obs[i].y).collect();
+        RegimeIc {
+            regime: regime.to_owned(),
+            bucket: bucket.to_owned(),
+            ic: spearman(&xs, &ys),
+            n: xs.len(),
+        }
+    })
+    .collect()
+}
+
+/// The diagnostics of one time-series cell.
+fn diagnostics(
+    cell_ic: f64,
+    horizon: usize,
+    accepted: &[String],
+    obs: &[DiagObs],
+    feature_series: &[(&[f64], usize)],
+) -> Diagnostics {
+    let xs: Vec<f64> = obs.iter().map(|o| o.x).collect();
+    let ys: Vec<f64> = obs.iter().map(|o| o.y).collect();
+    let incremental_ic = if accepted.is_empty() {
+        None
+    } else {
+        let regressors: Vec<Vec<f64>> = (0..accepted.len())
+            .map(|k| obs.iter().map(|o| o.accepted[k]).collect())
+            .collect();
+        let residual = ols_residual(&xs, &regressors);
+        let (rx, ry): (Vec<f64>, Vec<f64>) = residual
+            .iter()
+            .zip(&ys)
+            .filter(|(r, _)| r.is_finite())
+            .map(|(r, y)| (*r, *y))
+            .unzip();
+        Some(if rx.len() >= 3 {
+            spearman(&rx, &ry)
+        } else {
+            f64::NAN
+        })
+    };
+    // Per day.
+    let mut by_day: BTreeMap<NaiveDate, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for o in obs {
+        let entry = by_day.entry(o.date).or_default();
+        entry.0.push(o.x);
+        entry.1.push(o.y);
+    }
+    let daily_ic: Vec<DailyIc> = by_day
+        .into_iter()
+        .filter(|(_, (x, _))| x.len() >= MIN_DAY_OBS)
+        .map(|(date, (x, y))| DailyIc {
+            date,
+            ic: spearman(&x, &y),
+            n: x.len(),
+        })
+        .filter(|d| d.ic.is_finite())
+        .collect();
+    let sign_consistency = if daily_ic.is_empty() || cell_ic == 0.0 || !cell_ic.is_finite() {
+        f64::NAN
+    } else {
+        daily_ic
+            .iter()
+            .filter(|d| (d.ic > 0.0) == (cell_ic > 0.0))
+            .count() as f64
+            / daily_ic.len() as f64
+    };
+    // Regimes.
+    let mut regimes = tercile_regimes("spread", obs, |o| o.spread);
+    regimes.extend(tercile_regimes("vol", obs, |o| o.vol));
+    let mut by_hour: BTreeMap<u32, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for o in obs {
+        let entry = by_hour.entry(o.hour).or_default();
+        entry.0.push(o.x);
+        entry.1.push(o.y);
+    }
+    if by_hour.len() >= 2 {
+        regimes.extend(
+            by_hour
+                .into_iter()
+                .filter(|(_, (x, _))| x.len() >= MIN_DAY_OBS)
+                .map(|(hour, (x, y))| RegimeIc {
+                    regime: "hour".to_owned(),
+                    bucket: format!("{hour:02}"),
+                    ic: spearman(&x, &y),
+                    n: x.len(),
+                }),
+        );
+    }
+    // Autocorrelation, observation-weighted over the symbols that make up the cell.
+    let weighted = |lag: usize| -> f64 {
+        let mut total = 0.0;
+        let mut weight = 0.0;
+        for (values, n) in feature_series {
+            let rho = autocorrelation(values, lag);
+            if rho.is_finite() && *n > 0 {
+                total += rho * *n as f64;
+                weight += *n as f64;
+            }
+        }
+        if weight > 0.0 {
+            total / weight
+        } else {
+            f64::NAN
+        }
+    };
+    Diagnostics {
+        accepted: accepted.to_vec(),
+        incremental_ic,
+        daily_ic,
+        sign_consistency,
+        regimes,
+        autocorrelation_1: weighted(1),
+        autocorrelation_horizon: weighted(horizon.max(1)),
+    }
 }
 
 /// Per-date statistics of a cross-sectional cell. `ic` on the cell is the mean of the daily
@@ -834,8 +1150,13 @@ struct SymbolSeries {
     symbol: String,
     book: TargetSeries,
     features: BTreeMap<String, Vec<f64>>,
+    /// The accepted set evaluated on the same bars, in config order.
+    accepted: Vec<Vec<f64>>,
     /// Each bar's close instant (microseconds UTC): the cross-section groups symbols by it.
     keys: Vec<i64>,
+    dates: Vec<NaiveDate>,
+    hours: Vec<u32>,
+    trailing_vol: Vec<f64>,
     bars: usize,
     bars_with_book: usize,
 }
@@ -903,6 +1224,7 @@ fn lake_bar(bar: &Bar) -> lake::LakeBar {
 
 fn evaluate_symbol(
     features: &[String],
+    accepted: &[String],
     grid: Grid,
     symbol: &str,
     bars: &[lake::LakeBar],
@@ -911,6 +1233,18 @@ fn evaluate_symbol(
 ) -> Result<SymbolSeries> {
     let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
     let exogenous = align_series(grid, symbol, bars, series);
+    let (_, accepted_values, _) = evaluate_features_with(
+        accepted,
+        grid.step_secs(),
+        bars,
+        grid.has_book(),
+        &names,
+        &exogenous,
+    )?;
+    let accepted: Vec<Vec<f64>> = accepted
+        .iter()
+        .map(|name| accepted_values.get(name).cloned().unwrap_or_default())
+        .collect();
     let (_, mut features, bars_with_book) = evaluate_features_with(
         features,
         grid.step_secs(),
@@ -929,11 +1263,20 @@ fn evaluate_symbol(
             }
         }
     }
+    let book = TargetSeries::from_bars(bars, grid);
+    let trailing_vol = trailing_realized_variance(&book.mids, VOL_WINDOW);
     Ok(SymbolSeries {
         symbol: symbol.to_owned(),
-        book: TargetSeries::from_bars(bars, grid),
+        book,
         features,
+        accepted,
         keys: bars.iter().map(|bar| bar_close_us(bar, grid)).collect(),
+        dates: bars.iter().map(|bar| bar.date).collect(),
+        hours: bars
+            .iter()
+            .map(|bar| chrono::Timelike::hour(&bar.time))
+            .collect(),
+        trailing_vol,
         bars: bars.len(),
         bars_with_book,
     })
@@ -1070,6 +1413,7 @@ fn mean_and_se(values: &[f64]) -> (f64, f64) {
 
 /// Aligned (feature, target) pairs: the feature observed at bar `i`, the target from acting
 /// `delay` bars later (see [`target_series`] for the target per acting bar).
+#[cfg(test)]
 fn pairs(feature: &[f64], targets: &[f64], delay: usize) -> (Vec<f64>, Vec<f64>) {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -1253,6 +1597,7 @@ fn cross_section_cell(
             ic_positive_share: ics.iter().filter(|ic| **ic > 0.0).count() as f64 / ics.len() as f64,
             symbols_per_date: used as f64 / ics.len() as f64,
         }),
+        diagnostics: None,
     })
 }
 
@@ -1325,6 +1670,7 @@ fn cell(
         buckets: rows,
         curves,
         cross_section: None,
+        diagnostics: None,
     }
 }
 
@@ -1343,7 +1689,7 @@ pub fn run(
         series.extend(lake_series(&config.lake_dir, &config.symbols, start, end)?);
     }
     let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
-    for feature in &config.features {
+    for feature in config.features.iter().chain(&config.accepted) {
         feature_expr::parse_with(feature, &names)
             .with_context(|| format!("feature expression {feature:?}"))?;
     }
@@ -1508,7 +1854,15 @@ fn run_study(
         .par_iter()
         .enumerate()
         .map(|(i, (symbol, bars))| {
-            evaluate_symbol(&features, grid, symbol, bars, &exogenous, lifted.get(i))
+            evaluate_symbol(
+                &features,
+                &config.accepted,
+                grid,
+                symbol,
+                bars,
+                &exogenous,
+                lifted.get(i),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     // Event studies for every event-kind series.
@@ -1565,29 +1919,51 @@ fn run_study(
             }
             let mut pooled_x = Vec::new();
             let mut pooled_y = Vec::new();
+            let mut pooled_obs: Vec<DiagObs> = Vec::new();
+            let mut pooled_series: Vec<(&[f64], usize)> = Vec::new();
             for (s, symbol_targets) in series.iter().zip(&targets) {
-                let (xs, ys) = pairs(
+                let indexed = pairs_indexed(
                     &s.features[feature],
                     &symbol_targets[hi],
                     config.decision_delay_bars,
                 );
+                let obs: Vec<DiagObs> = indexed
+                    .iter()
+                    .map(|&(i, x, y)| DiagObs {
+                        x,
+                        y,
+                        date: s.dates[i],
+                        hour: s.hours[i],
+                        spread: s.book.spreads.get(i).copied().unwrap_or(f64::NAN),
+                        vol: s.trailing_vol.get(i).copied().unwrap_or(f64::NAN),
+                        accepted: s
+                            .accepted
+                            .iter()
+                            .map(|a| a.get(i).copied().unwrap_or(f64::NAN))
+                            .collect(),
+                    })
+                    .collect();
+                let xs: Vec<f64> = indexed.iter().map(|o| o.1).collect();
+                let ys: Vec<f64> = indexed.iter().map(|o| o.2).collect();
                 if xs.len() >= 100 {
-                    cells.push(cell(
-                        &s.symbol,
-                        feature,
+                    let mut c = cell(&s.symbol, feature, horizon, grid, config.buckets, &xs, &ys);
+                    c.diagnostics = Some(diagnostics(
+                        c.ic,
                         horizon,
-                        grid,
-                        config.buckets,
-                        &xs,
-                        &ys,
+                        &config.accepted,
+                        &obs,
+                        &[(s.features[feature].as_slice(), xs.len())],
                     ));
+                    cells.push(c);
                 }
+                pooled_series.push((s.features[feature].as_slice(), xs.len()));
                 pooled_x.extend(xs);
                 pooled_y.extend(ys);
+                pooled_obs.extend(obs);
                 done += 1;
             }
             if series.len() > 1 && pooled_x.len() >= 100 {
-                cells.push(cell(
+                let mut c = cell(
                     "ALL",
                     feature,
                     horizon,
@@ -1595,7 +1971,15 @@ fn run_study(
                     config.buckets,
                     &pooled_x,
                     &pooled_y,
+                );
+                c.diagnostics = Some(diagnostics(
+                    c.ic,
+                    horizon,
+                    &config.accepted,
+                    &pooled_obs,
+                    &pooled_series,
                 ));
+                cells.push(c);
             }
             done += 1;
             eprintln!(
@@ -1632,15 +2016,17 @@ fn run_study(
     let mut csv = String::from(
         "symbol,feature,horizon_secs,observations,ic,top_minus_bottom_bps,top_minus_bottom_t,\
          sharpe,turnover,breakeven_bps,sign_sharpe,sign_turnover,sign_breakeven_bps,\
-         dates,ic_t,ic_positive_share\n",
+         dates,ic_t,ic_positive_share,incremental_ic,sign_consistency,autocorrelation_1\n",
     );
+    let mut daily_csv = String::from("symbol,feature,horizon_secs,date,ic,n\n");
+    let mut regime_csv = String::from("symbol,feature,horizon_secs,regime,bucket,ic,n\n");
     let mut curves =
         String::from("symbol,feature,horizon_secs,variant,observation,cumulative_bps\n");
     for c in &result.cells {
         let sign = c.curves.get(1);
         let cross = c.cross_section.as_ref();
         csv.push_str(&format!(
-            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{},{},{},{},{},{}\n",
+            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{},{},{},{},{},{},{},{},{}\n",
             c.symbol,
             c.feature,
             c.horizon_secs,
@@ -1661,7 +2047,34 @@ fn run_study(
             cross
                 .map(|x| format!("{:.3}", x.ic_positive_share))
                 .unwrap_or_default(),
+            c.diagnostics
+                .as_ref()
+                .and_then(|d| d.incremental_ic)
+                .map(|v| format!("{v:.5}"))
+                .unwrap_or_default(),
+            c.diagnostics
+                .as_ref()
+                .map(|d| format!("{:.3}", d.sign_consistency))
+                .unwrap_or_default(),
+            c.diagnostics
+                .as_ref()
+                .map(|d| format!("{:.4}", d.autocorrelation_1))
+                .unwrap_or_default(),
         ));
+        if let Some(d) = &c.diagnostics {
+            for day in &d.daily_ic {
+                daily_csv.push_str(&format!(
+                    "{},{},{},{},{:.5},{}\n",
+                    c.symbol, c.feature, c.horizon_secs, day.date, day.ic, day.n
+                ));
+            }
+            for r in &d.regimes {
+                regime_csv.push_str(&format!(
+                    "{},{},{},{},{},{:.5},{}\n",
+                    c.symbol, c.feature, c.horizon_secs, r.regime, r.bucket, r.ic, r.n
+                ));
+            }
+        }
         for curve in &c.curves {
             for point in &curve.curve {
                 curves.push_str(&format!(
@@ -1678,6 +2091,8 @@ fn run_study(
     }
     fs::write(output_dir.join("study.csv"), csv)?;
     fs::write(output_dir.join("curves.csv"), curves)?;
+    fs::write(output_dir.join("daily_ic.csv"), daily_csv)?;
+    fs::write(output_dir.join("regimes.csv"), regime_csv)?;
     if !result.events.is_empty() {
         let mut events = String::from("series,offset,mean_bps,t,count\n");
         for study in &result.events {
@@ -1732,11 +2147,12 @@ pub fn summary_table(result: &StudyResult) -> String {
     }
     let _ = writeln!(
         out,
-        "{:<16} {:>8} {:>10} {:>9} {:>12} {:>8} {:>8} {:>10}",
+        "{:<16} {:>8} {:>10} {:>9} {:>9} {:>12} {:>8} {:>8} {:>10}",
         "feature",
         "horizon",
         "obs",
         "IC",
+        "incr IC",
         format!("top-bot {unit}"),
         "t",
         "sharpe",
@@ -1749,13 +2165,20 @@ pub fn summary_table(result: &StudyResult) -> String {
         _ => format!("{}s", c.horizon_secs),
     };
     for c in result.cells.iter().filter(|c| c.symbol == symbol) {
+        let incremental = c
+            .diagnostics
+            .as_ref()
+            .and_then(|d| d.incremental_ic)
+            .map(|v| format!("{v:>+9.4}"))
+            .unwrap_or_else(|| format!("{:>9}", "-"));
         let _ = writeln!(
             out,
-            "{:<16} {:>8} {:>10} {:>+9.4} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4}",
+            "{:<16} {:>8} {:>10} {:>+9.4} {} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4}",
             c.feature,
             horizon_text(c),
             c.observations,
             c.ic,
+            incremental,
             c.top_minus_bottom_bps,
             c.top_minus_bottom_t,
             c.sharpe,
@@ -2049,6 +2472,7 @@ mod tests {
             mode: StudyMode::TimeSeries,
             intraday_source: None,
             event_window: 20,
+            accepted: Vec::new(),
         };
         let start = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
@@ -2220,6 +2644,7 @@ mod tests {
             mode: StudyMode::TimeSeries,
             intraday_source: None,
             event_window: 20,
+            accepted: Vec::new(),
         };
         let out = std::env::temp_dir().join(format!("tessera-wb05-study-{}", std::process::id()));
         let result = run_on_panel_with_series(
@@ -2440,6 +2865,7 @@ mod tests {
             mode: StudyMode::TimeSeries,
             intraday_source: None,
             event_window: 20,
+            accepted: Vec::new(),
         };
         let out = std::env::temp_dir().join(format!("tessera-wb07-{}", std::process::id()));
         let result = run_on_panel_with_series(
@@ -2521,6 +2947,7 @@ mod tests {
             mode: StudyMode::CrossSectional,
             intraday_source: None,
             event_window: 20,
+            accepted: Vec::new(),
         };
         let out = std::env::temp_dir().join(format!("tessera-wb06-{}", std::process::id()));
         let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
@@ -2598,6 +3025,122 @@ mod tests {
         }]
     }
 
+    /// The done line: a feature that is a linear copy of an accepted one keeps its plain IC
+    /// but has no incremental IC once the accepted set is regressed out; an unrelated
+    /// feature keeps its IC. Daily ICs, regimes, and autocorrelation come along.
+    #[test]
+    fn linear_copy_of_an_accepted_feature_has_no_incremental_ic() {
+        let bars = synthetic_grid_days(2);
+        let config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: vec!["BINANCE_FUTURES:SOLUSDT".to_owned()],
+            step_secs: 1,
+            resolution: None,
+            daily_dir: PathBuf::new(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: None,
+            session: SessionKind::Regular,
+            // clip -1 1 leaves obi_l1 untouched: an exact copy of the accepted feature.
+            features: vec!["spread_bps | clip 0 1000".to_owned(), "obi_l5".to_owned()],
+            horizons: vec![30],
+            decision_delay_bars: 1,
+            buckets: 10,
+            target: Target::RealizedVariance,
+            series: Vec::new(),
+            lake_series: false,
+            mode: StudyMode::TimeSeries,
+            intraday_source: None,
+            event_window: 20,
+            accepted: vec!["spread_bps".to_owned()],
+        };
+        let out = std::env::temp_dir().join(format!("tessera-wb08-{}", std::process::id()));
+        let result = run_on_panel_with_series(
+            &config,
+            vec![("BINANCE_FUTURES:SOLUSDT".to_owned(), bars)],
+            Vec::new(),
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 11).unwrap(),
+            &out,
+        )
+        .unwrap();
+        let copy = result
+            .cells
+            .iter()
+            .find(|c| c.feature == "spread_bps | clip 0 1000")
+            .unwrap();
+        let d = copy.diagnostics.as_ref().unwrap();
+        assert!(
+            copy.ic > 0.3,
+            "the copy keeps the spread's edge: {}",
+            copy.ic
+        );
+        assert_eq!(d.accepted, vec!["spread_bps"]);
+        let incremental = d.incremental_ic.unwrap();
+        assert!(
+            incremental.abs() < 0.02,
+            "nothing left once spread_bps is regressed out: {incremental}"
+        );
+        let other = result.cells.iter().find(|c| c.feature == "obi_l5").unwrap();
+        let od = other.diagnostics.as_ref().unwrap();
+        // A random book imbalance says nothing about variance, before or after the spread
+        // is regressed out (both sit within sampling noise of zero).
+        assert!(
+            other.ic.abs() < 0.05 && od.incremental_ic.unwrap().abs() < 0.05,
+            "obi_l5 is unrelated: plain {} incremental {}",
+            other.ic,
+            od.incremental_ic.unwrap()
+        );
+        // Two dates, an IC each, and the sign count against the cell.
+        assert_eq!(d.daily_ic.len(), 2);
+        assert!(d.daily_ic.iter().all(|day| day.n > 1_000 && day.ic > 0.2));
+        assert_eq!(d.sign_consistency, 1.0);
+        // Spread and volatility terciles are populated; one hour of bars gives no hour rows.
+        let spread_rows: Vec<&RegimeIc> =
+            d.regimes.iter().filter(|r| r.regime == "spread").collect();
+        let vol_rows: Vec<&RegimeIc> = d.regimes.iter().filter(|r| r.regime == "vol").collect();
+        assert_eq!(spread_rows.len(), 3);
+        assert_eq!(vol_rows.len(), 3);
+        assert!(spread_rows.iter().all(|r| r.n > 1_000 && r.ic.is_finite()));
+        assert!(d.regimes.iter().all(|r| r.regime != "hour"));
+        // A regime-driven spread is persistent; the random book imbalance is not.
+        assert!(
+            d.autocorrelation_1 > 0.9,
+            "spread autocorrelation {}",
+            d.autocorrelation_1
+        );
+        assert!(
+            od.autocorrelation_1.abs() < 0.1,
+            "obi_l5 autocorrelation {}",
+            od.autocorrelation_1
+        );
+        assert!(d.autocorrelation_horizon.is_finite());
+        // The files and the summary carry it.
+        assert!(
+            fs::read_to_string(out.join("daily_ic.csv"))
+                .unwrap()
+                .lines()
+                .count()
+                >= 5
+        );
+        assert!(
+            fs::read_to_string(out.join("regimes.csv"))
+                .unwrap()
+                .contains("spread,low")
+        );
+        assert!(summary_table(&result).contains("incr IC"));
+        // OLS on the fixture directly: a copy leaves a zero residual.
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let r = ols_residual(&x, &[vec![2.0, 4.0, 6.0, 8.0, 10.0]]);
+        assert!(r.iter().all(|v| v.abs() < 1e-9), "{r:?}");
+        let r = ols_residual(&x, &[vec![1.0, 1.0, 1.0, 1.0, 1.0]]);
+        assert!(
+            (r[0] + 2.0).abs() < 1e-9,
+            "a constant regressor falls back to demeaning: {r:?}"
+        );
+        let _ = fs::remove_dir_all(&out);
+    }
+
     /// The pre-expression feature switch, kept as the parity reference for the eight names.
     fn legacy_feature_value(
         name: &str,
@@ -2627,6 +3170,11 @@ mod tests {
 
     /// A deterministic day of 1-second bars with a moving book and occasional gaps.
     fn synthetic_grid() -> Vec<lake::LakeBar> {
+        synthetic_grid_days(1)
+    }
+
+    /// The same grid over several dates, 3,000 one-second bars a day.
+    fn synthetic_grid_days(days: u32) -> Vec<lake::LakeBar> {
         let mut seed: u64 = 0x5eed;
         let mut rand = move || {
             seed ^= seed << 13;
@@ -2635,7 +3183,7 @@ mod tests {
             (seed % 10_000) as f64 / 10_000.0
         };
         let mut mid = 150.0;
-        (0..3_000)
+        (0..3_000 * days)
             .map(|i| {
                 // Volatility alternates every 300 bars, and the quoted spread widens with it,
                 // as it does on the SOL perpetuals: half a bp in the quiet regime, two in the
@@ -2666,8 +3214,10 @@ mod tests {
                     sell_volume: sell,
                 });
                 lake::LakeBar {
-                    date: NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
-                    time: chrono::NaiveTime::from_num_seconds_from_midnight_opt(i, 0).unwrap(),
+                    date: NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()
+                        + chrono::Days::new(u64::from(i / 3_000)),
+                    time: chrono::NaiveTime::from_num_seconds_from_midnight_opt(i % 3_000, 0)
+                        .unwrap(),
                     open: mid,
                     high: mid,
                     low: mid,
