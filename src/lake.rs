@@ -203,6 +203,55 @@ fn text_column(frame: &DataFrame, name: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
+/// One row of a lake side feed (`funding`, `open_interest`): when we received it, when the
+/// venue stamped it, and one numeric column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FeedValue {
+    pub recv_us: i64,
+    pub event_us: i64,
+    pub value: f64,
+}
+
+/// Values of one column of a side feed for a symbol over a date range, in receive order.
+/// Rows with a null or non-finite value are skipped; a missing partition is an empty day.
+pub fn read_feed_values(
+    lake: &Path,
+    sym: &LakeSymbol,
+    feed: &str,
+    column: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<FeedValue>> {
+    let mut values = Vec::new();
+    let mut date = from;
+    while date <= to {
+        for path in day_files(lake, sym, feed, date)? {
+            let Some(frame) = read_frame(&path) else {
+                continue;
+            };
+            let recv = i64_column(&frame, "recvTimestampMicros")?;
+            let event = i64_column(&frame, "eventTimestampMicros").unwrap_or_else(|_| recv.clone());
+            let column = f64_column(&frame, column)?;
+            for index in 0..frame.height() {
+                let (Some(recv_us), Some(value)) = (recv[index], column[index]) else {
+                    continue;
+                };
+                if !value.is_finite() {
+                    continue;
+                }
+                values.push(FeedValue {
+                    recv_us,
+                    event_us: event[index].unwrap_or(recv_us),
+                    value,
+                });
+            }
+        }
+        date = date.succ_opt().context("date overflow")?;
+    }
+    values.sort_by_key(|v| v.recv_us);
+    Ok(values)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Trade {
     pub recv_us: i64,

@@ -88,9 +88,16 @@ pub fn base_family(name: &str) -> Option<&'static str> {
         .find(|b| *b == name && !matches!(*b, "return_n" | "high_252_distance"))
 }
 
-fn check_base(name: &str) -> Result<()> {
-    if base_family(name).is_none() {
-        bail!("unknown base {name:?}; bases: {}", BASES.join(", "));
+fn check_base(name: &str, series: &[String]) -> Result<()> {
+    if base_family(name).is_none() && !series.iter().any(|s| s == name) {
+        if series.is_empty() {
+            bail!("unknown base {name:?}; bases: {}", BASES.join(", "));
+        }
+        bail!(
+            "unknown base {name:?}; bases: {}; series: {}",
+            BASES.join(", "),
+            series.join(", ")
+        );
     }
     Ok(())
 }
@@ -246,6 +253,8 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// Registered exogenous series, accepted as bases alongside [`BASES`].
+    series: &'a [String],
 }
 
 impl Parser<'_> {
@@ -262,7 +271,7 @@ impl Parser<'_> {
             Some(Token::Ident(name)) => name,
             other => bail!("expected a base series name, found {other:?}"),
         };
-        check_base(&base)?;
+        check_base(&base, self.series)?;
         let mut transforms = Vec::new();
         while self.peek() == Some(&Token::Pipe) {
             self.pos += 1;
@@ -320,7 +329,7 @@ impl Parser<'_> {
                         Some(Token::Ident(name)) => name,
                         other => bail!("times needs a base name or ( expr ), found {other:?}"),
                     };
-                    check_base(&base)?;
+                    check_base(&base, self.series)?;
                     Expr {
                         base,
                         transforms: Vec::new(),
@@ -338,6 +347,12 @@ impl Parser<'_> {
 
 /// Parses one feature expression.
 pub fn parse(text: &str) -> Result<Expr> {
+    parse_with(text, &[])
+}
+
+/// Parses an expression whose bases may also be the named exogenous series (see
+/// [`crate::series`]), e.g. `funding_rate | zscore 300`.
+pub fn parse_with(text: &str, series: &[String]) -> Result<Expr> {
     let tokens = tokenize(text)?;
     if tokens.is_empty() {
         bail!("empty feature expression");
@@ -345,6 +360,7 @@ pub fn parse(text: &str) -> Result<Expr> {
     let mut parser = Parser {
         tokens: &tokens,
         pos: 0,
+        series,
     };
     let expr = parser.expr()?;
     if parser.pos != tokens.len() {
@@ -361,6 +377,8 @@ pub fn parse(text: &str) -> Result<Expr> {
 pub struct BarInput<'a> {
     pub bar: &'a LakeBar,
     pub previous_mid: Option<f64>,
+    /// Exogenous series values as of this bar, in the order the evaluator was given names.
+    pub exogenous: &'a [f64],
 }
 
 /// Value of a per-bar base series on this bar; `None` when the bar has no book (or for the
@@ -455,7 +473,7 @@ enum State {
 }
 
 impl State {
-    fn new(transform: &Transform, step_secs: u32) -> Self {
+    fn new(transform: &Transform, step_secs: u32, book_grid: bool, series: &[String]) -> Self {
         match transform {
             Transform::Ema(n) => State::Ema {
                 alpha: 2.0 / (*n as f64 + 1.0),
@@ -469,12 +487,16 @@ impl State {
                 window: Window::new(*n),
                 seconds: (*n as f64) * f64::from(step_secs.max(1)),
             },
-            Transform::RatioTo(inner) => State::RatioTo(Box::new(State::new(inner, step_secs))),
+            Transform::RatioTo(inner) => {
+                State::RatioTo(Box::new(State::new(inner, step_secs, book_grid, series)))
+            }
             Transform::PctRank(n) => State::PctRank(Window::new(*n)),
             Transform::Abs => State::Abs,
             Transform::Sign => State::Sign,
             Transform::Clip(lo, hi) => State::Clip(*lo, *hi),
-            Transform::Times(expr) => State::Times(Box::new(Evaluator::new(expr, step_secs))),
+            Transform::Times(expr) => State::Times(Box::new(Evaluator::for_panel(
+                expr, step_secs, book_grid, series,
+            ))),
         }
     }
 
@@ -601,6 +623,8 @@ enum BaseState {
     },
     /// `high_n_distance`: highs of the last `n` bars.
     HighDistance(Window),
+    /// A registered exogenous series: index into `BarInput::exogenous`.
+    Exogenous(usize),
 }
 
 impl Evaluator {
@@ -612,7 +636,15 @@ impl Evaluator {
     /// `book_grid` says whether the bars carry an order book. Returns then use the mid and
     /// treat a bar without a book as a gap; on an OHLCV grid they use the close.
     pub fn for_grid(expr: &Expr, step_secs: u32, book_grid: bool) -> Self {
+        Self::for_panel(expr, step_secs, book_grid, &[])
+    }
+
+    /// As [`Evaluator::for_grid`], with the registered exogenous series in the order their
+    /// values arrive in `BarInput::exogenous`.
+    pub fn for_panel(expr: &Expr, step_secs: u32, book_grid: bool, series: &[String]) -> Self {
+        let exogenous = series.iter().position(|s| *s == expr.base);
         let base_state = match (windowed_base(&expr.base), expr.base.as_str()) {
+            _ if exogenous.is_some() => BaseState::Exogenous(exogenous.unwrap_or_default()),
             (Some(("return_n", n)), _) => BaseState::ReturnN(Window::new(n + 1)),
             (Some(("high_n_distance", n)), _) => BaseState::HighDistance(Window::new(n)),
             (_, "gap_bps") => BaseState::Gap {
@@ -627,7 +659,7 @@ impl Evaluator {
             states: expr
                 .transforms
                 .iter()
-                .map(|t| State::new(t, step_secs))
+                .map(|t| State::new(t, step_secs, book_grid, series))
                 .collect(),
         }
     }
@@ -642,6 +674,7 @@ impl Evaluator {
         };
         let mut x = match &mut self.base_state {
             BaseState::Plain => base_value(&self.base, input).unwrap_or(f64::NAN),
+            BaseState::Exogenous(index) => input.exogenous.get(*index).copied().unwrap_or(f64::NAN),
             BaseState::ReturnN(window) => {
                 window.push(price);
                 match window.values.front() {
@@ -734,6 +767,7 @@ mod tests {
                 let v = eval.next(BarInput {
                     bar: b,
                     previous_mid,
+                    exogenous: &[],
                 });
                 previous_mid = b.book.map(|k| k.mid);
                 v
@@ -883,6 +917,7 @@ mod tests {
                 eval.next(BarInput {
                     bar: b,
                     previous_mid: None,
+                    exogenous: &[],
                 })
             })
             .collect();

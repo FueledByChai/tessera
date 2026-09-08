@@ -26,6 +26,26 @@ provider = "csv-folders"
 # Enables EXCHANGE:SYMBOL instruments (e.g. PARADEX:SOL-USD-PERP) and 1s/5s/30s bars.
 # lake_dir = "/path/to/lake"
 
+# Optional: exogenous series studies can use as feature bases (`cpi_surprise | zscore 12`),
+# joined to bars as-of the moment each row became observable, never its nominal date. One
+# `[[data.series]]` per file (CSV or parquet). `kind` is "level" (carried forward) or "event"
+# (the value on the first bar that sees it, zero elsewhere). Availability comes from an
+# `available_at_column` or a fixed `publication_lag_secs` after the nominal time. Funding
+# and open interest from the lake (funding_rate, funding_annualized, open_interest,
+# open_interest_usd) register on their own for lake instruments.
+# [[data.series]]
+# name = "cpi_surprise"
+# path = "/path/to/series/cpi_surprise.csv"     # columns: time,available_at,value
+# kind = "event"
+# time_column = "time"
+# value_column = "value"
+# available_at_column = "available_at"
+# [[data.series]]
+# name = "short_interest"
+# path = "/path/to/series/short_interest.csv"   # columns: time,symbol,value
+# symbol_column = "symbol"
+# publication_lag_secs = 1209600                # published two weeks after the nominal date
+
 [engine]
 # Optional: run strategies with a different engine binary, for example one built from a
 # private strategies repository. Defaults to target/release/tessera in this checkout.

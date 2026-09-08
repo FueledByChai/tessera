@@ -44,6 +44,10 @@ pub struct DataLibrary {
     /// `EXCHANGE:SYMBOL` instruments and second resolutions.
     #[serde(default)]
     pub lake_dir: Option<PathBuf>,
+    /// Exogenous series studies can use as bases, joined as-of their availability
+    /// (`[[data.series]]`; see `crate::series`).
+    #[serde(default)]
+    pub series: Vec<crate::series::SeriesSpec>,
 }
 
 fn default_calendar_symbol() -> String {
@@ -135,6 +139,7 @@ impl LocalConfig {
                 update_command: None,
                 provider: "bundled-example".to_owned(),
                 lake_dir: None,
+                series: Vec::new(),
             },
             engine: EngineConfig::default(),
             strategies: StrategyDirs::default(),
@@ -156,6 +161,9 @@ impl LocalConfig {
         }
         if let Some(path) = self.data.lake_dir.as_mut() {
             fix(path);
+        }
+        for series in &mut self.data.series {
+            fix(&mut series.path);
         }
         if let Some(path) = self.engine.path.as_mut() {
             fix(path);
@@ -214,6 +222,7 @@ mod tests {
                 update_command: None,
                 provider: "csv-folders".to_owned(),
                 lake_dir: None,
+                series: Vec::new(),
             },
             engine: EngineConfig::default(),
             strategies: StrategyDirs::default(),

@@ -92,7 +92,7 @@ OHLCV bases: `return_n`, `range_bps`, `gap_bps`, `volume | zscore n`, `high_252_
 **Done when:** a daily study of `return_1 | zscore 20` on `examples/data` runs end to end and a
 test asserts the same IC from the CSV path and from an equivalent in-memory panel.
 
-### WB-05 Exogenous series registry with availability times — `todo` — Blocked by WB-04
+### WB-05 Exogenous series registry with availability times — `done 2026-09-07 WB-05: exogenous series registry with availability times` — Blocked by WB-04
 `local.toml [[data.series]]`: name, path (CSV or parquet), kind `level` or `event`, optional
 symbol column, and an `available_at` column or a fixed publication lag. Studies join series as-of
 the bar's time using availability, never the nominal date. Funding and open interest from the
@@ -148,6 +148,14 @@ a CSV grid is chosen, pick CSV symbols from the catalog with the run form's inst
 and pre-tick the OHLCV set (`return_1`, `range_bps`, `gap_bps`, `high_252_distance`).
 **Done when:** the browser check selects the daily grid and finds no order-book checkbox and a
 catalog-backed symbol picker; a submitted daily study reports nothing unavailable.
+
+### WB-13 Studies form lists the registered series — `todo` — Blocked by WB-05
+Series from `[[data.series]]` and the lake side feeds (funding_rate, funding_annualized,
+open_interest, open_interest_usd) are usable as bases but only appear in the expression hint;
+the form should list them as feature checkboxes with their kind and availability rule, from a
+`GET /api/studies/series` endpoint, and grey out lake feeds on CSV grids.
+**Done when:** the browser check on the studies form finds a checkbox per registered series and
+a lake study submitted from it with `funding_rate` ticked produces that cell.
 
 ## Housekeeping
 

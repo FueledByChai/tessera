@@ -4431,9 +4431,20 @@ fn validate_study_request(
             Some(text) if !text.is_empty() => tessera::study::Target::parse(text)?,
             _ => tessera::study::Target::default(),
         },
+        series: data.series.clone(),
+        lake_series: true,
     };
+    // Bases may be declared series, plus the lake side feeds on the lake grid.
+    let mut names: Vec<String> = data.series.iter().map(|s| s.name.clone()).collect();
+    if grid.has_book() {
+        names.extend(
+            tessera::study::LAKE_SERIES
+                .iter()
+                .map(|(n, _, _)| (*n).to_owned()),
+        );
+    }
     for feature in &config.features {
-        tessera::feature_expr::parse(feature)
+        tessera::feature_expr::parse_with(feature, &names)
             .with_context(|| format!("feature expression {feature:?}"))?;
     }
     Ok((config, start, end))

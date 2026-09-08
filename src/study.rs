@@ -31,6 +31,7 @@ use crate::feature_expr::{self, BarInput, Evaluator};
 use crate::lake::{self, LakeSymbol};
 use crate::sdk::runner::{SessionKind, load_daily, load_intraday, sanitize_daily};
 use crate::sdk::strategy::Bar;
+use crate::series::{Series, SeriesKind, SeriesSpec};
 
 /// The default feature set: the plain base series a study runs when none are given.
 pub const FEATURES: &[&str] = &[
@@ -83,6 +84,97 @@ pub struct StudyConfig {
     /// What every feature is scored against over the horizon (default `return`).
     #[serde(default)]
     pub target: Target,
+    /// Exogenous series usable as bases, joined as-of availability (`[[data.series]]` in
+    /// `local.toml`, or inline here). Relative paths resolve against the working directory.
+    #[serde(default)]
+    pub series: Vec<SeriesSpec>,
+    /// On the lake grid, register funding and open interest for every symbol (default on).
+    #[serde(default = "default_true")]
+    pub lake_series: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The side feeds every lake instrument registers as series when `lake_series` is on: the
+/// base name, the lake feed, and its column. Availability is the receive timestamp.
+pub const LAKE_SERIES: [(&str, &str, &str); 4] = [
+    ("funding_rate", "funding", "fundingRate"),
+    ("funding_annualized", "funding", "annualizedRate"),
+    ("open_interest", "open_interest", "openInterest"),
+    ("open_interest_usd", "open_interest", "openInterestUsd"),
+];
+
+/// Funding and open interest for the lake symbols, one series per name, as-of receipt.
+pub fn lake_series(
+    lake_dir: &Path,
+    symbols: &[String],
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<Series>> {
+    let mut out = Vec::new();
+    for (name, feed, column) in LAKE_SERIES {
+        let mut observations = Vec::new();
+        for symbol in symbols {
+            let Some(sym) = LakeSymbol::parse(symbol) else {
+                continue;
+            };
+            for value in lake::read_feed_values(lake_dir, &sym, feed, column, start, end)? {
+                observations.push(crate::series::Observation {
+                    nominal_us: value.event_us,
+                    available_us: value.recv_us,
+                    symbol: Some(symbol.clone()),
+                    value: value.value,
+                });
+            }
+        }
+        if !observations.is_empty() {
+            out.push(Series::new(name, SeriesKind::Level, observations));
+        }
+    }
+    Ok(out)
+}
+
+/// The instant a bar closes, microseconds UTC: lake bars are stamped at their start in UTC;
+/// CSV bars carry New York wall time (daily bars close at 16:00).
+pub fn bar_close_us(bar: &lake::LakeBar, grid: Grid) -> i64 {
+    use chrono::TimeZone;
+    match grid {
+        Grid::Lake { step_secs } => {
+            bar.date.and_time(bar.time).and_utc().timestamp_micros()
+                + i64::from(step_secs) * 1_000_000
+        }
+        Grid::Daily => {
+            let close = bar.date.and_hms_opt(16, 0, 0).expect("valid time");
+            chrono_tz::America::New_York
+                .from_local_datetime(&close)
+                .single()
+                .map(|t| t.timestamp_micros())
+                .unwrap_or_else(|| close.and_utc().timestamp_micros())
+        }
+        Grid::FiveMinute | Grid::OneMinute => {
+            let start = bar.date.and_time(bar.time);
+            chrono_tz::America::New_York
+                .from_local_datetime(&start)
+                .single()
+                .map(|t| t.timestamp_micros())
+                .unwrap_or_else(|| start.and_utc().timestamp_micros())
+                + i64::from(grid.step_secs()) * 1_000_000
+        }
+    }
+}
+
+/// Every registered series aligned to one symbol's bars, series-major, as the evaluator
+/// reads them.
+pub fn align_series(
+    grid: Grid,
+    symbol: &str,
+    bars: &[lake::LakeBar],
+    series: &[Series],
+) -> Vec<Vec<f64>> {
+    let closes: Vec<i64> = bars.iter().map(|bar| bar_close_us(bar, grid)).collect();
+    series.iter().map(|s| s.align(symbol, &closes)).collect()
 }
 
 /// The forward quantity a feature is scored against: IC, deciles, and the costless curve all
@@ -550,6 +642,8 @@ pub struct StudyResult {
     pub target_unit: String,
     /// The bar grid: `1s`, `daily`, `5m`, or `1m`.
     pub grid: String,
+    /// Exogenous series that were registered for this study, usable as bases.
+    pub series: Vec<String>,
     /// Features that could not run on this grid, with the reason, instead of failing.
     pub unavailable: Vec<UnavailableFeature>,
     pub start: NaiveDate,
@@ -646,9 +740,18 @@ fn evaluate_symbol(
     grid: Grid,
     symbol: &str,
     bars: &[lake::LakeBar],
+    series: &[Series],
 ) -> Result<SymbolSeries> {
-    let (_, features, bars_with_book) =
-        evaluate_features(features, grid.step_secs(), bars, grid.has_book())?;
+    let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
+    let exogenous = align_series(grid, symbol, bars, series);
+    let (_, features, bars_with_book) = evaluate_features_with(
+        features,
+        grid.step_secs(),
+        bars,
+        grid.has_book(),
+        &names,
+        &exogenous,
+    )?;
     Ok(SymbolSeries {
         symbol: symbol.to_owned(),
         book: TargetSeries::from_bars(bars, grid),
@@ -661,21 +764,36 @@ fn evaluate_symbol(
 /// Runs every feature expression over the bars in one streaming pass. Returns the mid series
 /// (`NaN` where the bar has no book), the feature matrix, and the count of bars with a book.
 /// `book_grid` says whether returns read the mid (a bar without a book is a gap) or the close.
+#[cfg(test)]
 fn evaluate_features(
     expressions: &[String],
     step_secs: u32,
     bars: &[lake::LakeBar],
     book_grid: bool,
 ) -> Result<(Vec<f64>, BTreeMap<String, Vec<f64>>, usize)> {
+    evaluate_features_with(expressions, step_secs, bars, book_grid, &[], &[])
+}
+
+/// As [`evaluate_features`], with exogenous series (names, and values aligned to the bars,
+/// series-major) available as bases.
+fn evaluate_features_with(
+    expressions: &[String],
+    step_secs: u32,
+    bars: &[lake::LakeBar],
+    book_grid: bool,
+    series_names: &[String],
+    exogenous: &[Vec<f64>],
+) -> Result<(Vec<f64>, BTreeMap<String, Vec<f64>>, usize)> {
     let mut evaluators = Vec::with_capacity(expressions.len());
     for text in expressions {
-        let expr =
-            feature_expr::parse(text).with_context(|| format!("feature expression {text:?}"))?;
+        let expr = feature_expr::parse_with(text, series_names)
+            .with_context(|| format!("feature expression {text:?}"))?;
         evaluators.push((
             text.clone(),
-            Evaluator::for_grid(&expr, step_secs, book_grid),
+            Evaluator::for_panel(&expr, step_secs, book_grid, series_names),
         ));
     }
+    let mut row = vec![f64::NAN; exogenous.len()];
     let mut mids = Vec::with_capacity(bars.len());
     let mut features: BTreeMap<String, Vec<f64>> = expressions
         .iter()
@@ -683,8 +801,15 @@ fn evaluate_features(
         .collect();
     let mut bars_with_book = 0;
     let mut previous_mid = None;
-    for bar in bars {
-        let input = BarInput { bar, previous_mid };
+    for (index, bar) in bars.iter().enumerate() {
+        for (slot, values) in row.iter_mut().zip(exogenous) {
+            *slot = values.get(index).copied().unwrap_or(f64::NAN);
+        }
+        let input = BarInput {
+            bar,
+            previous_mid,
+            exogenous: &row,
+        };
         for (name, evaluator) in &mut evaluators {
             let value = evaluator.next(input);
             if let Some(values) = features.get_mut(name) {
@@ -863,8 +988,14 @@ pub fn run(
         bail!("the study needs at least one symbol");
     }
     let grid = config.grid()?;
+    let mut series = declared_series(config)?;
+    if grid.has_book() && config.lake_series && !config.lake_dir.as_os_str().is_empty() {
+        series.extend(lake_series(&config.lake_dir, &config.symbols, start, end)?);
+    }
+    let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
     for feature in &config.features {
-        feature_expr::parse(feature).with_context(|| format!("feature expression {feature:?}"))?;
+        feature_expr::parse_with(feature, &names)
+            .with_context(|| format!("feature expression {feature:?}"))?;
     }
     eprintln!(
         "progress: load 0/{} symbols elapsed=0s",
@@ -880,7 +1011,17 @@ pub fn run(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    run_on_panel(config, panel, start, end, output_dir)
+    run_on_panel_with_series(config, panel, series, start, end, output_dir)
+}
+
+/// The series declared in the config, loaded from their files.
+fn declared_series(config: &StudyConfig) -> Result<Vec<Series>> {
+    let root = std::env::current_dir().unwrap_or_default();
+    config
+        .series
+        .iter()
+        .map(|spec| Series::load(spec, &root))
+        .collect()
 }
 
 /// The study over bars already in memory, one series per symbol, on the config's grid. Every
@@ -893,7 +1034,22 @@ pub fn run_on_panel(
     end: NaiveDate,
     output_dir: &Path,
 ) -> Result<StudyResult> {
+    let series = declared_series(config)?;
+    run_on_panel_with_series(config, panel, series, start, end, output_dir)
+}
+
+/// [`run_on_panel`] with the exogenous series already loaded (declared files, lake side
+/// feeds, or anything built in memory).
+pub fn run_on_panel_with_series(
+    config: &StudyConfig,
+    panel: Vec<(String, Vec<lake::LakeBar>)>,
+    series: Vec<Series>,
+    start: NaiveDate,
+    end: NaiveDate,
+    output_dir: &Path,
+) -> Result<StudyResult> {
     let grid = config.grid()?;
+    let series_names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
     let started = std::time::Instant::now();
     fs::create_dir_all(output_dir)?;
     let has_book = grid.has_book();
@@ -912,8 +1068,8 @@ pub fn run_on_panel(
     let mut features = Vec::new();
     let mut unavailable = Vec::new();
     for text in &config.features {
-        let expr =
-            feature_expr::parse(text).with_context(|| format!("feature expression {text:?}"))?;
+        let expr = feature_expr::parse_with(text, &series_names)
+            .with_context(|| format!("feature expression {text:?}"))?;
         if !has_book && feature_expr::needs_book(&expr) {
             unavailable.push(UnavailableFeature {
                 feature: text.clone(),
@@ -926,9 +1082,10 @@ pub fn run_on_panel(
             features.push(text.clone());
         }
     }
+    let exogenous = series;
     let series: Vec<SymbolSeries> = panel
         .par_iter()
-        .map(|(symbol, bars)| evaluate_symbol(&features, grid, symbol, bars))
+        .map(|(symbol, bars)| evaluate_symbol(&features, grid, symbol, bars, &exogenous))
         .collect::<Result<Vec<_>>>()?;
     eprintln!(
         "progress: load {}/{} symbols loaded elapsed={}s",
@@ -998,6 +1155,7 @@ pub fn run_on_panel(
         target: config.target,
         target_unit: config.target.unit().to_owned(),
         grid: grid.label(),
+        series: series_names,
         unavailable,
         start,
         end,
@@ -1074,6 +1232,9 @@ pub fn summary_table(result: &StudyResult) -> String {
         result.grid,
         result.target.name()
     );
+    if !result.series.is_empty() {
+        let _ = writeln!(out, "series: {}", result.series.join(", "));
+    }
     for skipped in &result.unavailable {
         let _ = writeln!(out, "{}: {}", skipped.feature, skipped.reason);
     }
@@ -1391,6 +1552,8 @@ mod tests {
             decision_delay_bars: 1,
             buckets: 10,
             target: Target::Return,
+            series: Vec::new(),
+            lake_series: true,
         };
         let start = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
@@ -1449,6 +1612,160 @@ mod tests {
         );
         assert_eq!(spearman(&xs, &ys), csv_cell(5).ic);
         let _ = fs::remove_dir_all(&out);
+    }
+
+    /// A series joins a daily panel as-of availability: the bar before the release cannot see
+    /// the value, the bar after can, and expressions read it like any other base.
+    #[test]
+    fn series_join_as_of_availability_on_a_daily_panel() {
+        let bars = daily_bars(&[
+            (100.0, 101.0, 99.0, 100.0, 1000.0),
+            (100.5, 103.0, 100.0, 102.0, 1100.0),
+            (101.0, 102.0, 100.0, 101.0, 900.0),
+            (101.5, 105.0, 101.0, 104.0, 1200.0),
+            (103.0, 104.0, 102.0, 103.0, 1000.0),
+            (103.0, 104.0, 102.0, 103.5, 1000.0),
+        ]);
+        // Bars are 2024-01-01 .. 2024-01-06; the value is for the 3rd, published on the 5th.
+        let published = NaiveDate::from_ymd_opt(2024, 1, 5)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        let macro_series = Series::new(
+            "macro",
+            SeriesKind::Level,
+            vec![crate::series::Observation {
+                nominal_us: published - 2 * 86_400 * 1_000_000,
+                available_us: published,
+                symbol: None,
+                value: 7.0,
+            }],
+        );
+        let aligned = align_series(
+            Grid::Daily,
+            "DEMO.US",
+            &bars,
+            std::slice::from_ref(&macro_series),
+        );
+        assert_eq!(aligned.len(), 1);
+        assert!(
+            aligned[0][2].is_nan() && aligned[0][3].is_nan(),
+            "the 3rd and 4th cannot see it"
+        );
+        assert_eq!(aligned[0][4], 7.0, "the 5th's close can");
+        assert_eq!(aligned[0][5], 7.0, "and it carries forward");
+        // Daily bars close at 16:00 New York, after a midnight-UTC release the same day.
+        let close = bar_close_us(&bars[4], Grid::Daily);
+        assert!(close > published && close - published == 21 * 3_600 * 1_000_000);
+        let names = vec!["macro".to_owned()];
+        let (_, features, _) = evaluate_features_with(
+            &["macro".to_owned(), "macro | times close".to_owned()],
+            86_400,
+            &bars,
+            false,
+            &names,
+            &aligned,
+        )
+        .unwrap();
+        assert!(features["macro"][3].is_nan() && features["macro"][4] == 7.0);
+        assert_eq!(features["macro | times close"][4], 7.0 * 103.0);
+        assert!(
+            feature_expr::parse("macro").is_err(),
+            "unregistered names still fail"
+        );
+        assert!(feature_expr::parse_with("macro | zscore 3", &names).is_ok());
+        assert!(!feature_expr::needs_book(
+            &feature_expr::parse_with("macro", &names).unwrap()
+        ));
+    }
+
+    /// The done line's second half: a funding rate registered for a lake instrument is a base
+    /// in a SOL study and produces cells.
+    #[test]
+    fn funding_rate_is_a_base_in_a_sol_study() {
+        let bars = synthetic_grid();
+        let grid = Grid::Lake { step_secs: 1 };
+        // Funding ticks every 300 bars, received 5 s after its event time, for this symbol.
+        let observations: Vec<crate::series::Observation> = (0..bars.len())
+            .step_by(300)
+            .enumerate()
+            .map(|(k, i)| {
+                let event_us = bar_close_us(&bars[i], grid) - 1_000_000;
+                crate::series::Observation {
+                    nominal_us: event_us,
+                    available_us: event_us + 5_000_000,
+                    symbol: Some("BINANCE_FUTURES:SOLUSDT".to_owned()),
+                    value: 1e-4 * (if k % 2 == 0 { 1.0 } else { -1.0 }),
+                }
+            })
+            .collect();
+        let funding = Series::new("funding_rate", SeriesKind::Level, observations);
+        let config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: vec!["BINANCE_FUTURES:SOLUSDT".to_owned()],
+            step_secs: 1,
+            resolution: None,
+            daily_dir: PathBuf::new(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: None,
+            session: SessionKind::Regular,
+            features: vec![
+                "funding_rate".to_owned(),
+                "funding_rate | diff 1".to_owned(),
+            ],
+            horizons: vec![5],
+            decision_delay_bars: 1,
+            buckets: 10,
+            target: Target::Return,
+            series: Vec::new(),
+            lake_series: false,
+        };
+        let out = std::env::temp_dir().join(format!("tessera-wb05-study-{}", std::process::id()));
+        let result = run_on_panel_with_series(
+            &config,
+            vec![("BINANCE_FUTURES:SOLUSDT".to_owned(), bars.clone())],
+            vec![funding],
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            &out,
+        )
+        .unwrap();
+        assert_eq!(result.series, vec!["funding_rate"]);
+        let cell = result
+            .cells
+            .iter()
+            .find(|c| c.feature == "funding_rate")
+            .unwrap();
+        assert!(cell.observations > 2_000 && cell.ic.is_finite(), "{cell:?}");
+        assert!(summary_table(&result).contains("series: funding_rate"));
+        // A different symbol sees nothing of it: every value NaN, so no cell.
+        let other = run_on_panel_with_series(
+            &config,
+            vec![("PARADEX:SOL-USD-PERP".to_owned(), bars.clone())],
+            vec![Series::new(
+                "funding_rate",
+                SeriesKind::Level,
+                result_observations_for_binance(),
+            )],
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+            &out.join("other"),
+        )
+        .unwrap();
+        assert!(other.cells.is_empty());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    fn result_observations_for_binance() -> Vec<crate::series::Observation> {
+        vec![crate::series::Observation {
+            nominal_us: 0,
+            available_us: 0,
+            symbol: Some("BINANCE_FUTURES:SOLUSDT".to_owned()),
+            value: 1e-4,
+        }]
     }
 
     /// The pre-expression feature switch, kept as the parity reference for the eight names.

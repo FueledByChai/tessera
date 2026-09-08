@@ -1482,8 +1482,10 @@ type StudyCurve = {
 };
 type StudyResult = {
   config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number; target?: string; resolution?: string };
-  // The bar grid (`1s`, `daily`, `5m`, `1m`) and the features that could not run on it.
+  // The bar grid (`1s`, `daily`, `5m`, `1m`), the registered exogenous series, and the
+  // features that could not run on it.
   grid?: string;
+  series?: string[];
   unavailable?: { feature: string; reason: string }[];
   // The forward quantity every cell is scored against and its unit (absent on older results).
   target?: string;
@@ -1818,7 +1820,9 @@ function StudiesWorkspace() {
                     One per line: a base (obi_l1, obi_l5, obi_l10, microprice_bps, spread_bps, trade_imbalance,
                     return_n, signed_volume, bid, ask, mid, microprice, bid_size, ask_size, bid_depth_l5,
                     ask_depth_l5, trade_count, buy_volume, sell_volume, volume, close, range_bps, gap_bps,
-                    high_n_distance; return_n and high_n_distance take any window) then transforms:
+                    high_n_distance; return_n and high_n_distance take any window; on the lake also
+                    funding_rate, funding_annualized, open_interest, open_interest_usd, plus any series
+                    registered in local.toml) then transforms:
                     ema n, sma n, zscore n, diff n, lag n, rate n, ratio_to &lt;transform&gt;, pct_rank n, abs,
                     sign, clip lo hi, times &lt;base | (expr)&gt;.
                   </small>
@@ -1878,6 +1882,9 @@ function StudiesWorkspace() {
                 <span>{result.start} → {result.end} · {resultGrid} grid · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
                 <span>{result.symbols.map((s) => `${s.symbol} ${(s.bars_with_book || s.bars).toLocaleString()} bars`).join(" · ")}</span>
               </div>
+              {result.series && result.series.length > 0 && (
+                <p className="footnote">Series available as bases, joined as-of availability: {result.series.join(", ")}.</p>
+              )}
               {result.unavailable && result.unavailable.length > 0 && (
                 <p className="footnote">{result.unavailable.map((u) => `${u.feature}: ${u.reason}`).join(" · ")}</p>
               )}

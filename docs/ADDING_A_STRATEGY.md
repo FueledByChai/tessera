@@ -129,6 +129,17 @@ Bases: `obi_l1`, `obi_l5`, `obi_l10`, `microprice_bps`, `spread_bps`, `trade_imb
 bps, never above zero); `range_bps` is the bar's high-low range over its close; `gap_bps` is the
 open against the previous close.
 
+**Exogenous series.** Anything observed outside the bar stream joins a study as a base:
+declare it under `[[data.series]]` in `local.toml` (name, CSV or parquet path, `kind` of
+`level` or `event`, the time and value columns, an optional `symbol_column`, and either an
+`available_at_column` or a fixed `publication_lag_secs`), and write `cpi_surprise | zscore 12`
+like any other feature. Rows join each bar as-of the moment they became observable, never their
+nominal date: a value for the 3rd published on the 5th is invisible on the 3rd and 4th. `level`
+series carry forward; `event` series are the value on the first bar that sees them and zero
+elsewhere. Lake instruments register `funding_rate`, `funding_annualized`, `open_interest`, and
+`open_interest_usd` on their own, available at the receive timestamp. The result lists the
+series it had; the CLI prints them under the grid line.
+
 **Grids.** A study runs on tick-built lake bars (`step_secs`, the default) or, with
 `resolution = "daily"`, `"5m"`, or `"1m"`, on CSV bars read through the same SDK loaders a
 backtest uses (daily prints sanitized against `calendar_symbol`, intraday prints in the regular

@@ -6,6 +6,7 @@ pub mod local_config;
 pub mod portfolio;
 pub mod report;
 pub mod sdk;
+pub mod series;
 pub mod strategies;
 pub mod strategy;
 pub mod study;
