@@ -129,6 +129,22 @@ Bases: `obi_l1`, `obi_l5`, `obi_l10`, `microprice_bps`, `spread_bps`, `trade_imb
 bps, never above zero); `range_bps` is the bar's high-low range over its close; `gap_bps` is the
 open against the previous close.
 
+**Aggregation and lifting.** On an intraday grid `agg daily` is a running intraday feature
+(today's volume so far, today's realized variance so far). On the daily grid it lifts: with
+`intraday_source = "1m"` (or `"5m"`; the service picks the finest library present) each
+`agg daily` feature is computed on that intraday panel of the same symbol and the day's final
+value lands on the daily bar, so a daily study can score `return_1 | agg daily realized_var`
+built from minute bars. Without a source such features are reported unavailable on the daily
+grid. Slow series ride fast grids the other way round, by the `level` forward fill of the
+series registry.
+
+**Event studies.** Every registered `event` series gets an event study in the result (and
+`events.csv`): for each event bar (the first bar that could see the row) the cumulative return
+from the event bar to each offset in `-event_window ..= +event_window` (default 20 bars),
+averaged over events with a full window, with a t-statistic and count per offset. The path is
+normalised to zero at the event, so a run-in shows as negative values climbing to zero and
+post-event drift as the values after it. The studies page lists it under EVT.
+
 **Cross-sectional mode.** `mode = "cross_sectional"` (the form's Mode select) reads a
 many-symbol panel across symbols instead of along time: on every date with at least `buckets`
 symbols, the feature is ranked across symbols against their targets, giving an IC per date
@@ -176,7 +192,9 @@ decision_delay_bars = 1
 ```
 Transforms: `ema n`, `sma n`, `zscore n`, `diff n`, `lag n`, `rate n` (sum over `n` bars per
 second), `ratio_to <transform>` (the value over a transform of itself), `pct_rank n`, `abs`,
-`sign`, `clip lo hi`, `times <base | (expr)>`. Windows count bars; a bar without a book is `NaN`
+`sign`, `clip lo hi`, `times <base | (expr)>`, `agg daily sum|mean|last|realized_var` (the
+day's fold so far, resetting when the bar's date changes; `return_1 | agg daily realized_var`
+is the session's realized variance in bps²). Windows count bars; a bar without a book is `NaN`
 and a `NaN` inside a window propagates, so a lag is always a lag in bars. Unknown names fail with
 the list of what exists. The grammar lives in `src/feature_expr.rs`.
 

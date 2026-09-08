@@ -1490,6 +1490,8 @@ type StudyResult = {
   // features that could not run on it.
   grid?: string;
   series?: string[];
+  // One event study per registered event series: the mean price path around its events.
+  events?: { series: string; window: number; events: number; points: { offset: number; mean_bps: number | null; t: number | null; count: number }[] }[];
   unavailable?: { feature: string; reason: string }[];
   // The forward quantity every cell is scored against and its unit (absent on older results).
   target?: string;
@@ -1836,7 +1838,8 @@ function StudiesWorkspace() {
                     ask_depth_l5, trade_count, buy_volume, sell_volume, volume, close, range_bps, gap_bps,
                     high_n_distance; return_n and high_n_distance take any window; on the lake also
                     funding_rate, funding_annualized, open_interest, open_interest_usd, plus any series
-                    registered in local.toml) then transforms:
+                    registered in local.toml) then transforms (agg daily sum|mean|last|realized_var folds
+                    a day; on the daily grid it lifts from the intraday library):
                     ema n, sma n, zscore n, diff n, lag n, rate n, ratio_to &lt;transform&gt;, pct_rank n, abs,
                     sign, clip lo hi, times &lt;base | (expr)&gt;.
                   </small>
@@ -1985,6 +1988,25 @@ function StudiesWorkspace() {
               ) : (
                 <div className="empty-state">No breakeven costs in this study; run it again on the current engine.</div>
               )}
+              {result.events?.map((study) => (
+                <div key={study.series}>
+                  <div className="terminal-panel-title">
+                    <span>EVT</span> EVENT PATH · {study.series} · {study.events.toLocaleString()} events · ±{study.window} bars
+                  </div>
+                  <div className="table-wrap"><table className="event-path">
+                    <thead><tr><th>Offset</th><th>Mean path (bps)</th><th>t</th><th>Count</th></tr></thead>
+                    <tbody>{study.points.filter((p) => study.window <= 10 || p.offset % 5 === 0 || Math.abs(p.offset) <= 2).map((p) => (
+                      <tr key={p.offset} className={p.offset === 0 ? "active" : ""}>
+                        <td>{p.offset > 0 ? `+${p.offset}` : p.offset}</td>
+                        <td className={classFor(finite(p.mean_bps) ?? undefined)}>{signed(p.mean_bps, 2)}</td>
+                        <td>{signed(p.t, 1)}</td>
+                        <td>{p.count.toLocaleString()}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table></div>
+                  <p className="footnote">Cumulative return from the event bar to each offset, averaged over events and normalised to zero at the event; negative offsets show the run-in. Offsets within two bars of the event and every fifth bar are listed.</p>
+                </div>
+              ))}
             </>
           )}
         </section>

@@ -128,7 +128,38 @@ pub const TRANSFORMS: &[&str] = &[
     "sign",
     "clip lo hi",
     "times <base | (expr)>",
+    "agg daily sum|mean|last|realized_var",
 ];
+
+/// How `agg daily` folds a day's values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggOp {
+    Sum,
+    Mean,
+    Last,
+    /// Sum of squares: on `return_1` (bps) the day's realized variance in bps squared.
+    RealizedVar,
+}
+
+impl AggOp {
+    pub fn name(self) -> &'static str {
+        match self {
+            AggOp::Sum => "sum",
+            AggOp::Mean => "mean",
+            AggOp::Last => "last",
+            AggOp::RealizedVar => "realized_var",
+        }
+    }
+    fn parse(text: &str) -> Result<AggOp> {
+        Ok(match text {
+            "sum" => AggOp::Sum,
+            "mean" => AggOp::Mean,
+            "last" => AggOp::Last,
+            "realized_var" | "rv" => AggOp::RealizedVar,
+            other => bail!("agg daily needs sum, mean, last, or realized_var, found {other:?}"),
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transform {
@@ -148,6 +179,9 @@ pub enum Transform {
     Clip(f64, f64),
     /// Multiply by another expression evaluated on the same bar.
     Times(Box<Expr>),
+    /// The day's aggregate so far (resets when the bar's date changes): `agg daily sum`. On
+    /// a daily study with an intraday source, the day's final value lifts onto the daily bar.
+    Agg(AggOp),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,8 +211,19 @@ impl fmt::Display for Transform {
                     write!(f, "times ({expr})")
                 }
             }
+            Transform::Agg(op) => write!(f, "agg daily {}", op.name()),
         }
     }
+}
+
+/// Whether the expression folds values by day anywhere (`agg daily ...`), which on a daily
+/// study means it wants an intraday source to lift from.
+pub fn has_daily_agg(expr: &Expr) -> bool {
+    expr.transforms.iter().any(|t| match t {
+        Transform::Agg(_) => true,
+        Transform::Times(inner) => has_daily_agg(inner),
+        _ => false,
+    })
 }
 
 impl fmt::Display for Expr {
@@ -304,6 +349,18 @@ impl Parser<'_> {
             "lag" => Transform::Lag(self.window("lag")?),
             "rate" => Transform::Rate(self.window("rate")?),
             "pct_rank" => Transform::PctRank(self.window("pct_rank")?),
+            "agg" => {
+                match self.next() {
+                    Some(Token::Ident(bucket)) if bucket == "daily" => {}
+                    other => bail!("agg needs the bucket 'daily', found {other:?}"),
+                }
+                match self.next() {
+                    Some(Token::Ident(op)) => Transform::Agg(AggOp::parse(&op)?),
+                    other => {
+                        bail!("agg daily needs sum, mean, last, or realized_var, found {other:?}")
+                    }
+                }
+            }
             "abs" => Transform::Abs,
             "sign" => Transform::Sign,
             "clip" => {
@@ -470,6 +527,15 @@ enum State {
     Sign,
     Clip(f64, f64),
     Times(Box<Evaluator>),
+    /// The running day fold: resets when the bar's date changes.
+    Agg {
+        op: AggOp,
+        day: Option<chrono::NaiveDate>,
+        sum: f64,
+        sum_squares: f64,
+        count: usize,
+        last: f64,
+    },
 }
 
 impl State {
@@ -494,6 +560,14 @@ impl State {
             Transform::Abs => State::Abs,
             Transform::Sign => State::Sign,
             Transform::Clip(lo, hi) => State::Clip(*lo, *hi),
+            Transform::Agg(op) => State::Agg {
+                op: *op,
+                day: None,
+                sum: 0.0,
+                sum_squares: 0.0,
+                count: 0,
+                last: f64::NAN,
+            },
             Transform::Times(expr) => State::Times(Box::new(Evaluator::for_panel(
                 expr, step_secs, book_grid, series,
             ))),
@@ -580,6 +654,37 @@ impl State {
                     at_or_below as f64 / window.size as f64
                 } else {
                     f64::NAN
+                }
+            }
+            State::Agg {
+                op,
+                day,
+                sum,
+                sum_squares,
+                count,
+                last,
+            } => {
+                if *day != Some(input.bar.date) {
+                    *day = Some(input.bar.date);
+                    *sum = 0.0;
+                    *sum_squares = 0.0;
+                    *count = 0;
+                    *last = f64::NAN;
+                }
+                if x.is_finite() {
+                    *sum += x;
+                    *sum_squares += x * x;
+                    *count += 1;
+                    *last = x;
+                }
+                if *count == 0 {
+                    return f64::NAN;
+                }
+                match op {
+                    AggOp::Sum => *sum,
+                    AggOp::Mean => *sum / *count as f64,
+                    AggOp::Last => *last,
+                    AggOp::RealizedVar => *sum_squares,
                 }
             }
             State::Abs => x.abs(),

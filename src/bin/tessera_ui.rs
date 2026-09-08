@@ -4244,6 +4244,9 @@ struct CreateStudyRequest {
     /// `time_series` (default) or `cross_sectional`.
     #[serde(default)]
     mode: Option<String>,
+    /// Bars either side of an event in the event-study path (default 20).
+    #[serde(default)]
+    event_window: Option<usize>,
     /// `return` (default), `realized_variance`, `abs_move`, `spread_change`,
     /// `fair_value_residual`, or `microprice_residual`.
     #[serde(default)]
@@ -4440,6 +4443,15 @@ fn validate_study_request(
             Some(text) => tessera::study::StudyMode::parse(text)?,
             None => tessera::study::StudyMode::default(),
         },
+        // `agg daily` features on the daily grid lift from the finest intraday library present.
+        intraday_source: if data.one_minute_dir.is_dir() {
+            Some("1m".to_owned())
+        } else if data.five_minute_dir.is_dir() {
+            Some("5m".to_owned())
+        } else {
+            None
+        },
+        event_window: request.event_window.unwrap_or(20).clamp(1, 500),
     };
     // Bases may be declared series, plus the lake side feeds on the lake grid.
     let mut names: Vec<String> = data.series.iter().map(|s| s.name.clone()).collect();

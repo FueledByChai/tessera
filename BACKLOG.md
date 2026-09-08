@@ -107,7 +107,7 @@ mean and t across dates, and a costless long-short decile portfolio with its equ
 **Done when:** a synthetic panel where the feature is the next-day return gives IC near 1 and the
 long-short curve is monotone; the UI offers `time-series` and `cross-sectional` modes.
 
-### WB-07 Aggregation transforms and event studies — `todo` — Blocked by WB-05
+### WB-07 Aggregation transforms and event studies — `done 2026-09-07 WB-07: aggregation transforms and event studies` — Blocked by WB-05
 `agg daily sum|mean|last|realized_var` lifts intraday series to the daily grid; slow series ride
 fast grids by forward fill. For `event` series: average forward and backward return path around
 events with counts and t per offset.

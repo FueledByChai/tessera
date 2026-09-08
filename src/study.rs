@@ -96,6 +96,18 @@ pub struct StudyConfig {
     /// their targets, IC per date, and a long-short decile portfolio. See [`StudyMode`].
     #[serde(default)]
     pub mode: StudyMode,
+    /// On the daily grid, the intraday CSV grid (`1m` or `5m`) that `agg daily ...` features
+    /// are computed on before lifting each day's final value onto the daily bar. Absent means
+    /// such features are reported unavailable on the daily grid.
+    #[serde(default)]
+    pub intraday_source: Option<String>,
+    /// Bars before and after an event in the event-study path (default 20).
+    #[serde(default = "default_event_window")]
+    pub event_window: usize,
+}
+
+fn default_event_window() -> usize {
+    20
 }
 
 /// How a study reads the panel: along time within each symbol, or across symbols per date.
@@ -704,6 +716,104 @@ pub struct StudyResult {
     pub end: NaiveDate,
     pub symbols: Vec<SymbolCoverage>,
     pub cells: Vec<StudyCell>,
+    /// One event study per registered `event` series: the mean price path around its events.
+    pub events: Vec<EventStudy>,
+}
+
+/// The average cumulative return path around the events of one series, normalised to zero
+/// at the event bar: offset -5 is the return from five bars before the event to the event
+/// bar, so a run-up shows as negative values climbing to zero; offset +10 is the return from
+/// the event bar to ten bars later.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventStudy {
+    pub series: String,
+    /// Bars either side of the event.
+    pub window: usize,
+    /// Events with a full window of bars on both sides, across all symbols.
+    pub events: usize,
+    pub points: Vec<EventPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventPoint {
+    pub offset: i64,
+    /// Mean cumulative return from the event bar to this offset, bps.
+    pub mean_bps: f64,
+    /// Mean over its standard error across events.
+    pub t: f64,
+    pub count: usize,
+}
+
+/// The event study of one `event` series over the panel: each symbol's events are the bars
+/// on which a row first became visible; the path uses the symbol's mid (close on OHLCV grids).
+pub fn event_study(
+    grid: Grid,
+    panel: &[(String, Vec<lake::LakeBar>)],
+    series: &Series,
+    window: usize,
+) -> EventStudy {
+    let offsets: Vec<i64> = (-(window as i64)..=window as i64).collect();
+    let mut paths: Vec<Vec<f64>> = vec![Vec::new(); offsets.len()];
+    let mut events = 0usize;
+    for (symbol, bars) in panel {
+        let landed = series.align(
+            symbol,
+            &bars
+                .iter()
+                .map(|b| bar_close_us(b, grid))
+                .collect::<Vec<_>>(),
+        );
+        let prices = TargetSeries::from_bars(bars, grid).mids;
+        for (e, value) in landed.iter().enumerate() {
+            if !(value.is_finite() && *value != 0.0) {
+                continue;
+            }
+            if e < window || e + window >= bars.len() {
+                continue;
+            }
+            let anchor = prices[e];
+            if !(anchor.is_finite() && anchor > 0.0) {
+                continue;
+            }
+            events += 1;
+            for (k, offset) in offsets.iter().enumerate() {
+                let index = (e as i64 + offset) as usize;
+                let price = prices[index];
+                if price.is_finite() && price > 0.0 {
+                    paths[k].push((price / anchor - 1.0) * 1e4);
+                }
+            }
+        }
+    }
+    let points = offsets
+        .iter()
+        .zip(&paths)
+        .map(|(&offset, values)| {
+            let (mean, se) = mean_and_se(values);
+            EventPoint {
+                offset,
+                mean_bps: if values.is_empty() { f64::NAN } else { mean },
+                t: if se > 0.0 { mean / se } else { f64::NAN },
+                count: values.len(),
+            }
+        })
+        .collect();
+    EventStudy {
+        series: series.name.clone(),
+        window,
+        events,
+        points,
+    }
+}
+
+/// Each day's final value of an intraday series, keyed by date: what `agg daily` features
+/// lift onto a daily panel.
+pub fn lift_to_daily(intraday: &[lake::LakeBar], values: &[f64]) -> BTreeMap<NaiveDate, f64> {
+    let mut out = BTreeMap::new();
+    for (bar, &value) in intraday.iter().zip(values) {
+        out.insert(bar.date, value);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -797,10 +907,11 @@ fn evaluate_symbol(
     symbol: &str,
     bars: &[lake::LakeBar],
     series: &[Series],
+    lifted: Option<&BTreeMap<String, BTreeMap<NaiveDate, f64>>>,
 ) -> Result<SymbolSeries> {
     let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
     let exogenous = align_series(grid, symbol, bars, series);
-    let (_, features, bars_with_book) = evaluate_features_with(
+    let (_, mut features, bars_with_book) = evaluate_features_with(
         features,
         grid.step_secs(),
         bars,
@@ -808,6 +919,16 @@ fn evaluate_symbol(
         &names,
         &exogenous,
     )?;
+    // Features computed on the intraday source replace their daily-grid evaluation.
+    if let Some(lifted) = lifted {
+        for (name, by_date) in lifted {
+            if let Some(values) = features.get_mut(name) {
+                for (value, bar) in values.iter_mut().zip(bars) {
+                    *value = by_date.get(&bar.date).copied().unwrap_or(f64::NAN);
+                }
+            }
+        }
+    }
     Ok(SymbolSeries {
         symbol: symbol.to_owned(),
         book: TargetSeries::from_bars(bars, grid),
@@ -1240,7 +1361,56 @@ pub fn run(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    run_on_panel_with_series(config, panel, series, start, end, output_dir)
+    // On the daily grid, `agg daily` features are computed on the intraday source and lifted.
+    let lifted = match (grid, config.intraday_source.as_deref()) {
+        (Grid::Daily, Some(source)) => {
+            let agg_features: Vec<String> = config
+                .features
+                .iter()
+                .filter(|f| {
+                    feature_expr::parse_with(f, &names)
+                        .is_ok_and(|e| feature_expr::has_daily_agg(&e))
+                })
+                .cloned()
+                .collect();
+            if agg_features.is_empty() {
+                Vec::new()
+            } else {
+                let source_grid = Grid::parse(Some(source), 1)?;
+                anyhow::ensure!(
+                    !source_grid.has_book() && source_grid != Grid::Daily,
+                    "intraday_source must be 1m or 5m"
+                );
+                let source_config = StudyConfig {
+                    resolution: Some(source.to_owned()),
+                    ..config.clone()
+                };
+                config
+                    .symbols
+                    .par_iter()
+                    .map(|symbol| {
+                        let bars =
+                            load_panel_symbol(&source_config, source_grid, symbol, start, end)?;
+                        let exogenous = align_series(source_grid, symbol, &bars, &series);
+                        let (_, values, _) = evaluate_features_with(
+                            &agg_features,
+                            source_grid.step_secs(),
+                            &bars,
+                            false,
+                            &names,
+                            &exogenous,
+                        )?;
+                        Ok(values
+                            .into_iter()
+                            .map(|(name, v)| (name, lift_to_daily(&bars, &v)))
+                            .collect::<BTreeMap<_, _>>())
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        }
+        _ => Vec::new(),
+    };
+    run_study(config, panel, series, lifted, start, end, output_dir)
 }
 
 /// The series declared in the config, loaded from their files.
@@ -1277,6 +1447,20 @@ pub fn run_on_panel_with_series(
     end: NaiveDate,
     output_dir: &Path,
 ) -> Result<StudyResult> {
+    run_study(config, panel, series, Vec::new(), start, end, output_dir)
+}
+
+/// The study proper. `lifted` holds, per panel symbol, the `agg daily` features already
+/// computed on an intraday source and keyed by date (empty when there are none).
+fn run_study(
+    config: &StudyConfig,
+    panel: Vec<(String, Vec<lake::LakeBar>)>,
+    series: Vec<Series>,
+    lifted: Vec<BTreeMap<String, BTreeMap<NaiveDate, f64>>>,
+    start: NaiveDate,
+    end: NaiveDate,
+    output_dir: &Path,
+) -> Result<StudyResult> {
     let grid = config.grid()?;
     let series_names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
     let started = std::time::Instant::now();
@@ -1307,6 +1491,14 @@ pub fn run_on_panel_with_series(
                     grid.label()
                 ),
             });
+        } else if grid == Grid::Daily
+            && feature_expr::has_daily_agg(&expr)
+            && !lifted.iter().any(|l| l.contains_key(text))
+        {
+            unavailable.push(UnavailableFeature {
+                feature: text.clone(),
+                reason: "unavailable on this grid: agg daily needs an intraday_source (1m or 5m) to lift from".to_owned(),
+            });
         } else {
             features.push(text.clone());
         }
@@ -1314,8 +1506,17 @@ pub fn run_on_panel_with_series(
     let exogenous = series;
     let series: Vec<SymbolSeries> = panel
         .par_iter()
-        .map(|(symbol, bars)| evaluate_symbol(&features, grid, symbol, bars, &exogenous))
+        .enumerate()
+        .map(|(i, (symbol, bars))| {
+            evaluate_symbol(&features, grid, symbol, bars, &exogenous, lifted.get(i))
+        })
         .collect::<Result<Vec<_>>>()?;
+    // Event studies for every event-kind series.
+    let events: Vec<EventStudy> = exogenous
+        .iter()
+        .filter(|s| s.kind == SeriesKind::Event)
+        .map(|s| event_study(grid, &panel, s, config.event_window.max(1)))
+        .collect();
     eprintln!(
         "progress: load {}/{} symbols loaded elapsed={}s",
         series.len(),
@@ -1422,6 +1623,7 @@ pub fn run_on_panel_with_series(
             })
             .collect(),
         cells,
+        events,
     };
     fs::write(
         output_dir.join("study.json"),
@@ -1476,6 +1678,18 @@ pub fn run_on_panel_with_series(
     }
     fs::write(output_dir.join("study.csv"), csv)?;
     fs::write(output_dir.join("curves.csv"), curves)?;
+    if !result.events.is_empty() {
+        let mut events = String::from("series,offset,mean_bps,t,count\n");
+        for study in &result.events {
+            for point in &study.points {
+                events.push_str(&format!(
+                    "{},{},{:.4},{:.2},{}\n",
+                    study.series, point.offset, point.mean_bps, point.t, point.count
+                ));
+            }
+        }
+        fs::write(output_dir.join("events.csv"), events)?;
+    }
     Ok(result)
 }
 
@@ -1501,6 +1715,20 @@ pub fn summary_table(result: &StudyResult) -> String {
     }
     for skipped in &result.unavailable {
         let _ = writeln!(out, "{}: {}", skipped.feature, skipped.reason);
+    }
+    for study in &result.events {
+        let _ = writeln!(
+            out,
+            "event study {}: {} events, ±{} bars",
+            study.series, study.events, study.window
+        );
+        for point in study.points.iter().filter(|p| p.offset % 5 == 0) {
+            let _ = writeln!(
+                out,
+                "  {:>+4}  {:>+9.2} bps  t {:>+6.1}  n {}",
+                point.offset, point.mean_bps, point.t, point.count
+            );
+        }
     }
     let _ = writeln!(
         out,
@@ -1819,6 +2047,8 @@ mod tests {
             series: Vec::new(),
             lake_series: true,
             mode: StudyMode::TimeSeries,
+            intraday_source: None,
+            event_window: 20,
         };
         let start = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
@@ -1988,6 +2218,8 @@ mod tests {
             series: Vec::new(),
             lake_series: false,
             mode: StudyMode::TimeSeries,
+            intraday_source: None,
+            event_window: 20,
         };
         let out = std::env::temp_dir().join(format!("tessera-wb05-study-{}", std::process::id()));
         let result = run_on_panel_with_series(
@@ -2022,6 +2254,211 @@ mod tests {
         )
         .unwrap();
         assert!(other.cells.is_empty());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// Two sessions of 1-minute bars with a deterministic walk.
+    fn minute_bars(days: u32, per_day: u32) -> Vec<lake::LakeBar> {
+        let mut seed: u64 = 0x1234_5678;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0
+        };
+        let mut close = 100.0;
+        let mut bars = Vec::new();
+        for day in 0..days {
+            for minute in 0..per_day {
+                close *= 1.0 + (rand() - 0.5) * 4e-3;
+                bars.push(lake::LakeBar {
+                    date: NaiveDate::from_ymd_opt(2024, 3, 4).unwrap()
+                        + chrono::Days::new(u64::from(day)),
+                    time: chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap()
+                        + chrono::Duration::minutes(i64::from(minute)),
+                    open: close,
+                    high: close * 1.001,
+                    low: close * 0.999,
+                    close,
+                    volume: 100.0 + rand() * 50.0,
+                    book: None,
+                });
+            }
+        }
+        bars
+    }
+
+    /// The done line, first half: `return_1 | agg daily realized_var` on 1-minute bars equals
+    /// the sum of squared minute returns of each session, computed directly, and lifts onto
+    /// a daily panel by date; `sum`, `mean`, and `last` fold the same way.
+    #[test]
+    fn daily_realized_variance_from_minute_bars_matches_a_direct_computation() {
+        let bars = minute_bars(3, 390);
+        let names = [
+            "return_1 | agg daily realized_var",
+            "volume | agg daily sum",
+            "volume | agg daily mean",
+            "close | agg daily last",
+        ]
+        .map(str::to_owned);
+        let (_, features, _) = evaluate_features(&names, 60, &bars, false).unwrap();
+        let lifted = lift_to_daily(&bars, &features["return_1 | agg daily realized_var"]);
+        assert_eq!(lifted.len(), 3);
+        for day in 0..3 {
+            let session: Vec<&lake::LakeBar> = bars.iter().skip(day * 390).take(390).collect();
+            // Direct: squared bar-to-bar returns within the session, skipping the first bar
+            // of the day (its return crosses the overnight, and `return_1` on a fresh
+            // session still has a previous close, so both sides include it consistently).
+            let direct: f64 = (0..390)
+                .filter_map(|i| {
+                    let previous = if i == 0 {
+                        if day == 0 {
+                            return None;
+                        }
+                        bars[day * 390 - 1].close
+                    } else {
+                        session[i - 1].close
+                    };
+                    let r = (session[i].close / previous - 1.0) * 1e4;
+                    Some(r * r)
+                })
+                .sum();
+            let date = session[0].date;
+            assert!(
+                (lifted[&date] - direct).abs() < 1e-6 * direct.max(1.0),
+                "day {day}: lifted {} vs direct {direct}",
+                lifted[&date]
+            );
+            let volumes: Vec<f64> = session.iter().map(|b| b.volume).collect();
+            let sum = lift_to_daily(&bars, &features["volume | agg daily sum"])[&date];
+            let mean = lift_to_daily(&bars, &features["volume | agg daily mean"])[&date];
+            let last = lift_to_daily(&bars, &features["close | agg daily last"])[&date];
+            assert!((sum - volumes.iter().sum::<f64>()).abs() < 1e-6);
+            assert!((mean - volumes.iter().sum::<f64>() / 390.0).abs() < 1e-6);
+            assert_eq!(last, session[389].close);
+        }
+        // Mid-session the fold is the day so far: the first bar of day two holds one term.
+        let rv = &features["return_1 | agg daily realized_var"];
+        let r = (bars[390].close / bars[389].close - 1.0) * 1e4;
+        assert!((rv[390] - r * r).abs() < 1e-9);
+        // Grammar and the daily-grid rule.
+        let expr = feature_expr::parse("return_1 | agg daily realized_var | zscore 20").unwrap();
+        assert!(feature_expr::has_daily_agg(&expr));
+        assert_eq!(
+            expr.to_string(),
+            "return_1 | agg daily realized_var | zscore 20"
+        );
+        assert!(feature_expr::parse("volume | agg weekly sum").is_err());
+        assert!(feature_expr::parse("volume | agg daily median").is_err());
+        assert!(!feature_expr::has_daily_agg(
+            &feature_expr::parse("volume | zscore 20").unwrap()
+        ));
+    }
+
+    /// The done line, second half: events followed by a known drift reproduce it in the
+    /// event-study path, and nothing shows before them.
+    #[test]
+    fn event_study_reproduces_a_known_post_event_drift() {
+        let days = 600;
+        let mut seed: u64 = 0xabcd;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0
+        };
+        let mut panel = Vec::new();
+        let mut observations = Vec::new();
+        for k in 0..3 {
+            let name = format!("E{k}.US");
+            let mut close = 100.0;
+            let mut rows = Vec::with_capacity(days);
+            for d in 0..days {
+                // Noise of ~10 bps; +5 bps a bar for the ten bars after each event (every
+                // 50 bars from bar 40).
+                let since_event = (d + 10) % 50;
+                let drift = if d >= 40 && (1..=10).contains(&since_event) {
+                    5e-4
+                } else {
+                    0.0
+                };
+                close *= 1.0 + drift + (rand() - 0.5) * 2e-3 * 1.7;
+                rows.push((close, close * 1.001, close * 0.999, close, 1000.0));
+            }
+            let bars = daily_bars(&rows);
+            for d in (40..days).step_by(50) {
+                observations.push(crate::series::Observation {
+                    nominal_us: bar_close_us(&bars[d], Grid::Daily),
+                    available_us: bar_close_us(&bars[d], Grid::Daily),
+                    symbol: Some(name.clone()),
+                    value: 1.0,
+                });
+            }
+            panel.push((name, bars));
+        }
+        let announcements = Series::new("announcement", SeriesKind::Event, observations);
+        let study = event_study(Grid::Daily, &panel, &announcements, 20);
+        assert_eq!(study.series, "announcement");
+        assert_eq!(study.points.len(), 41);
+        assert!(study.events >= 30, "{} events", study.events);
+        let at = |offset: i64| study.points.iter().find(|p| p.offset == offset).unwrap();
+        assert_eq!(at(0).mean_bps, 0.0, "normalised to the event bar");
+        assert!(
+            at(-10).mean_bps.abs() < 20.0 && at(-10).t.abs() < 2.5,
+            "no run-up: {:?}",
+            at(-10)
+        );
+        let after = at(10);
+        assert!(
+            (after.mean_bps - 50.0).abs() < 20.0,
+            "ten bars of +5 bps: {after:?}"
+        );
+        assert!(after.t > 5.0 && after.count == study.events);
+        assert!(
+            (at(20).mean_bps - 50.0).abs() < 25.0,
+            "the drift stops: {:?}",
+            at(20)
+        );
+        // The study carries it when the series is registered.
+        let config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: panel.iter().map(|(s, _)| s.clone()).collect(),
+            step_secs: 1,
+            resolution: Some("daily".to_owned()),
+            daily_dir: PathBuf::new(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: None,
+            session: SessionKind::Regular,
+            features: vec!["announcement".to_owned()],
+            horizons: vec![5],
+            decision_delay_bars: 0,
+            buckets: 10,
+            target: Target::Return,
+            series: Vec::new(),
+            lake_series: false,
+            mode: StudyMode::TimeSeries,
+            intraday_source: None,
+            event_window: 20,
+        };
+        let out = std::env::temp_dir().join(format!("tessera-wb07-{}", std::process::id()));
+        let result = run_on_panel_with_series(
+            &config,
+            panel,
+            vec![announcements],
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+            &out,
+        )
+        .unwrap();
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].events, study.events);
+        assert!(
+            fs::read_to_string(out.join("events.csv"))
+                .unwrap()
+                .starts_with("series,offset")
+        );
+        assert!(summary_table(&result).contains("event study announcement"));
         let _ = fs::remove_dir_all(&out);
     }
 
@@ -2082,6 +2519,8 @@ mod tests {
             series: Vec::new(),
             lake_series: false,
             mode: StudyMode::CrossSectional,
+            intraday_source: None,
+            event_window: 20,
         };
         let out = std::env::temp_dir().join(format!("tessera-wb06-{}", std::process::id()));
         let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
