@@ -15,102 +15,18 @@
 // `playwright` or `patchright` resolvable from web/, or the CodeGPT VS Code extension's bundled
 // copy. Without one, without a built bundle, or without a reachable console, the check reports
 // that it skipped and exits 0; the theme check's static rules still apply there.
-import { createRequire } from "node:module";
-import { existsSync, readdirSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
-import http from "node:http";
-import { homedir } from "node:os";
-import { extname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { LAUNCH, reachable, resolveChromium, serveDist } from "./headless.mjs";
 
 const consoleOrigin = process.env.LAYOUT_CONSOLE ?? "http://127.0.0.1:8787/";
 const servedUrl = process.env.LAYOUT_URL;
 const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
 const verbose = process.argv.includes("--verbose");
-
-/** Serves the built bundle on an ephemeral port, proxying the API paths to the console. */
-async function serveDist(dir, apiOrigin) {
-  const types = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "text/javascript",
-    ".css": "text/css",
-    ".svg": "image/svg+xml",
-    ".json": "application/json",
-    ".png": "image/png",
-    ".ico": "image/x-icon",
-    ".woff2": "font/woff2",
-  };
-  const server = http.createServer(async (req, res) => {
-    const requested = new URL(req.url ?? "/", "http://localhost");
-    if (/^\/(api|artifacts|reports)(\/|$)/.test(requested.pathname)) {
-      const target = new URL(requested.pathname + requested.search, apiOrigin);
-      const upstream = http.request(
-        target,
-        { method: req.method, headers: { ...req.headers, host: target.host } },
-        (reply) => {
-          res.writeHead(reply.statusCode ?? 502, reply.headers);
-          reply.pipe(res);
-        },
-      );
-      upstream.on("error", () => {
-        res.writeHead(502);
-        res.end();
-      });
-      req.pipe(upstream);
-      return;
-    }
-    let file = join(dir, decodeURIComponent(requested.pathname));
-    try {
-      if ((await stat(file)).isDirectory()) file = join(file, "index.html");
-    } catch {
-      file = join(dir, "index.html"); // the console is a single page
-    }
-    try {
-      const body = await readFile(file);
-      res.writeHead(200, { "content-type": types[extname(file)] ?? "application/octet-stream" });
-      res.end(body);
-    } catch {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { server, url: `http://127.0.0.1:${server.address().port}/` };
-}
 const WIDTHS = [1280, 1440];
 const HEIGHT = 800;
-
-function resolveChromium() {
-  const roots = [process.cwd() + "/", join(process.cwd(), "web") + "/"];
-  for (const base of [join(homedir(), ".vscode/extensions"), join(homedir(), ".vscode-server/extensions")]) {
-    if (!existsSync(base)) continue;
-    const dirs = readdirSync(base)
-      .filter((d) => d.startsWith("danielsanmedium.dscodegpt-"))
-      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    if (dirs.length) roots.push(join(base, dirs[dirs.length - 1], "standalone") + "/");
-  }
-  for (const root of roots) {
-    for (const name of ["playwright", "patchright"]) {
-      try {
-        const mod = createRequire(root)(name);
-        const chromium = mod?.chromium ?? mod?.default?.chromium;
-        if (chromium) return { chromium, from: `${name} (${root})` };
-      } catch {
-        /* try the next candidate */
-      }
-    }
-  }
-  return null;
-}
-
-async function reachable(target) {
-  try {
-    const response = await fetch(new URL("/api/jobs", target), { signal: AbortSignal.timeout(3000) });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
 
 /** Runs in the page: body overflow and elements past the viewport with no scrolling ancestor. */
 function measure() {
@@ -198,12 +114,7 @@ if (!servedUrl && !existsSync(join(distDir, "index.html"))) {
 if (!servedUrl) served = await serveDist(distDir, consoleOrigin);
 const url = servedUrl ?? served.url;
 
-// The full Chromium build in new headless mode: the separate headless shell is often absent.
-const browser = await runtime.chromium.launch({
-  headless: true,
-  channel: "chromium",
-  args: ["--no-sandbox", "--disable-dev-shm-usage"],
-});
+const browser = await runtime.chromium.launch(LAUNCH);
 const failures = [];
 try {
   for (const mode of ["terminal", "modern"]) {

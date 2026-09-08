@@ -13,7 +13,8 @@
     "preview": "vite preview",
     "lint": "eslint app src --ignore-pattern dist",
     "theme-check": "node scripts/theme-check.mjs",
-    "layout-check": "node scripts/layout-check.mjs"
+    "layout-check": "node scripts/layout-check.mjs",
+    "chart-check": "node scripts/chart-check.mjs"
   },
   "dependencies": {
     "react": "19.2.6",

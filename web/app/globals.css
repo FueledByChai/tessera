@@ -4086,6 +4086,12 @@ nav {
 .ranked-cells td.positive { color: #32c832; }
 .ranked-cells td.negative { color: #e03040; }
 .diag-readout { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
+.ic-decay .chart-readout { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
+.ic-decay .chart-readout .positive { color: #32c832; }
+.ic-decay .chart-readout .negative { color: #e03040; }
+.app-shell .ic-decay .chart-line.faint { stroke: #6a6a6a; stroke-width: 1; opacity: 0.7; }
+.ic-decay .chart-point { cursor: pointer; }
+.decile-chart { padding-top: 6px; }
 .daily-ic-strip { padding-top: 4px; }
 .ic-bar.positive { fill: #32c832; }
 .ic-bar.negative { fill: #e03040; }

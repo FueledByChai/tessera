@@ -66,7 +66,7 @@ done
 
 if [ "$NO_WEB" = 0 ]; then
   step "web typecheck, lint, theme check, build, layout check"
-  (cd web && npm run --silent typecheck && npm run --silent lint && npm run --silent theme-check && npm run --silent build >/dev/null && npm run --silent layout-check)
+  (cd web && npm run --silent typecheck && npm run --silent lint && npm run --silent theme-check && npm run --silent build >/dev/null && npm run --silent layout-check && npm run --silent chart-check)
 fi
 
 if [ "$QUICK" = 0 ] && [ -x "$ROOT/../Tessera-private/scripts/check.sh" ]; then

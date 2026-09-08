@@ -127,7 +127,7 @@ accepted features plus targets for model fitting.
 **Done when:** a preset survives a service restart, promotion changes what WB-08 orthogonalizes
 against, and the export round-trips through `tessera parquet-schema`.
 
-### WB-10 Study charts — `todo` — Blocked by WB-02
+### WB-10 Study charts — `done 2026-09-08 WB-10: study charts as inline SVG with a fixture-backed chart check` — Blocked by WB-02
 IC decay across horizons, decile bars, the costless equity curve, and daily IC, as inline SVG in
 the terminal style (see `EquityChart`).
 **Done when:** each chart renders from a fixture result in the browser without console errors and

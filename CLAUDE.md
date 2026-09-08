@@ -65,6 +65,10 @@ refresh the baseline with `scripts/check.sh --refresh-baseline` and say why in t
   bare `fr` grid tracks. Pages must fit a 13-inch laptop: wide tables go dense under 1500 px
   rather than scrolling; `web/scripts/layout-check.mjs` measures 1280 and 1440 px.
 - Long tables go behind tabs or caps with a "show all"; a page must open at the top.
+- Charts are inline SVG in the terminal style (`EquityChart`, the study charts). The studies
+  page must keep rendering every chart from `web/fixtures/study-result.json`:
+  `web/scripts/chart-check.mjs` (run by `scripts/check.sh`) fails on a missing chart, a console
+  error, or a chart placed above the results grid.
 - Relative API origin (`import.meta.env.VITE_API_ORIGIN ?? ""`); dev server on 5173 proxies `/api`.
 
 ## Docs to keep current

@@ -1614,6 +1614,108 @@ function StudyCurveChart({ cell, variant, unit }: { cell: StudyCell; variant: st
   );
 }
 
+/** IC across horizons for every feature in scope, the selected feature drawn bold; a point picks that cell. */
+function IcDecayChart({ cells, features, horizons, selected, horizonLabel, onSelect }: {
+  cells: StudyCell[];
+  features: string[];
+  horizons: number[];
+  selected: string;
+  horizonLabel: (h: number) => string;
+  onSelect: (feature: string, horizon: number) => void;
+}) {
+  type Point = { i: number; h: number; ic: number; cell: StudyCell };
+  const series = features
+    .map((feature) => ({
+      feature,
+      points: horizons
+        .map((h, i): Point | null => {
+          const cell = cells.find((c) => c.feature === feature && c.horizon_bars === h);
+          return cell && Number.isFinite(cell.ic) ? { i, h, ic: cell.ic, cell } : null;
+        })
+        .filter((p): p is Point => p != null),
+    }))
+    .filter((s) => s.points.length > 0);
+  if (!series.length) return <div className="empty-state">No cells to chart.</div>;
+  const peak = Math.max(0.01, ...series.flatMap((s) => s.points.map((p) => Math.abs(p.ic))));
+  const x = (i: number) => (horizons.length > 1 ? 32 + (i / (horizons.length - 1)) * 736 : 400);
+  const y = (ic: number) => 120 - (ic / peak) * 86;
+  const active = series.find((s) => s.feature === selected) ?? series[0];
+  return (
+    <div className="equity-chart ic-decay">
+      <div className="chart-readout">
+        <strong>{active.feature}</strong>
+        {active.points.map((p) => (
+          <span key={p.h} className={icClass(p.ic)}>{horizonLabel(p.h)} {signed(p.ic, 4)}</span>
+        ))}
+        {series.length > 1 && <span>{series.length - 1} other feature{series.length > 2 ? "s" : ""} faint</span>}
+      </div>
+      <svg viewBox="0 0 800 240" role="img" aria-label="IC by horizon">
+        {[-1, -0.5, 0, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line x1="32" y1={y(f * peak)} x2="768" y2={y(f * peak)} className={f === 0 ? "chart-crosshair" : "chart-grid"} />
+            <text x="766" y={y(f * peak) - 3} textAnchor="end" className="chart-axis">{signed(f * peak, 3)}</text>
+          </g>
+        ))}
+        {series.filter((s) => s !== active).map((s) => (
+          <polyline key={s.feature} points={s.points.map((p) => `${x(p.i)},${y(p.ic)}`).join(" ")} className="chart-line faint">
+            <title>{s.feature}</title>
+          </polyline>
+        ))}
+        <polyline points={active.points.map((p) => `${x(p.i)},${y(p.ic)}`).join(" ")} className="chart-line" />
+        {active.points.map((p) => (
+          <circle key={p.h} cx={x(p.i)} cy={y(p.ic)} r="4" className="chart-point" onClick={() => onSelect(active.feature, p.h)}>
+            <title>{`${active.feature} · ${horizonLabel(p.h)}: IC ${signed(p.ic, 4)} · n=${p.cell.observations.toLocaleString()}`}</title>
+          </circle>
+        ))}
+        {horizons.map((h, i) => (
+          <text key={h} x={x(i)} y="228" textAnchor={i === 0 ? "start" : i === horizons.length - 1 ? "end" : "middle"} className="chart-axis">
+            {horizonLabel(h)}
+          </text>
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+/** The forward target's mean per feature decile for one cell, as bars around zero. */
+function DecileChart({ cell, unit }: { cell: StudyCell; unit: string }) {
+  const buckets = cell.buckets;
+  if (!buckets.length) return null;
+  const peak = Math.max(1e-9, ...buckets.map((b) => Math.abs(b.forward_bps)));
+  const slot = 688 / buckets.length; // leaves room for the axis labels on the right
+  const zero = 120;
+  const y = (v: number) => zero - (v / peak) * 86;
+  return (
+    <div className="equity-chart decile-chart">
+      <svg viewBox="0 0 800 240" role="img" aria-label={`Forward target by decile in ${unit}`}>
+        {[-1, -0.5, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line x1="32" y1={y(f * peak)} x2="768" y2={y(f * peak)} className="chart-grid" />
+            <text x="766" y={y(f * peak) - 3} textAnchor="end" className="chart-axis">{signed(f * peak, 2)}</text>
+          </g>
+        ))}
+        <line x1="32" y1={zero} x2="768" y2={zero} className="chart-crosshair" />
+        {buckets.map((b, i) => {
+          const positive = b.forward_bps >= 0;
+          const height = Math.max(1, Math.abs(y(b.forward_bps) - zero));
+          const left = 32 + i * slot + slot * 0.15;
+          return (
+            <g key={b.bucket}>
+              <rect x={left} y={positive ? zero - height : zero} width={slot * 0.7} height={height} className={positive ? "ic-bar positive" : "ic-bar negative"}>
+                <title>{`decile ${b.bucket}: ${signed(b.forward_bps, 3)} ${unit} · feature mean ${b.feature_mean.toFixed(4)} · n=${b.count.toLocaleString()}`}</title>
+              </rect>
+              <text x={left + slot * 0.35} y={positive ? zero - height - 5 : zero + height + 13} textAnchor="middle" className="chart-axis">
+                {signed(b.forward_bps, 2)}
+              </text>
+              <text x={left + slot * 0.35} y="228" textAnchor="middle" className="chart-axis">{b.bucket}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 /** Incremental IC, the per-day IC strip, the regime table, and autocorrelation of one cell. */
 function StudyDiagnostics({ cell }: { cell: StudyCell }) {
   const d = cell.diagnostics;
@@ -1637,6 +1739,8 @@ function StudyDiagnostics({ cell }: { cell: StudyCell }) {
             <line x1="32" y1="60" x2="768" y2="60" className="chart-grid" />
             <text x="34" y="14" className="chart-axis">{`+${peak.toFixed(3)}`}</text>
             <text x="34" y="116" className="chart-axis">{`-${peak.toFixed(3)}`}</text>
+            <text x="766" y="14" textAnchor="end" className="chart-axis">{days[0].date}</text>
+            <text x="766" y="116" textAnchor="end" className="chart-axis">{days[days.length - 1].date}</text>
             {days.map((day, i) => {
               const x = 32 + (i * 736) / days.length;
               const h = (Math.abs(day.ic) / peak) * 52;
@@ -1717,6 +1821,10 @@ function StudiesWorkspace() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  // The page opens at the top; the results grid comes first and the charts follow it.
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+  }, []);
   const refresh = useCallback(async () => {
     const [i, s, f] = await Promise.all([
       fetch(`${API}/lake/instruments`, { cache: "no-store" }),
@@ -1852,6 +1960,188 @@ function StudiesWorkspace() {
 
   return (
     <div className="studies-workspace">
+      <div className="compare-grid">
+        <section className="panel sweep-history">
+          <div className="terminal-panel-title"><span>HST</span> STUDIES</div>
+          {studies.length ? studies.map((study) => (
+            <button
+              key={study.id}
+              className={selected === study.id ? "sweep-row active" : "sweep-row"}
+              onClick={() => setSelected(study.id)}
+            >
+              <strong>{study.name}</strong>
+              <span>{study.start_date} → {study.end_date}</span>
+              <em>{study.status}</em>
+            </button>
+          )) : <div className="empty-state">No studies yet; run one from the form below.</div>}
+        </section>
+        <section className="panel sweep-results">
+          <div className="terminal-panel-title">
+            <span>IC</span> INFORMATION COEFFICIENT
+            {symbolsInResult.length > 1 && (
+              <select value={scopeSymbol} onChange={(e) => setScope(e.target.value)}>
+                {symbolsInResult.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            )}
+            {result && (
+              <select value={sortKey} onChange={(e) => setSortKey(e.target.value as "breakeven" | "ic" | "name")}>
+                <option value="breakeven">rows: breakeven cost</option>
+                <option value="ic">rows: |IC|</option>
+                <option value="name">rows: name</option>
+              </select>
+            )}
+          </div>
+          {!detail ? <div className="empty-state">Select a study, or run one from the form below.</div> : detail.study.status === "failed" ? (
+            <div className="run-failure"><strong>Study failed</strong><span>{detail.study.error}</span></div>
+          ) : !result ? (
+            <div className="empty-state">Running… {detail.study.status}</div>
+          ) : (
+            <>
+              <div className="sweep-summary-strip">
+                <strong>{detail.study.name}</strong>
+                <span>{result.start} → {result.end} · {resultGrid} grid · {(result.mode ?? result.config.mode ?? "time_series").replace("_", "-")} · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
+                <span>{result.symbols.map((s) => `${s.symbol} ${(s.bars_with_book || s.bars).toLocaleString()} bars`).join(" · ")}</span>
+                {result.accepted_export && (
+                  <a className="study-export" href={`${API}/studies/${detail.study.id}/export`} download>
+                    {result.accepted_export} ↓ accepted features + targets
+                  </a>
+                )}
+              </div>
+              {result.series && result.series.length > 0 && (
+                <p className="footnote">Series available as bases, joined as-of availability: {result.series.join(", ")}.</p>
+              )}
+              {result.unavailable && result.unavailable.length > 0 && (
+                <p className="footnote">{result.unavailable.map((u) => `${u.feature}: ${u.reason}`).join(" · ")}</p>
+              )}
+              <div className="table-wrap sweep-heatmap"><table>
+                <thead><tr><th>feature ↓ / horizon →</th>{horizonList.map((h) => <th key={h}>{horizonLabel(h)}</th>)}</tr></thead>
+                <tbody>{sortedFeatures.map((feature) => (
+                  <tr key={feature}><th>{feature}</th>
+                    {horizonList.map((h) => {
+                      const c = cellFor(feature, h);
+                      return (
+                        <td
+                          key={h}
+                          className={c ? icClass(c.ic) : "pending-cell"}
+                          title={c ? `top-bottom ${signed(c.top_minus_bottom_bps, 2)} bp · breakeven ${signed(c.breakeven_bps, 3)} bp · t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar${c.cross_section ? ` · ${c.cross_section.dates} dates · IC t=${formatNumber(finite(c.cross_section.ic_t), 1)} · ${Math.round(c.cross_section.ic_positive_share * 100)}% positive` : ""}` : ""}
+                          onClick={() => { if (c) { setBucketFeature(feature); setBucketHorizon(h); } }}
+                        >
+                          {c ? `${c.ic >= 0 ? "+" : ""}${c.ic.toFixed(4)}` : "·"}
+                          {c && <small>{signed(c.top_minus_bottom_bps, 2)}bp · be {signed(c.breakeven_bps, 3)}</small>}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}</tbody>
+              </table></div>
+              <p className="footnote">Cell: Spearman IC against the target, then top-minus-bottom decile target mean ({unit}) and the breakeven cost ({unit} per unit traded) of the clipped z-score rule. Hover for t-stat, observations, Sharpe, and turnover; click a cell to select it below.</p>
+              <div className="terminal-panel-title"><span>ICD</span> IC BY HORIZON{bucketCell ? ` · ${bucketCell.feature}` : ""}</div>
+              <IcDecayChart
+                cells={cells}
+                features={sortedFeatures}
+                horizons={horizonList}
+                selected={bucketCell?.feature ?? ""}
+                horizonLabel={horizonLabel}
+                onSelect={(feature, horizon) => { setBucketFeature(feature); setBucketHorizon(horizon); }}
+              />
+              <p className="footnote">Spearman IC of each feature at every horizon; the selected feature is drawn bold, click a point to select that cell.</p>
+              <div className="terminal-panel-title">
+                <span>DEC</span> DECILES
+                <select value={bucketCell?.feature ?? ""} onChange={(e) => setBucketFeature(e.target.value)}>
+                  {featureList.map((f) => <option key={f} value={f}>{f}</option>)}
+                </select>
+                <select value={bucketCell?.horizon_bars ?? ""} onChange={(e) => setBucketHorizon(Number(e.target.value))}>
+                  {horizonList.map((h) => <option key={h} value={h}>{horizonLabel(h)}</option>)}
+                </select>
+              </div>
+              {bucketCell && <DecileChart cell={bucketCell} unit={unit} />}
+              {bucketCell && (
+                <div className="table-wrap"><table>
+                  <thead><tr><th>Decile</th><th>Feature mean</th><th>Target ({unit})</th><th>Count</th></tr></thead>
+                  <tbody>{bucketCell.buckets.map((b) => (
+                    <tr key={b.bucket}>
+                      <td>{b.bucket}</td>
+                      <td>{b.feature_mean.toFixed(4)}</td>
+                      <td className={classFor(b.forward_bps)}>{b.forward_bps >= 0 ? "+" : ""}{b.forward_bps.toFixed(3)}</td>
+                      <td>{b.count.toLocaleString()}</td>
+                    </tr>
+                  ))}</tbody>
+                </table></div>
+              )}
+              <div className="terminal-panel-title">
+                <span>CRV</span> COSTLESS CURVE{bucketCell ? ` · ${bucketCell.feature} · ${horizonLabel(bucketCell.horizon_bars)}` : ""}
+                <select value={curveVariant} onChange={(e) => setCurveVariant(e.target.value)}>
+                  <option value="zscore">position: clipped z-score</option>
+                  <option value="sign">position: sign</option>
+                </select>
+                {bucketCell && (acceptedInLibrary(bucketCell.feature) ? (
+                  <em className="accepted-tag">accepted</em>
+                ) : (
+                  <button
+                    type="button"
+                    className="text-action"
+                    onClick={() => void saveFeature(bucketCell.feature, bucketCell.feature, `promoted from ${detail.study.name}`, true)}
+                  >
+                    promote to accepted
+                  </button>
+                ))}
+              </div>
+              {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
+              <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L."}</p>
+              {bucketCell?.diagnostics && <StudyDiagnostics cell={bucketCell} />}
+              <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
+              {ranked.length ? (
+                <>
+                  <div className="table-wrap"><table className="ranked-cells">
+                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven ({unit})</th><th>Sign breakeven</th></tr></thead>
+                    <tbody>{(showAllRanked ? ranked : ranked.slice(0, RANK_CAP)).map((c) => (
+                      <tr
+                        key={`${c.feature}-${c.horizon_bars}`}
+                        className={bucketCell === c ? "active" : ""}
+                        onClick={() => { setBucketFeature(c.feature); setBucketHorizon(c.horizon_bars); }}
+                      >
+                        <td>{c.feature}</td>
+                        <td>{horizonLabel(c.horizon_bars)}</td>
+                        <td className={icClass(c.ic)}>{signed(c.ic, 4)}</td>
+                        <td className={classFor(finite(c.sharpe) ?? undefined)}>{signed(c.sharpe, 2)}</td>
+                        <td>{formatNumber(finite(c.turnover), 3)}</td>
+                        <td className={classFor(finite(c.breakeven_bps) ?? undefined)}>{signed(c.breakeven_bps, 4)}</td>
+                        <td className={classFor(finite(c.curves?.[1]?.breakeven_bps) ?? undefined)}>{signed(c.curves?.[1]?.breakeven_bps, 4)}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table></div>
+                  {ranked.length > RANK_CAP && (
+                    <button type="button" className="secondary-action" onClick={() => setShowAllRanked((v) => !v)}>
+                      {showAllRanked ? `Top ${RANK_CAP} only` : `Show all ${ranked.length}`}
+                    </button>
+                  )}
+                </>
+              ) : (
+                <div className="empty-state">No breakeven costs in this study; run it again on the current engine.</div>
+              )}
+              {result.events?.map((study) => (
+                <div key={study.series}>
+                  <div className="terminal-panel-title">
+                    <span>EVT</span> EVENT PATH · {study.series} · {study.events.toLocaleString()} events · ±{study.window} bars
+                  </div>
+                  <div className="table-wrap"><table className="event-path">
+                    <thead><tr><th>Offset</th><th>Mean path (bps)</th><th>t</th><th>Count</th></tr></thead>
+                    <tbody>{study.points.filter((p) => study.window <= 10 || p.offset % 5 === 0 || Math.abs(p.offset) <= 2).map((p) => (
+                      <tr key={p.offset} className={p.offset === 0 ? "active" : ""}>
+                        <td>{p.offset > 0 ? `+${p.offset}` : p.offset}</td>
+                        <td className={classFor(finite(p.mean_bps) ?? undefined)}>{signed(p.mean_bps, 2)}</td>
+                        <td>{signed(p.t, 1)}</td>
+                        <td>{p.count.toLocaleString()}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table></div>
+                  <p className="footnote">Cumulative return from the event bar to each offset, averaged over events and normalised to zero at the event; negative offsets show the run-in. Offsets within two bars of the event and every fifth bar are listed.</p>
+                </div>
+              ))}
+            </>
+          )}
+        </section>
+      </div>
       <section className="panel">
         <div className="terminal-panel-title"><span>STD</span> NEW FEATURE STUDY · {csvGrid ? `${gridChoice} CSV bars` : "tick lake"}</div>
         {(
@@ -2057,177 +2347,6 @@ function StudiesWorkspace() {
         )}
       </section>
 
-      <div className="compare-grid">
-        <section className="panel sweep-history">
-          <div className="terminal-panel-title"><span>HST</span> STUDIES</div>
-          {studies.length ? studies.map((study) => (
-            <button
-              key={study.id}
-              className={selected === study.id ? "sweep-row active" : "sweep-row"}
-              onClick={() => setSelected(study.id)}
-            >
-              <strong>{study.name}</strong>
-              <span>{study.start_date} → {study.end_date}</span>
-              <em>{study.status}</em>
-            </button>
-          )) : <div className="empty-state">No studies yet.</div>}
-        </section>
-        <section className="panel sweep-results">
-          <div className="terminal-panel-title">
-            <span>IC</span> INFORMATION COEFFICIENT
-            {symbolsInResult.length > 1 && (
-              <select value={scopeSymbol} onChange={(e) => setScope(e.target.value)}>
-                {symbolsInResult.map((s) => <option key={s} value={s}>{s}</option>)}
-              </select>
-            )}
-            {result && (
-              <select value={sortKey} onChange={(e) => setSortKey(e.target.value as "breakeven" | "ic" | "name")}>
-                <option value="breakeven">rows: breakeven cost</option>
-                <option value="ic">rows: |IC|</option>
-                <option value="name">rows: name</option>
-              </select>
-            )}
-          </div>
-          {!detail ? <div className="empty-state">Select a study.</div> : detail.study.status === "failed" ? (
-            <div className="run-failure"><strong>Study failed</strong><span>{detail.study.error}</span></div>
-          ) : !result ? (
-            <div className="empty-state">Running… {detail.study.status}</div>
-          ) : (
-            <>
-              <div className="sweep-summary-strip">
-                <strong>{detail.study.name}</strong>
-                <span>{result.start} → {result.end} · {resultGrid} grid · {(result.mode ?? result.config.mode ?? "time_series").replace("_", "-")} · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
-                <span>{result.symbols.map((s) => `${s.symbol} ${(s.bars_with_book || s.bars).toLocaleString()} bars`).join(" · ")}</span>
-                {result.accepted_export && (
-                  <a className="study-export" href={`${API}/studies/${detail.study.id}/export`} download>
-                    {result.accepted_export} ↓ accepted features + targets
-                  </a>
-                )}
-              </div>
-              {result.series && result.series.length > 0 && (
-                <p className="footnote">Series available as bases, joined as-of availability: {result.series.join(", ")}.</p>
-              )}
-              {result.unavailable && result.unavailable.length > 0 && (
-                <p className="footnote">{result.unavailable.map((u) => `${u.feature}: ${u.reason}`).join(" · ")}</p>
-              )}
-              <div className="table-wrap sweep-heatmap"><table>
-                <thead><tr><th>feature ↓ / horizon →</th>{horizonList.map((h) => <th key={h}>{horizonLabel(h)}</th>)}</tr></thead>
-                <tbody>{sortedFeatures.map((feature) => (
-                  <tr key={feature}><th>{feature}</th>
-                    {horizonList.map((h) => {
-                      const c = cellFor(feature, h);
-                      return (
-                        <td
-                          key={h}
-                          className={c ? icClass(c.ic) : "pending-cell"}
-                          title={c ? `top-bottom ${signed(c.top_minus_bottom_bps, 2)} bp · breakeven ${signed(c.breakeven_bps, 3)} bp · t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar${c.cross_section ? ` · ${c.cross_section.dates} dates · IC t=${formatNumber(finite(c.cross_section.ic_t), 1)} · ${Math.round(c.cross_section.ic_positive_share * 100)}% positive` : ""}` : ""}
-                          onClick={() => { if (c) { setBucketFeature(feature); setBucketHorizon(h); } }}
-                        >
-                          {c ? `${c.ic >= 0 ? "+" : ""}${c.ic.toFixed(4)}` : "·"}
-                          {c && <small>{signed(c.top_minus_bottom_bps, 2)}bp · be {signed(c.breakeven_bps, 3)}</small>}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                ))}</tbody>
-              </table></div>
-              <p className="footnote">Cell: Spearman IC against the target, then top-minus-bottom decile target mean ({unit}) and the breakeven cost ({unit} per unit traded) of the clipped z-score rule. Hover for t-stat, observations, Sharpe, and turnover; click a cell to select it below.</p>
-              <div className="terminal-panel-title">
-                <span>DEC</span> DECILES
-                <select value={bucketCell?.feature ?? ""} onChange={(e) => setBucketFeature(e.target.value)}>
-                  {featureList.map((f) => <option key={f} value={f}>{f}</option>)}
-                </select>
-                <select value={bucketCell?.horizon_bars ?? ""} onChange={(e) => setBucketHorizon(Number(e.target.value))}>
-                  {horizonList.map((h) => <option key={h} value={h}>{horizonLabel(h)}</option>)}
-                </select>
-              </div>
-              {bucketCell && (
-                <div className="table-wrap"><table>
-                  <thead><tr><th>Decile</th><th>Feature mean</th><th>Target ({unit})</th><th>Count</th></tr></thead>
-                  <tbody>{bucketCell.buckets.map((b) => (
-                    <tr key={b.bucket}>
-                      <td>{b.bucket}</td>
-                      <td>{b.feature_mean.toFixed(4)}</td>
-                      <td className={classFor(b.forward_bps)}>{b.forward_bps >= 0 ? "+" : ""}{b.forward_bps.toFixed(3)}</td>
-                      <td>{b.count.toLocaleString()}</td>
-                    </tr>
-                  ))}</tbody>
-                </table></div>
-              )}
-              <div className="terminal-panel-title">
-                <span>CRV</span> COSTLESS CURVE{bucketCell ? ` · ${bucketCell.feature} · ${horizonLabel(bucketCell.horizon_bars)}` : ""}
-                <select value={curveVariant} onChange={(e) => setCurveVariant(e.target.value)}>
-                  <option value="zscore">position: clipped z-score</option>
-                  <option value="sign">position: sign</option>
-                </select>
-                {bucketCell && (acceptedInLibrary(bucketCell.feature) ? (
-                  <em className="accepted-tag">accepted</em>
-                ) : (
-                  <button
-                    type="button"
-                    className="text-action"
-                    onClick={() => void saveFeature(bucketCell.feature, bucketCell.feature, `promoted from ${detail.study.name}`, true)}
-                  >
-                    promote to accepted
-                  </button>
-                ))}
-              </div>
-              {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
-              <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L."}</p>
-              {bucketCell?.diagnostics && <StudyDiagnostics cell={bucketCell} />}
-              <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
-              {ranked.length ? (
-                <>
-                  <div className="table-wrap"><table className="ranked-cells">
-                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven ({unit})</th><th>Sign breakeven</th></tr></thead>
-                    <tbody>{(showAllRanked ? ranked : ranked.slice(0, RANK_CAP)).map((c) => (
-                      <tr
-                        key={`${c.feature}-${c.horizon_bars}`}
-                        className={bucketCell === c ? "active" : ""}
-                        onClick={() => { setBucketFeature(c.feature); setBucketHorizon(c.horizon_bars); }}
-                      >
-                        <td>{c.feature}</td>
-                        <td>{horizonLabel(c.horizon_bars)}</td>
-                        <td className={icClass(c.ic)}>{signed(c.ic, 4)}</td>
-                        <td className={classFor(finite(c.sharpe) ?? undefined)}>{signed(c.sharpe, 2)}</td>
-                        <td>{formatNumber(finite(c.turnover), 3)}</td>
-                        <td className={classFor(finite(c.breakeven_bps) ?? undefined)}>{signed(c.breakeven_bps, 4)}</td>
-                        <td className={classFor(finite(c.curves?.[1]?.breakeven_bps) ?? undefined)}>{signed(c.curves?.[1]?.breakeven_bps, 4)}</td>
-                      </tr>
-                    ))}</tbody>
-                  </table></div>
-                  {ranked.length > RANK_CAP && (
-                    <button type="button" className="secondary-action" onClick={() => setShowAllRanked((v) => !v)}>
-                      {showAllRanked ? `Top ${RANK_CAP} only` : `Show all ${ranked.length}`}
-                    </button>
-                  )}
-                </>
-              ) : (
-                <div className="empty-state">No breakeven costs in this study; run it again on the current engine.</div>
-              )}
-              {result.events?.map((study) => (
-                <div key={study.series}>
-                  <div className="terminal-panel-title">
-                    <span>EVT</span> EVENT PATH · {study.series} · {study.events.toLocaleString()} events · ±{study.window} bars
-                  </div>
-                  <div className="table-wrap"><table className="event-path">
-                    <thead><tr><th>Offset</th><th>Mean path (bps)</th><th>t</th><th>Count</th></tr></thead>
-                    <tbody>{study.points.filter((p) => study.window <= 10 || p.offset % 5 === 0 || Math.abs(p.offset) <= 2).map((p) => (
-                      <tr key={p.offset} className={p.offset === 0 ? "active" : ""}>
-                        <td>{p.offset > 0 ? `+${p.offset}` : p.offset}</td>
-                        <td className={classFor(finite(p.mean_bps) ?? undefined)}>{signed(p.mean_bps, 2)}</td>
-                        <td>{signed(p.t, 1)}</td>
-                        <td>{p.count.toLocaleString()}</td>
-                      </tr>
-                    ))}</tbody>
-                  </table></div>
-                  <p className="footnote">Cumulative return from the event bar to each offset, averaged over events and normalised to zero at the event; negative offsets show the run-in. Offsets within two bars of the event and every fifth bar are listed.</p>
-                </div>
-              ))}
-            </>
-          )}
-        </section>
-      </div>
     </div>
   );
 }
