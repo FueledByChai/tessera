@@ -175,7 +175,7 @@ Replace the hand-written CI steps with `scripts/check.sh --quick` plus the web j
 **Done when:** the workflow file calls the script and a deliberate parity break fails CI locally
 with `act` or in a PR.
 
-### HK-04 check.sh works from a worktree — `todo`
+### HK-04 check.sh works from a worktree — `done 2026-09-08 HK-04: check.sh resolves the main and private checkouts from a worktree`
 From `.claude/worktrees/<name>` the script cannot find `../Tessera-private` (so the private checks
 silently skip), a fresh worktree has no `local.toml` (so private strategies do not compile in), and
 the private legacy crate builds against the main checkout's engine, so a private strategy that uses

@@ -43,7 +43,11 @@ hand-written CI steps to keep in sync.
 
 - Commit per ticket, message starts with the ticket id (`WB-03: ...`), ends with the
   `Co-Authored-By: Claude ... <noreply@anthropic.com>` trailer. Never push; the owner pushes.
-- Prefer an isolated worktree per ticket. Never rewrite history on `main`.
+- Prefer an isolated worktree per ticket. Never rewrite history on `main`. From a worktree,
+  `scripts/check.sh` finds the main checkout through the shared git dir, the private checkout
+  beside it (`TESSERA_PRIVATE_ROOT` overrides), writes `local.toml` from the main one with its
+  relative paths made absolute, links `web/node_modules`, and builds the private legacy crate
+  against the worktree's engine; `scripts/check.sh --resolve` shows what a run would use.
 - Update `BACKLOG.md` in the same commit: status, date, commit summary.
 
 ## Engine and data rules
