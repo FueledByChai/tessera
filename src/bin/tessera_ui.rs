@@ -4241,6 +4241,9 @@ struct CreateStudyRequest {
     horizons: Vec<usize>,
     #[serde(default)]
     decision_delay_bars: usize,
+    /// `time_series` (default) or `cross_sectional`.
+    #[serde(default)]
+    mode: Option<String>,
     /// `return` (default), `realized_variance`, `abs_move`, `spread_change`,
     /// `fair_value_residual`, or `microprice_residual`.
     #[serde(default)]
@@ -4433,6 +4436,10 @@ fn validate_study_request(
         },
         series: data.series.clone(),
         lake_series: true,
+        mode: match request.mode.as_deref() {
+            Some(text) => tessera::study::StudyMode::parse(text)?,
+            None => tessera::study::StudyMode::default(),
+        },
     };
     // Bases may be declared series, plus the lake side feeds on the lake grid.
     let mut names: Vec<String> = data.series.iter().map(|s| s.name.clone()).collect();

@@ -1470,6 +1470,8 @@ type StudyCell = {
   breakeven_bps?: number | null;
   curves?: StudyCurve[];
   buckets: { bucket: number; count: number; feature_mean: number; forward_bps: number }[];
+  // Cross-sectional cells carry the per-date IC statistics.
+  cross_section?: { dates: number; ic_t: number | null; ic_positive_share: number; symbols_per_date: number } | null;
 };
 type StudyCurve = {
   variant: string;
@@ -1481,7 +1483,9 @@ type StudyCurve = {
   curve: { observation: number; cumulative_bps: number }[];
 };
 type StudyResult = {
-  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number; target?: string; resolution?: string };
+  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number; target?: string; resolution?: string; mode?: string };
+  // `time_series` or `cross_sectional` (absent on older results).
+  mode?: string;
   // The bar grid (`1s`, `daily`, `5m`, `1m`), the registered exogenous series, and the
   // features that could not run on it.
   grid?: string;
@@ -1564,7 +1568,7 @@ function StudyCurveChart({ cell, variant, unit }: { cell: StudyCell; variant: st
   return (
     <div className="equity-chart study-curve">
       <div className="chart-readout">
-        <strong>{curve.variant === "sign" ? "position = sign(z)" : "position = clip(z, ±3)"}</strong>
+        <strong>{curve.variant === "sign" ? "position = sign(z)" : curve.variant === "long_short" ? "long top decile, short bottom decile, rebalanced each date" : "position = clip(z, ±3)"}</strong>
         <span>Sharpe {formatNumber(finite(curve.sharpe), 2)}</span>
         <span>turnover {formatNumber(finite(curve.turnover), 3)}/bar</span>
         <span className={classFor(finite(curve.breakeven_bps) ?? undefined)}>breakeven {signed(curve.breakeven_bps, 4)} {unit}</span>
@@ -1610,6 +1614,7 @@ function StudiesWorkspace() {
   const [horizons, setHorizons] = useState("1,5,30,60");
   const [delay, setDelay] = useState(1);
   const [target, setTarget] = useState("return");
+  const [mode, setMode] = useState("time_series");
   const [scope, setScope] = useState("ALL");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1699,6 +1704,7 @@ function StudiesWorkspace() {
           horizons: horizons.split(",").map((h) => Number(h.trim())).filter((h) => h > 0),
           decision_delay_bars: delay,
           target,
+          mode,
         }),
       });
       const body = await response.json();
@@ -1759,6 +1765,14 @@ function StudiesWorkspace() {
                   {STUDY_TARGETS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
                 </select>
                 <small>what every feature is scored against over the horizon</small>
+              </label>
+              <label>
+                Mode
+                <select value={mode} onChange={(e) => setMode(e.target.value)}>
+                  <option value="time_series">Time-series · per symbol along time</option>
+                  <option value="cross_sectional">Cross-sectional · across symbols per date</option>
+                </select>
+                <small>{mode === "cross_sectional" ? "rank the feature across symbols each date; IC per date, long-short decile portfolio" : "each symbol against its own forward target, plus a pooled cell"}</small>
               </label>
             </div>
             <div className="study-pick-grid">
@@ -1879,7 +1893,7 @@ function StudiesWorkspace() {
             <>
               <div className="sweep-summary-strip">
                 <strong>{detail.study.name}</strong>
-                <span>{result.start} → {result.end} · {resultGrid} grid · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
+                <span>{result.start} → {result.end} · {resultGrid} grid · {(result.mode ?? result.config.mode ?? "time_series").replace("_", "-")} · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
                 <span>{result.symbols.map((s) => `${s.symbol} ${(s.bars_with_book || s.bars).toLocaleString()} bars`).join(" · ")}</span>
               </div>
               {result.series && result.series.length > 0 && (
@@ -1898,7 +1912,7 @@ function StudiesWorkspace() {
                         <td
                           key={h}
                           className={c ? icClass(c.ic) : "pending-cell"}
-                          title={c ? `top-bottom ${signed(c.top_minus_bottom_bps, 2)} bp · breakeven ${signed(c.breakeven_bps, 3)} bp · t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar` : ""}
+                          title={c ? `top-bottom ${signed(c.top_minus_bottom_bps, 2)} bp · breakeven ${signed(c.breakeven_bps, 3)} bp · t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar${c.cross_section ? ` · ${c.cross_section.dates} dates · IC t=${formatNumber(finite(c.cross_section.ic_t), 1)} · ${Math.round(c.cross_section.ic_positive_share * 100)}% positive` : ""}` : ""}
                           onClick={() => { if (c) { setBucketFeature(feature); setBucketHorizon(h); } }}
                         >
                           {c ? `${c.ic >= 0 ? "+" : ""}${c.ic.toFixed(4)}` : "·"}
@@ -1940,7 +1954,7 @@ function StudiesWorkspace() {
                 </select>
               </div>
               {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
-              <p className="footnote">Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L.</p>
+              <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L."}</p>
               <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
               {ranked.length ? (
                 <>

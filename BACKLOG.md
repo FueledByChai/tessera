@@ -101,7 +101,7 @@ lake register automatically.
 bar before availability does not see the value and the bar after does; funding rate is usable as
 a base in a SOL study.
 
-### WB-06 Cross-sectional mode — `todo` — Blocked by WB-04
+### WB-06 Cross-sectional mode — `done 2026-09-07 WB-06: cross-sectional mode` — Blocked by WB-04
 For daily panels across many symbols: rank the feature across symbols per date, IC per date,
 mean and t across dates, and a costless long-short decile portfolio with its equity curve.
 **Done when:** a synthetic panel where the feature is the next-day return gives IC near 1 and the

@@ -18,7 +18,7 @@
 //! or `trade_count`, optionally followed by streaming transforms, e.g.
 //! `signed_volume | zscore 30` or `trade_count | rate 1 | ratio_to sma 300`.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -91,6 +91,36 @@ pub struct StudyConfig {
     /// On the lake grid, register funding and open interest for every symbol (default on).
     #[serde(default = "default_true")]
     pub lake_series: bool,
+    /// `time_series` (default): each symbol's feature against its own forward target, plus a
+    /// pooled cell. `cross_sectional`: per date, the feature ranked across symbols against
+    /// their targets, IC per date, and a long-short decile portfolio. See [`StudyMode`].
+    #[serde(default)]
+    pub mode: StudyMode,
+}
+
+/// How a study reads the panel: along time within each symbol, or across symbols per date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StudyMode {
+    #[default]
+    TimeSeries,
+    CrossSectional,
+}
+
+impl StudyMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            StudyMode::TimeSeries => "time_series",
+            StudyMode::CrossSectional => "cross_sectional",
+        }
+    }
+    pub fn parse(text: &str) -> Result<StudyMode> {
+        match text.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "" | "time_series" | "timeseries" | "ts" => Ok(StudyMode::TimeSeries),
+            "cross_sectional" | "crosssectional" | "cs" | "xs" => Ok(StudyMode::CrossSectional),
+            other => bail!("unknown study mode {other:?}; use time_series or cross_sectional"),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -498,8 +528,25 @@ pub struct StudyCell {
     /// Cost per unit traded, in bps, at which the `zscore` curve's mean P&L is zero.
     pub breakeven_bps: f64,
     pub buckets: Vec<BucketRow>,
-    /// Costless curves: `zscore` first, then `sign`.
+    /// Costless curves: `zscore` first, then `sign`; a single `long_short` curve on a
+    /// cross-sectional cell.
     pub curves: Vec<CostlessCurve>,
+    /// Present on cross-sectional cells: the per-date IC statistics.
+    pub cross_section: Option<CrossSection>,
+}
+
+/// Per-date statistics of a cross-sectional cell. `ic` on the cell is the mean of the daily
+/// rank correlations; the long-short figures are the top decile long, bottom decile short,
+/// rebalanced every date and paid the target over the horizon.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossSection {
+    /// Dates with at least `buckets` symbols, so every decile is populated.
+    pub dates: usize,
+    /// Mean daily IC over its standard error across dates.
+    pub ic_t: f64,
+    /// Share of dates with a positive IC.
+    pub ic_positive_share: f64,
+    pub symbols_per_date: f64,
 }
 
 /// One costless trading rule on a cell: a position taken from the feature at every bar, paid
@@ -539,6 +586,31 @@ const Z_CLIP: f64 = 3.0;
 /// Independent periods per year for annualizing a horizon on a grid.
 fn periods_per_year(grid: Grid, horizon: usize) -> f64 {
     grid.bars_per_year() / horizon.max(1) as f64
+}
+
+/// A cumulative series sampled at up to [`CURVE_POINTS`] observations, first and last kept.
+fn curve_points(cumulative: &[f64]) -> Vec<CurvePoint> {
+    let n = cumulative.len();
+    if n <= CURVE_POINTS {
+        cumulative
+            .iter()
+            .enumerate()
+            .map(|(observation, &cumulative_bps)| CurvePoint {
+                observation,
+                cumulative_bps,
+            })
+            .collect()
+    } else {
+        (0..CURVE_POINTS)
+            .map(|k| {
+                let observation = k * (n - 1) / (CURVE_POINTS - 1);
+                CurvePoint {
+                    observation,
+                    cumulative_bps: cumulative[observation],
+                }
+            })
+            .collect()
+    }
 }
 
 /// The costless curve for one variant over aligned (feature, forward return in bps) pairs.
@@ -603,26 +675,7 @@ pub fn costless_curve(
         total += value;
         cumulative.push(total);
     }
-    let curve = if n <= CURVE_POINTS {
-        cumulative
-            .iter()
-            .enumerate()
-            .map(|(observation, &cumulative_bps)| CurvePoint {
-                observation,
-                cumulative_bps,
-            })
-            .collect()
-    } else {
-        (0..CURVE_POINTS)
-            .map(|k| {
-                let observation = k * (n - 1) / (CURVE_POINTS - 1);
-                CurvePoint {
-                    observation,
-                    cumulative_bps: cumulative[observation],
-                }
-            })
-            .collect()
-    };
+    let curve = curve_points(&cumulative);
     CostlessCurve {
         variant: variant.to_owned(),
         mean_bps: if n == 0 { f64::NAN } else { mean_bps },
@@ -642,6 +695,7 @@ pub struct StudyResult {
     pub target_unit: String,
     /// The bar grid: `1s`, `daily`, `5m`, or `1m`.
     pub grid: String,
+    pub mode: StudyMode,
     /// Exogenous series that were registered for this study, usable as bases.
     pub series: Vec<String>,
     /// Features that could not run on this grid, with the reason, instead of failing.
@@ -670,6 +724,8 @@ struct SymbolSeries {
     symbol: String,
     book: TargetSeries,
     features: BTreeMap<String, Vec<f64>>,
+    /// Each bar's close instant (microseconds UTC): the cross-section groups symbols by it.
+    keys: Vec<i64>,
     bars: usize,
     bars_with_book: usize,
 }
@@ -756,6 +812,7 @@ fn evaluate_symbol(
         symbol: symbol.to_owned(),
         book: TargetSeries::from_bars(bars, grid),
         features,
+        keys: bars.iter().map(|bar| bar_close_us(bar, grid)).collect(),
         bars: bars.len(),
         bars_with_book,
     })
@@ -907,6 +964,177 @@ fn pairs(feature: &[f64], targets: &[f64], delay: usize) -> (Vec<f64>, Vec<f64>)
     (xs, ys)
 }
 
+/// As [`pairs`], keeping the feature bar's index for grouping across symbols.
+fn pairs_indexed(feature: &[f64], targets: &[f64], delay: usize) -> Vec<(usize, f64, f64)> {
+    let mut out = Vec::new();
+    for (i, &x) in feature.iter().enumerate() {
+        let Some(&y) = targets.get(i + delay) else {
+            break;
+        };
+        if x.is_finite() && y.is_finite() {
+            out.push((i, x, y));
+        }
+    }
+    out
+}
+
+/// A cross-sectional cell over (date key, symbol index, feature, target) observations: per
+/// date with at least `buckets` symbols, the rank correlation across symbols, decile means,
+/// and the long-short decile portfolio (long the top decile, short the bottom, equal weights
+/// on each side, rebalanced every date). Turnover is the sum of absolute weight changes per
+/// date (a full swap of both sides is 4); breakeven is the mean long-short P&L over it.
+/// `None` with fewer than two usable dates.
+fn cross_section_cell(
+    feature: &str,
+    horizon: usize,
+    grid: Grid,
+    buckets: usize,
+    observations: &[(i64, usize, f64, f64)],
+) -> Option<StudyCell> {
+    let buckets = buckets.max(2);
+    let mut by_date: BTreeMap<i64, Vec<(usize, f64, f64)>> = BTreeMap::new();
+    for &(key, symbol, x, y) in observations {
+        by_date.entry(key).or_default().push((symbol, x, y));
+    }
+    let mut ics = Vec::new();
+    let mut pnls = Vec::new();
+    let mut turnovers = Vec::new();
+    let mut bucket_x = vec![0.0; buckets];
+    let mut bucket_y = vec![0.0; buckets];
+    let mut bucket_n = vec![0usize; buckets];
+    let mut previous: HashMap<usize, f64> = HashMap::new();
+    let mut used = 0usize;
+    for rows in by_date.values() {
+        let n = rows.len();
+        if n < buckets {
+            continue;
+        }
+        let xs: Vec<f64> = rows.iter().map(|r| r.1).collect();
+        let ys: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let ic = spearman(&xs, &ys);
+        if !ic.is_finite() {
+            continue;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|a, b| {
+            xs[*a]
+                .partial_cmp(&xs[*b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut top = Vec::new();
+        let mut bottom = Vec::new();
+        for (rank, &i) in order.iter().enumerate() {
+            let b = rank * buckets / n;
+            bucket_x[b] += xs[i];
+            bucket_y[b] += ys[i];
+            bucket_n[b] += 1;
+            if b == 0 {
+                bottom.push(i);
+            }
+            if b + 1 == buckets {
+                top.push(i);
+            }
+        }
+        let mean = |set: &[usize]| set.iter().map(|&i| ys[i]).sum::<f64>() / set.len() as f64;
+        let mut weights: HashMap<usize, f64> = HashMap::with_capacity(top.len() + bottom.len());
+        for &i in &top {
+            weights.insert(rows[i].0, 1.0 / top.len() as f64);
+        }
+        for &i in &bottom {
+            weights.insert(rows[i].0, -1.0 / bottom.len() as f64);
+        }
+        if !previous.is_empty() {
+            let mut turnover = 0.0;
+            for (symbol, weight) in &weights {
+                turnover += (weight - previous.get(symbol).copied().unwrap_or(0.0)).abs();
+            }
+            for (symbol, weight) in &previous {
+                if !weights.contains_key(symbol) {
+                    turnover += weight.abs();
+                }
+            }
+            turnovers.push(turnover);
+        }
+        previous = weights;
+        ics.push(ic);
+        pnls.push(mean(&top) - mean(&bottom));
+        used += n;
+    }
+    if ics.len() < 2 {
+        return None;
+    }
+    let (ic_mean, ic_se) = mean_and_se(&ics);
+    let (pnl_mean, pnl_se) = mean_and_se(&pnls);
+    let sd = pnl_se * (pnls.len() as f64).sqrt();
+    let sharpe = if sd > 0.0 {
+        pnl_mean / sd * periods_per_year(grid, horizon).sqrt()
+    } else {
+        f64::NAN
+    };
+    let turnover = if turnovers.is_empty() {
+        0.0
+    } else {
+        turnovers.iter().sum::<f64>() / turnovers.len() as f64
+    };
+    let breakeven_bps = if turnover > 0.0 {
+        pnl_mean / turnover
+    } else {
+        f64::NAN
+    };
+    let mut cumulative = Vec::with_capacity(pnls.len());
+    let mut total = 0.0;
+    for pnl in &pnls {
+        total += pnl;
+        cumulative.push(total);
+    }
+    let rows = (0..buckets)
+        .filter(|&b| bucket_n[b] > 0)
+        .map(|b| BucketRow {
+            bucket: b + 1,
+            count: bucket_n[b],
+            feature_mean: bucket_x[b] / bucket_n[b] as f64,
+            forward_bps: bucket_y[b] / bucket_n[b] as f64,
+        })
+        .collect();
+    Some(StudyCell {
+        symbol: "ALL".to_owned(),
+        feature: feature.to_owned(),
+        horizon_bars: horizon,
+        horizon_secs: horizon as u32 * grid.step_secs(),
+        observations: used,
+        ic: ic_mean,
+        top_minus_bottom_bps: pnl_mean,
+        top_minus_bottom_t: if pnl_se > 0.0 {
+            pnl_mean / pnl_se
+        } else {
+            f64::NAN
+        },
+        sharpe,
+        turnover,
+        breakeven_bps,
+        buckets: rows,
+        curves: vec![CostlessCurve {
+            variant: "long_short".to_owned(),
+            mean_bps: pnl_mean,
+            sharpe,
+            turnover,
+            breakeven_bps,
+            final_bps: total,
+            curve: curve_points(&cumulative),
+        }],
+        cross_section: Some(CrossSection {
+            dates: ics.len(),
+            ic_t: if ic_se > 0.0 {
+                ic_mean / ic_se
+            } else {
+                f64::NAN
+            },
+            ic_positive_share: ics.iter().filter(|ic| **ic > 0.0).count() as f64 / ics.len() as f64,
+            symbols_per_date: used as f64 / ics.len() as f64,
+        }),
+    })
+}
+
 fn cell(
     symbol: &str,
     feature: &str,
@@ -975,6 +1203,7 @@ fn cell(
         breakeven_bps: curves[0].breakeven_bps,
         buckets: rows,
         curves,
+        cross_section: None,
     }
 }
 
@@ -1109,6 +1338,30 @@ pub fn run_on_panel_with_series(
     let mut done = 0usize;
     for feature in &features {
         for (hi, &horizon) in config.horizons.iter().enumerate() {
+            if config.mode == StudyMode::CrossSectional {
+                let mut observations = Vec::new();
+                for (si, (s, symbol_targets)) in series.iter().zip(&targets).enumerate() {
+                    for (i, x, y) in pairs_indexed(
+                        &s.features[feature],
+                        &symbol_targets[hi],
+                        config.decision_delay_bars,
+                    ) {
+                        observations.push((s.keys[i], si, x, y));
+                    }
+                    done += 1;
+                }
+                if let Some(c) =
+                    cross_section_cell(feature, horizon, grid, config.buckets, &observations)
+                {
+                    cells.push(c);
+                }
+                done += 1;
+                eprintln!(
+                    "progress: study {done}/{total} cells elapsed={}s",
+                    started.elapsed().as_secs()
+                );
+                continue;
+            }
             let mut pooled_x = Vec::new();
             let mut pooled_y = Vec::new();
             for (s, symbol_targets) in series.iter().zip(&targets) {
@@ -1155,6 +1408,7 @@ pub fn run_on_panel_with_series(
         target: config.target,
         target_unit: config.target.unit().to_owned(),
         grid: grid.label(),
+        mode: config.mode,
         series: series_names,
         unavailable,
         start,
@@ -1175,14 +1429,16 @@ pub fn run_on_panel_with_series(
     )?;
     let mut csv = String::from(
         "symbol,feature,horizon_secs,observations,ic,top_minus_bottom_bps,top_minus_bottom_t,\
-         sharpe,turnover,breakeven_bps,sign_sharpe,sign_turnover,sign_breakeven_bps\n",
+         sharpe,turnover,breakeven_bps,sign_sharpe,sign_turnover,sign_breakeven_bps,\
+         dates,ic_t,ic_positive_share\n",
     );
     let mut curves =
         String::from("symbol,feature,horizon_secs,variant,observation,cumulative_bps\n");
     for c in &result.cells {
-        let sign = &c.curves[1];
+        let sign = c.curves.get(1);
+        let cross = c.cross_section.as_ref();
         csv.push_str(&format!(
-            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{:.3},{:.4},{:.4}\n",
+            "{},{},{},{},{:.5},{:.3},{:.2},{:.3},{:.4},{:.4},{},{},{},{},{},{}\n",
             c.symbol,
             c.feature,
             c.horizon_secs,
@@ -1193,9 +1449,16 @@ pub fn run_on_panel_with_series(
             c.sharpe,
             c.turnover,
             c.breakeven_bps,
-            sign.sharpe,
-            sign.turnover,
-            sign.breakeven_bps
+            sign.map(|s| format!("{:.3}", s.sharpe)).unwrap_or_default(),
+            sign.map(|s| format!("{:.4}", s.turnover))
+                .unwrap_or_default(),
+            sign.map(|s| format!("{:.4}", s.breakeven_bps))
+                .unwrap_or_default(),
+            cross.map(|x| x.dates.to_string()).unwrap_or_default(),
+            cross.map(|x| format!("{:.2}", x.ic_t)).unwrap_or_default(),
+            cross
+                .map(|x| format!("{:.3}", x.ic_positive_share))
+                .unwrap_or_default(),
         ));
         for curve in &c.curves {
             for point in &curve.curve {
@@ -1228,8 +1491,9 @@ pub fn summary_table(result: &StudyResult) -> String {
     let unit = result.target.unit();
     let _ = writeln!(
         out,
-        "grid: {} · target: {} ({unit})",
+        "grid: {} · mode: {} · target: {} ({unit})",
         result.grid,
+        result.mode.name(),
         result.target.name()
     );
     if !result.series.is_empty() {
@@ -1554,6 +1818,7 @@ mod tests {
             target: Target::Return,
             series: Vec::new(),
             lake_series: true,
+            mode: StudyMode::TimeSeries,
         };
         let start = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
@@ -1722,6 +1987,7 @@ mod tests {
             target: Target::Return,
             series: Vec::new(),
             lake_series: false,
+            mode: StudyMode::TimeSeries,
         };
         let out = std::env::temp_dir().join(format!("tessera-wb05-study-{}", std::process::id()));
         let result = run_on_panel_with_series(
@@ -1756,6 +2022,131 @@ mod tests {
         )
         .unwrap();
         assert!(other.cells.is_empty());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The done line: on a panel where every symbol's feature is its own next-day return (an
+    /// oracle series available at each bar's close), the cross-section ranks symbols
+    /// perfectly every date, so the mean IC is 1 and the long-short curve only climbs.
+    #[test]
+    fn cross_sectional_oracle_gives_ic_one_and_a_monotone_curve() {
+        let symbols = 30;
+        let days = 300;
+        let mut seed: u64 = 0xc5;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0
+        };
+        let mut panel = Vec::new();
+        let mut oracle = Vec::new();
+        for k in 0..symbols {
+            let name = format!("S{k:02}.US");
+            let mut close = 50.0 + k as f64;
+            let mut rows = Vec::with_capacity(days);
+            for _ in 0..days {
+                close *= 1.0 + (rand() - 0.5) * 0.04;
+                rows.push((close, close * 1.01, close * 0.99, close, 1000.0));
+            }
+            let bars = daily_bars(&rows);
+            for d in 0..days - 1 {
+                // The next day's return plus a whisker of noise (a bp against moves of
+                // hundreds), so the daily ICs sit near 1 rather than exactly on it.
+                let next_return = (bars[d + 1].close / bars[d].close - 1.0) * 1e4;
+                oracle.push(crate::series::Observation {
+                    nominal_us: bar_close_us(&bars[d], Grid::Daily),
+                    available_us: bar_close_us(&bars[d], Grid::Daily),
+                    symbol: Some(name.clone()),
+                    value: next_return + (rand() - 0.5) * 2.0,
+                });
+            }
+            panel.push((name, bars));
+        }
+        let oracle = Series::new("oracle", SeriesKind::Level, oracle);
+        let config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: panel.iter().map(|(s, _)| s.clone()).collect(),
+            step_secs: 1,
+            resolution: Some("daily".to_owned()),
+            daily_dir: PathBuf::new(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: None,
+            session: SessionKind::Regular,
+            features: vec!["oracle".to_owned()],
+            horizons: vec![1],
+            decision_delay_bars: 0,
+            buckets: 10,
+            target: Target::Return,
+            series: Vec::new(),
+            lake_series: false,
+            mode: StudyMode::CrossSectional,
+        };
+        let out = std::env::temp_dir().join(format!("tessera-wb06-{}", std::process::id()));
+        let start = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 12, 31).unwrap();
+        let result = run_on_panel_with_series(
+            &config,
+            panel.clone(),
+            vec![oracle.clone()],
+            start,
+            end,
+            &out.join("xs"),
+        )
+        .unwrap();
+        assert_eq!(result.mode, StudyMode::CrossSectional);
+        assert_eq!(
+            result.cells.len(),
+            1,
+            "one pooled cell, no per-symbol cells"
+        );
+        let c = &result.cells[0];
+        assert_eq!(c.symbol, "ALL");
+        assert!(c.ic > 0.99 && c.ic < 1.0, "mean daily IC {}", c.ic);
+        let cross = c.cross_section.as_ref().unwrap();
+        assert_eq!(cross.dates, days - 1);
+        assert!((cross.symbols_per_date - symbols as f64).abs() < 1e-9);
+        assert!(cross.ic_t > 50.0 && cross.ic_positive_share == 1.0);
+        assert!(c.top_minus_bottom_bps > 0.0 && c.sharpe > 0.0);
+        assert!(c.turnover > 0.0 && c.turnover <= 4.0 && c.breakeven_bps > 0.0);
+        assert_eq!(c.curves.len(), 1);
+        assert_eq!(c.curves[0].variant, "long_short");
+        let points = &c.curves[0].curve;
+        assert!(points.len() == days - 1);
+        assert!(
+            points
+                .windows(2)
+                .all(|w| w[1].cumulative_bps > w[0].cumulative_bps),
+            "the long-short curve climbs every date"
+        );
+        assert_eq!(c.buckets.len(), 10);
+        assert!(c.buckets[9].forward_bps > c.buckets[0].forward_bps);
+        assert!(summary_table(&result).contains("mode: cross_sectional"));
+        // The same panel along time also sees the oracle, per symbol and pooled.
+        let ts = run_on_panel_with_series(
+            &StudyConfig {
+                mode: StudyMode::TimeSeries,
+                ..config.clone()
+            },
+            panel,
+            vec![oracle],
+            start,
+            end,
+            &out.join("ts"),
+        )
+        .unwrap();
+        assert_eq!(ts.cells.len(), symbols + 1);
+        assert!(ts.cells.iter().all(|c| c.ic > 0.99));
+        assert_eq!(
+            StudyMode::parse("cross-sectional").unwrap(),
+            StudyMode::CrossSectional
+        );
+        assert_eq!(
+            StudyMode::parse("time_series").unwrap(),
+            StudyMode::TimeSeries
+        );
+        assert!(StudyMode::parse("panel").is_err());
         let _ = fs::remove_dir_all(&out);
     }
 

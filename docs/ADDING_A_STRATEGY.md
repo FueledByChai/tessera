@@ -129,6 +129,16 @@ Bases: `obi_l1`, `obi_l5`, `obi_l10`, `microprice_bps`, `spread_bps`, `trade_imb
 bps, never above zero); `range_bps` is the bar's high-low range over its close; `gap_bps` is the
 open against the previous close.
 
+**Cross-sectional mode.** `mode = "cross_sectional"` (the form's Mode select) reads a
+many-symbol panel across symbols instead of along time: on every date with at least `buckets`
+symbols, the feature is ranked across symbols against their targets, giving an IC per date
+(the cell's IC is the mean, with a t across dates and the share of positive dates), decile
+means, and a costless long-short decile portfolio, long the top decile and short the bottom,
+equal weights, rebalanced every date, whose cumulative curve, Sharpe, turnover (absolute weight
+change per date; a full swap of both sides is 4), and breakeven cost fill the cell. Only the
+pooled `ALL` cell exists in this mode. Meant for daily panels; the time-series mode remains the
+default.
+
 **Exogenous series.** Anything observed outside the bar stream joins a study as a base:
 declare it under `[[data.series]]` in `local.toml` (name, CSV or parquet path, `kind` of
 `level` or `event`, the time and value columns, an optional `symbol_column`, and either an
