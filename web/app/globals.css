@@ -2591,6 +2591,42 @@ nav {
   text-transform: uppercase;
   white-space: nowrap;
 }
+/* What loading dropped or skipped (HK-02): quiet when nothing was, amber when something was. */
+.sanitation-note {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  margin-bottom: 14px;
+  padding: 11px 14px;
+  border: 1px solid var(--line, #414141);
+  color: var(--muted);
+  font-size: 13px;
+}
+.sanitation-note strong {
+  font: 800 12px var(--font-geist-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.sanitation-note.dropped {
+  border-color: var(--accent, #f89828);
+  color: var(--ink, #f0f0f0);
+}
+.sanitation-note.dropped strong {
+  color: var(--accent, #f89828);
+}
+.skipped-symbols {
+  margin-bottom: 14px;
+}
+.skipped-symbols th,
+.skipped-symbols td {
+  text-align: left;
+}
+.skipped-symbols .skip-reason {
+  white-space: normal;
+  color: var(--muted);
+}
 .coverage-warning span {
   color: #d9adb0;
 }

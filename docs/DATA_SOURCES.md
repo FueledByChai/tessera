@@ -88,6 +88,9 @@ Vendor daily files contain prints that are not market data: closes on market hol
 spikes that revert the next session, and segments where the whole price scale changes overnight
 and stays changed. The SDK runner cleans daily series as it loads them (`[data] sanitize_prices`,
 default on; the calendar symbol's own dates define the session calendar), drops the first two
-kinds, skips symbols with the third, and prints the counts in the run log. For a standalone
+kinds, skips symbols with the third, prints the counts in the run log, and writes them to
+`sanitation.json` beside the report (off-calendar rows, spikes, and every skipped symbol with
+its reason, including symbols with no bars in the window). The run page shows the counts on
+the Overview tab and lists the skipped symbols on the Symbols tab. For a standalone
 audit of a library, `research/scripts/scan_bad_prints.py` in the private repo lists every
 suspect file with its first bad date.

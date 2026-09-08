@@ -165,7 +165,7 @@ hedge even when the form lists only `universe:stocks`).
 **Done when:** a test shows the appended symbol present in the plan when omitted from the form,
 and the Dogs manifest declares it.
 
-### HK-02 Sanitation counts on the run page — `todo`
+### HK-02 Sanitation counts on the run page — `done 2026-09-08 HK-02: sanitation counts on the run page from a sanitation.json sidecar`
 Show dropped off-calendar rows, dropped spikes, and skipped symbols from the run log in the
 Overview tab, with the skipped symbols listed on the Symbols tab.
 **Done when:** a run over `examples/data` with an injected holiday row shows the count in the UI.

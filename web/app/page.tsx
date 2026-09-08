@@ -370,6 +370,12 @@ type ReportView = {
     annual_drawdown_percent: number;
   }[];
 };
+// What loading dropped or skipped, from sanitation.json beside the report (HK-02).
+type RunSanitation = {
+  off_calendar: number;
+  spikes: number;
+  skipped: { symbol: string; reason: string }[];
+};
 type RunDetail = {
   run: Run;
   report?: ReportView;
@@ -377,6 +383,7 @@ type RunDetail = {
   config_text?: string;
   manifest?: Record<string, unknown>;
   job_error?: string | null;
+  sanitation?: RunSanitation | null;
 };
 
 /** Why a failed run failed, straight from the worker. */
@@ -769,10 +776,12 @@ function RunReport({ detail }: { detail: RunDetail }) {
       </section>
     );
   const m = report.metrics;
+  const sanitation = detail.sanitation ?? null;
+  const skipped = sanitation?.skipped ?? [];
   const tabs: [ReportTab, string][] = [
     ["overview", "Overview"],
     ["trades", `Trades · ${report.trades.length.toLocaleString()}`],
-    ["symbols", `Symbols · ${report.symbols.length.toLocaleString()}`],
+    ["symbols", `Symbols · ${report.symbols.length.toLocaleString()}${skipped.length ? ` · ${skipped.length.toLocaleString()} skipped` : ""}`],
   ];
   return (
     <>
@@ -798,6 +807,16 @@ function RunReport({ detail }: { detail: RunDetail }) {
             {report.coverage.covered} of {report.coverage.total} signal sessions
             were covered ({number(report.coverage.percent, 2)}%). Treat
             performance as coverage-dependent.
+          </span>
+        </div>
+      )}
+      {sanitation && (
+        <div className={sanitation.off_calendar + sanitation.spikes + skipped.length > 0 ? "sanitation-note dropped" : "sanitation-note"} data-testid="sanitation">
+          <strong>Data sanitation</strong>
+          <span>
+            {sanitation.off_calendar + sanitation.spikes + skipped.length > 0
+              ? `dropped ${sanitation.off_calendar.toLocaleString()} off-calendar row${sanitation.off_calendar === 1 ? "" : "s"} and ${sanitation.spikes.toLocaleString()} one-bar spike${sanitation.spikes === 1 ? "" : "s"}; skipped ${skipped.length.toLocaleString()} symbol${skipped.length === 1 ? "" : "s"}${skipped.length ? " (listed on the Symbols tab)" : ""}`
+              : "nothing dropped: every row sat on the calendar, no spikes, no symbols skipped"}
           </span>
         </div>
       )}
@@ -1143,6 +1162,24 @@ function RunReport({ detail }: { detail: RunDetail }) {
               <small>Coverage counts the signal sessions each symbol had bars for.</small>
             )}
           </div>
+          {skipped.length > 0 && (
+            <div className="skipped-symbols">
+              <div className="terminal-panel-title"><span>SKIP</span> SKIPPED AT LOAD · {skipped.length.toLocaleString()}</div>
+              <div className="table-wrap">
+                <table>
+                  <thead><tr><th>Symbol</th><th>Reason</th></tr></thead>
+                  <tbody>
+                    {skipped.map((s) => (
+                      <tr key={s.symbol}>
+                        <td>{s.symbol}</td>
+                        <td className="skip-reason">{s.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
           <div className="table-wrap">
             <table>
               <thead>

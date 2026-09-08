@@ -669,6 +669,36 @@ pub fn load_daily(path: &Path) -> Result<Vec<Bar>> {
     Ok(bars)
 }
 
+/// What loading dropped or skipped across a whole run, written to `sanitation.json` beside
+/// the report so the run page can show it (HK-02).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSanitation {
+    /// Rows on dates the calendar symbol did not trade, summed over every daily file.
+    pub off_calendar: usize,
+    /// One-bar spikes dropped, summed over every daily file.
+    pub spikes: usize,
+    /// Symbols left out of the run, with the reason: a persistent scale break, or no bars
+    /// (or lake trades) in the requested window.
+    pub skipped: Vec<SkippedSymbol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedSymbol {
+    pub symbol: String,
+    pub reason: String,
+}
+
+impl RunSanitation {
+    fn skip(&mut self, symbol: &str, reason: impl Into<String>) {
+        let reason = reason.into();
+        eprintln!("warning: skipping {symbol}: {reason}");
+        self.skipped.push(SkippedSymbol {
+            symbol: symbol.to_owned(),
+            reason,
+        });
+    }
+}
+
 /// What `sanitize_daily` removed from one file.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DailySanitation {
@@ -940,6 +970,8 @@ struct ReplayPlan {
     equity_symbol: String,
     /// Description of the symbol set for the report.
     symbol_note: Vec<String>,
+    /// What loading dropped or skipped.
+    sanitation: RunSanitation,
 }
 
 fn make_instance(
@@ -1025,30 +1057,26 @@ fn plan_standard(
     } else {
         None
     };
-    let sanitation = (
-        std::sync::atomic::AtomicUsize::new(0), // off-calendar rows
-        std::sync::atomic::AtomicUsize::new(0), // spike rows
-        std::sync::atomic::AtomicUsize::new(0), // rejected symbols
-    );
+    let sanitation: Mutex<RunSanitation> = Mutex::new(RunSanitation::default());
+    let skip = |symbol: &str, reason: &str| {
+        sanitation
+            .lock()
+            .expect("sanitation lock poisoned")
+            .skip(symbol, reason);
+    };
     let sanitize = |symbol: &str, bars: &mut Vec<Bar>| -> bool {
         if !config.data.sanitize_prices {
             return true;
         }
         match sanitize_daily(bars, calendar.as_ref()) {
             Ok(report) => {
-                sanitation
-                    .0
-                    .fetch_add(report.off_calendar, std::sync::atomic::Ordering::Relaxed);
-                sanitation
-                    .1
-                    .fetch_add(report.spikes, std::sync::atomic::Ordering::Relaxed);
+                let mut record = sanitation.lock().expect("sanitation lock poisoned");
+                record.off_calendar += report.off_calendar;
+                record.spikes += report.spikes;
                 true
             }
             Err(reason) => {
-                sanitation
-                    .2
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("warning: skipping {symbol}: {reason}");
+                skip(symbol, &reason);
                 false
             }
         }
@@ -1082,9 +1110,7 @@ fn plan_standard(
                     };
                     let lake_bars = crate::lake::build_bars(lake, &sym, step, load_from, end)?;
                     if lake_bars.is_empty() {
-                        eprintln!(
-                            "warning: skipping {symbol}: no lake trades in the requested window"
-                        );
+                        skip(symbol, "no lake trades in the requested window");
                         return Ok(None);
                     }
                     let mut book = Vec::with_capacity(lake_bars.len());
@@ -1143,7 +1169,7 @@ fn plan_standard(
                 if bars.is_empty() {
                     // Listed after the window or delisted before it: skip rather than abort,
                     // so universe-sized explicit lists run without hand-pruning.
-                    eprintln!("warning: skipping {symbol}: no bars in the requested window");
+                    skip(symbol, "no bars in the requested window");
                     return Ok(None);
                 }
                 let daily = if manifest.daily_context && config.data.resolution.is_intraday() {
@@ -1170,17 +1196,14 @@ fn plan_standard(
         loaded.len(),
         load_started.elapsed().as_secs()
     );
-    {
-        let (off_calendar, spikes, rejected) = (
-            sanitation.0.into_inner(),
-            sanitation.1.into_inner(),
-            sanitation.2.into_inner(),
+    let sanitation = sanitation.into_inner().expect("sanitation lock poisoned");
+    if sanitation.off_calendar + sanitation.spikes + sanitation.skipped.len() > 0 {
+        eprintln!(
+            "sanitized daily data: dropped {} off-calendar rows and {} one-bar spikes; skipped {} symbols",
+            sanitation.off_calendar,
+            sanitation.spikes,
+            sanitation.skipped.len()
         );
-        if off_calendar + spikes + rejected > 0 {
-            eprintln!(
-                "sanitized daily data: dropped {off_calendar} off-calendar rows and {spikes} one-bar spikes; skipped {rejected} symbols with a persistent scale break"
-            );
-        }
     }
     let mut active: Vec<String> = Vec::new();
     let mut book_series: BTreeMap<
@@ -1306,6 +1329,7 @@ fn plan_standard(
         instances,
         equity_symbol: active[0].clone(),
         symbol_note: active.clone(),
+        sanitation,
     })
 }
 
@@ -1338,6 +1362,7 @@ fn plan_screened(
     let next_session: BTreeMap<NaiveDate, NaiveDate> =
         calendar.windows(2).map(|pair| (pair[0], pair[1])).collect();
     let calendar_dates: BTreeSet<NaiveDate> = calendar.iter().copied().collect();
+    let sanitation: Mutex<RunSanitation> = Mutex::new(RunSanitation::default());
     let session_dates = calendar
         .iter()
         .copied()
@@ -1364,9 +1389,19 @@ fn plan_screened(
             }
             let mut daily = load_daily(&path)?;
             if config.data.sanitize_prices {
-                if let Err(reason) = sanitize_daily(&mut daily, Some(&calendar_dates)) {
-                    eprintln!("warning: skipping {symbol}: {reason}");
-                    return Ok(None);
+                match sanitize_daily(&mut daily, Some(&calendar_dates)) {
+                    Ok(report) => {
+                        let mut record = sanitation.lock().expect("sanitation lock poisoned");
+                        record.off_calendar += report.off_calendar;
+                        record.spikes += report.spikes;
+                    }
+                    Err(reason) => {
+                        sanitation
+                            .lock()
+                            .expect("sanitation lock poisoned")
+                            .skip(symbol, reason);
+                        return Ok(None);
+                    }
                 }
             }
             if daily.is_empty() {
@@ -1546,6 +1581,7 @@ fn plan_screened(
             "{screened_symbols} symbols screened · {} candidates traded intraday",
             candidates.len()
         )],
+        sanitation: sanitation.into_inner().expect("sanitation lock poisoned"),
     };
     // Re-create the recorder instance flag on the chosen symbol.
     if let Some(instance) = plan.instances.remove(&equity_symbol) {
@@ -1595,6 +1631,7 @@ pub fn run(
         instances,
         equity_symbol,
         symbol_note,
+        sanitation,
     } = plan;
 
     let mut host = StrategyHost::per_instrument(instances)?;
@@ -1830,6 +1867,10 @@ pub fn run(
         output_dir.join("strategy_manifest.json"),
         serde_json::to_vec_pretty(manifest)?,
     )?;
+    fs::write(
+        output_dir.join("sanitation.json"),
+        serde_json::to_vec_pretty(&sanitation)?,
+    )?;
     generate_report(output_dir, Some(&output_dir.join("report.html")))?;
     let report = load_report_view(output_dir)?;
     let summary = SdkRunSummary {
@@ -2009,6 +2050,115 @@ mod tests {
         fn on_bar(&mut self, _ctx: &mut crate::sdk::strategy::Ctx, _bar: &Bar) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// HK-02: a run over a copy of examples/data with bad prints injected writes
+    /// `sanitation.json` beside the report: the holiday row and the one-bar spike dropped from
+    /// ACME.US, and ZENITH.US skipped for its persistent scale break, with the reason.
+    #[test]
+    fn sanitation_sidecar_counts_injected_bad_prints() {
+        let source = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/data/eod"));
+        let data = env::temp_dir().join(format!("tessera-hk02-data-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&data);
+        fs::create_dir_all(&data).unwrap();
+        for name in ["DEMO.US", "ACME.US", "ZENITH.US"] {
+            let text = fs::read_to_string(source.join(format!("{name}.csv"))).unwrap();
+            let mut out = Vec::new();
+            for line in text.lines() {
+                let fields: Vec<&str> = line.split(',').collect();
+                let scale = |factor: f64| {
+                    let mut f: Vec<String> = fields.iter().map(|x| (*x).to_owned()).collect();
+                    for i in 1..=5 {
+                        f[i] = format!("{:.4}", fields[i].parse::<f64>().unwrap() * factor);
+                    }
+                    f.join(",")
+                };
+                match (name, fields[0]) {
+                    // A one-bar spike: ACME prints 10x on 2024-02-15 and reverts next session.
+                    ("ACME.US", "2024-02-15") => out.push(scale(10.0)),
+                    // A persistent scale break: ZENITH is 20x from 2024-02-01 onward.
+                    ("ZENITH.US", date) if date.starts_with('2') && date >= "2024-02-01" => {
+                        out.push(scale(20.0))
+                    }
+                    _ => out.push(line.to_owned()),
+                }
+                // A holiday row: ACME carries a print on Saturday 2024-01-06.
+                if name == "ACME.US" && fields[0] == "2024-01-05" {
+                    out.push("2024-01-06,1000000,1000000,1000000,1000000,1000000,1".to_owned());
+                }
+            }
+            fs::write(data.join(format!("{name}.csv")), out.join("\n") + "\n").unwrap();
+        }
+        let config: SdkRunConfig = toml::from_str(&format!(
+            r#"
+            strategy = "idle_with_hedge"
+            [data]
+            resolution = "daily"
+            daily_dir = "{}"
+            symbols = ["DEMO.US", "ZENITH.US"]
+            calendar_symbol = "DEMO.US"
+            "#,
+            data.display()
+        ))
+        .unwrap();
+        let entry = StrategyEntry::of::<IdleWithHedge>();
+        let out = env::temp_dir().join(format!("tessera-hk02-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let summary = run(
+            &config,
+            &entry,
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 28).unwrap(),
+            &out,
+        )
+        .unwrap();
+        assert_eq!(summary.symbols, 3, "DEMO, ZENITH, and the required ACME");
+        let sidecar: RunSanitation =
+            serde_json::from_str(&fs::read_to_string(out.join("sanitation.json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar.off_calendar, 1, "{sidecar:?}");
+        assert_eq!(sidecar.spikes, 1, "{sidecar:?}");
+        assert_eq!(sidecar.skipped.len(), 1, "{sidecar:?}");
+        assert_eq!(sidecar.skipped[0].symbol, "ZENITH.US");
+        assert!(
+            sidecar.skipped[0].reason.contains("impossible print"),
+            "{}",
+            sidecar.skipped[0].reason
+        );
+        // The skipped symbol is out of the coverage table; the sanitized ones stay.
+        let coverage = fs::read_to_string(out.join("coverage.csv")).unwrap();
+        assert!(coverage.lines().any(|line| line.starts_with("ACME.US,")));
+        assert!(!coverage.lines().any(|line| line.starts_with("ZENITH.US,")));
+        // A clean library writes the sidecar with zeros, so the page can say nothing was dropped.
+        let clean: SdkRunConfig = toml::from_str(&format!(
+            r#"
+            strategy = "idle_with_hedge"
+            [data]
+            resolution = "daily"
+            daily_dir = "{}"
+            symbols = ["DEMO.US"]
+            calendar_symbol = "DEMO.US"
+            "#,
+            source.display()
+        ))
+        .unwrap();
+        let clean_out = env::temp_dir().join(format!("tessera-hk02-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&clean_out);
+        run(
+            &clean,
+            &entry,
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 3, 28).unwrap(),
+            &clean_out,
+        )
+        .unwrap();
+        let sidecar: RunSanitation =
+            serde_json::from_str(&fs::read_to_string(clean_out.join("sanitation.json")).unwrap())
+                .unwrap();
+        assert_eq!(sidecar, RunSanitation::default());
+        let _ = fs::remove_dir_all(&data);
+        let _ = fs::remove_dir_all(&out);
+        let _ = fs::remove_dir_all(&clean_out);
     }
 
     #[test]

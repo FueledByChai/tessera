@@ -387,6 +387,8 @@ struct RunDetailResponse {
     manifest: Option<serde_json::Value>,
     /// The worker's error for a failed job, so the run page can say why.
     job_error: Option<String>,
+    /// What loading dropped or skipped (`sanitation.json`; absent on runs that predate it).
+    sanitation: Option<tessera::sdk::runner::RunSanitation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3660,6 +3662,9 @@ fn run_detail_sync(state: &AppState, id: &str) -> Result<RunDetailResponse> {
                 .then(|| artifact_dir.join("run_config.toml"))
         });
     let config_text = config_path.and_then(|path| fs::read_to_string(path).ok());
+    let sanitation = fs::read_to_string(artifact_dir.join("sanitation.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
     let manifest = fs::read_to_string(artifact_dir.join("run_manifest.json"))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
@@ -3673,6 +3678,7 @@ fn run_detail_sync(state: &AppState, id: &str) -> Result<RunDetailResponse> {
         config_text,
         manifest,
         job_error,
+        sanitation,
     })
 }
 
