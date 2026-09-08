@@ -4231,6 +4231,10 @@ struct CreateStudyRequest {
     symbols: Vec<String>,
     #[serde(default = "default_study_step")]
     step_secs: u32,
+    /// `daily`, `5m`, or `1m` for CSV bars through the SDK loader; absent means lake bars on
+    /// `step_secs`.
+    #[serde(default)]
+    resolution: Option<String>,
     #[serde(default)]
     features: Vec<String>,
     #[serde(default)]
@@ -4343,36 +4347,71 @@ fn validate_study_request(
     state: &AppState,
     request: &CreateStudyRequest,
 ) -> Result<(tessera::study::StudyConfig, NaiveDate, NaiveDate)> {
-    let lake_dir = state
-        .local
-        .data
-        .lake_dir
-        .clone()
-        .context("studies need lake_dir in local.toml")?;
+    let grid = tessera::study::Grid::parse(request.resolution.as_deref(), request.step_secs)?;
+    let data = &state.local.data;
+    let lake_dir = match grid {
+        tessera::study::Grid::Lake { .. } => data
+            .lake_dir
+            .clone()
+            .context("lake studies need lake_dir in local.toml")?,
+        _ => data.lake_dir.clone().unwrap_or_default(),
+    };
     anyhow::ensure!(!request.name.trim().is_empty(), "name the study");
-    anyhow::ensure!(
-        !request.symbols.is_empty(),
-        "select at least one lake instrument"
-    );
-    for symbol in &request.symbols {
-        anyhow::ensure!(
-            tessera::lake::is_lake_symbol(symbol),
-            "{symbol} is not an EXCHANGE:SYMBOL lake instrument"
-        );
-    }
+    anyhow::ensure!(!request.symbols.is_empty(), "select at least one symbol");
+    let symbols: Vec<String> = if grid.has_book() {
+        for symbol in &request.symbols {
+            anyhow::ensure!(
+                tessera::lake::is_lake_symbol(symbol),
+                "{symbol} is not an EXCHANGE:SYMBOL lake instrument"
+            );
+        }
+        request.symbols.clone()
+    } else {
+        // CSV grids take plain symbols; the SDK loader reads `<dir>/<SYMBOL>.csv`.
+        let dir = match grid {
+            tessera::study::Grid::FiveMinute => &data.five_minute_dir,
+            tessera::study::Grid::OneMinute => &data.one_minute_dir,
+            _ => &data.daily_dir,
+        };
+        let mut symbols = Vec::new();
+        for symbol in &request.symbols {
+            let symbol = normalize_sdk_symbol(symbol)?;
+            anyhow::ensure!(
+                dir.join(format!("{symbol}.csv")).is_file(),
+                "{symbol} has no {} file under {}",
+                grid.label(),
+                dir.display()
+            );
+            symbols.push(symbol);
+        }
+        symbols
+    };
     let start = NaiveDate::parse_from_str(&request.start_date, "%Y-%m-%d")
         .context("start_date must use YYYY-MM-DD")?;
     let end = NaiveDate::parse_from_str(&request.end_date, "%Y-%m-%d")
         .context("end_date must use YYYY-MM-DD")?;
     anyhow::ensure!(start <= end, "start_date must be on or before end_date");
-    anyhow::ensure!(
-        request.step_secs > 0 && request.step_secs < 60 && 60 % request.step_secs == 0,
-        "step_secs must divide a minute (1, 2, 5, 10, 15, 30)"
-    );
+    if grid.has_book() {
+        anyhow::ensure!(
+            request.step_secs > 0 && request.step_secs < 60 && 60 % request.step_secs == 0,
+            "step_secs must divide a minute (1, 2, 5, 10, 15, 30)"
+        );
+    }
     let config = tessera::study::StudyConfig {
         lake_dir,
-        symbols: request.symbols.clone(),
+        symbols,
         step_secs: request.step_secs,
+        resolution: request
+            .resolution
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty() && *r != "lake")
+            .map(str::to_owned),
+        daily_dir: data.daily_dir.clone(),
+        five_minute_dir: data.five_minute_dir.clone(),
+        one_minute_dir: data.one_minute_dir.clone(),
+        calendar_symbol: Some(data.calendar_symbol.clone()),
+        session: tessera::sdk::runner::SessionKind::Regular,
         features: if request.features.is_empty() {
             tessera::study::FEATURES
                 .iter()

@@ -744,7 +744,7 @@ pub fn sanitize_daily(
 
 /// Intraday bars in New York time, optionally restricted to the regular session and to
 /// a set of dates.
-fn load_intraday(
+pub fn load_intraday(
     path: &Path,
     session: SessionKind,
     only_dates: Option<&HashSet<NaiveDate>>,

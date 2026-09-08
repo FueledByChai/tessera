@@ -1,6 +1,7 @@
 //! Feature studies: how a bar-level feature relates to forward returns at several horizons.
 //!
-//! This is the research step before a strategy. For each symbol the study builds
+//! This is the research step before a strategy. For each symbol the study reads a panel of
+//! bars through the SDK loaders (daily, 5-minute, and 1-minute CSV bars) or builds
 //! `step_secs` bars from the tick lake, computes the requested features at each bar close,
 //! measures a forward target `h` bars ahead (the mid return by default; see [`Target`] for
 //! realized variance, absolute move, spread change, and fair-value residuals), then reports
@@ -17,9 +18,9 @@
 //! or `trade_count`, optionally followed by streaming transforms, e.g.
 //! `signed_volume | zscore 30` or `trade_count | rate 1 | ratio_to sma 300`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
@@ -28,6 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::feature_expr::{self, BarInput, Evaluator};
 use crate::lake::{self, LakeSymbol};
+use crate::sdk::runner::{SessionKind, load_daily, load_intraday, sanitize_daily};
+use crate::sdk::strategy::Bar;
 
 /// The default feature set: the plain base series a study runs when none are given.
 pub const FEATURES: &[&str] = &[
@@ -43,12 +46,30 @@ pub const FEATURES: &[&str] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StudyConfig {
-    pub lake_dir: std::path::PathBuf,
-    /// `EXCHANGE:SYMBOL` instruments.
+    /// Parquet tick lake, needed for the lake grid.
+    #[serde(default)]
+    pub lake_dir: PathBuf,
+    /// `EXCHANGE:SYMBOL` lake instruments, or CSV symbols such as `SPY.US` on a CSV grid.
     pub symbols: Vec<String>,
-    /// Sampling grid in seconds (also the unit of horizons and delay).
+    /// Sampling grid in seconds on the lake (also the unit of horizons and delay there).
     #[serde(default = "default_step")]
     pub step_secs: u32,
+    /// Bar grid: `daily`, `5m`, or `1m` from the CSV library; absent means tick-built lake
+    /// bars on `step_secs`. See [`Grid`].
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub daily_dir: PathBuf,
+    #[serde(default)]
+    pub five_minute_dir: PathBuf,
+    #[serde(default)]
+    pub one_minute_dir: PathBuf,
+    /// Daily file whose dates sanitize a daily panel (drops holiday rows); absent skips it.
+    #[serde(default)]
+    pub calendar_symbol: Option<String>,
+    /// Regular or extended session for intraday CSV bars.
+    #[serde(default = "default_session")]
+    pub session: SessionKind,
     #[serde(default = "default_features")]
     pub features: Vec<String>,
     /// Forward horizons in bars.
@@ -140,15 +161,20 @@ pub struct TargetSeries {
 }
 
 impl TargetSeries {
-    /// Mid, spread, and microprice per bar plus the fair-value EMA on the grid's step.
-    pub fn from_bars(bars: &[lake::LakeBar], step_secs: u32) -> Self {
+    /// Mid, spread, and microprice per bar plus the fair-value EMA. On a grid without an
+    /// order book the close stands in for the mid; spread and microprice stay `NaN`.
+    pub fn from_bars(bars: &[lake::LakeBar], grid: Grid) -> Self {
         let read = |f: fn(&crate::lake::BookFeatures) -> f64| -> Vec<f64> {
             bars.iter()
                 .map(|bar| bar.book.as_ref().map(f).unwrap_or(f64::NAN))
                 .collect()
         };
-        let mids = read(|b| b.mid);
-        let window = (FAIR_VALUE_EMA_SECS / step_secs.max(1)).max(1) as f64;
+        let mids = if grid.has_book() {
+            read(|b| b.mid)
+        } else {
+            bars.iter().map(|bar| bar.close).collect()
+        };
+        let window = grid.fair_value_window_bars() as f64;
         let alpha = 2.0 / (window + 1.0);
         let mut ema = f64::NAN;
         let fair_values = mids
@@ -258,6 +284,90 @@ pub fn target_series(series: &TargetSeries, target: Target, horizon: usize) -> V
 fn default_step() -> u32 {
     1
 }
+fn default_session() -> SessionKind {
+    SessionKind::Regular
+}
+
+/// The bar grid a study runs on: tick-built lake bars carry an order book; CSV bars from the
+/// SDK loaders carry open, high, low, close, and volume only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grid {
+    Lake { step_secs: u32 },
+    Daily,
+    FiveMinute,
+    OneMinute,
+}
+
+impl Grid {
+    pub fn parse(resolution: Option<&str>, step_secs: u32) -> Result<Grid> {
+        Ok(
+            match resolution.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
+                None | Some("") | Some("lake") => {
+                    anyhow::ensure!(step_secs > 0, "step_secs must be positive");
+                    Grid::Lake { step_secs }
+                }
+                Some("daily" | "eod" | "1d" | "d") => Grid::Daily,
+                Some("5m" | "five_minute") => Grid::FiveMinute,
+                Some("1m" | "one_minute") => Grid::OneMinute,
+                Some(other) => {
+                    bail!("unknown study resolution {other:?}; use daily, 5m, 1m, or lake")
+                }
+            },
+        )
+    }
+    pub fn label(self) -> String {
+        match self {
+            Grid::Lake { step_secs } => format!("{step_secs}s"),
+            Grid::Daily => "daily".to_owned(),
+            Grid::FiveMinute => "5m".to_owned(),
+            Grid::OneMinute => "1m".to_owned(),
+        }
+    }
+    /// Seconds per bar, the unit `horizon_secs` is reported in.
+    pub fn step_secs(self) -> u32 {
+        match self {
+            Grid::Lake { step_secs } => step_secs,
+            Grid::Daily => 86_400,
+            Grid::FiveMinute => 300,
+            Grid::OneMinute => 60,
+        }
+    }
+    /// Bars in a year, for annualizing: the lake never closes; the CSV grids trade 252
+    /// sessions of 6.5 hours.
+    pub fn bars_per_year(self) -> f64 {
+        match self {
+            Grid::Lake { step_secs } => 365.25 * 86_400.0 / f64::from(step_secs.max(1)),
+            Grid::Daily => 252.0,
+            Grid::FiveMinute => 78.0 * 252.0,
+            Grid::OneMinute => 390.0 * 252.0,
+        }
+    }
+    /// A horizon in this grid's natural unit: `30s`, `5d`, `25m`.
+    pub fn horizon_label(self, horizon: usize) -> String {
+        match self {
+            Grid::Lake { step_secs } => format!("{}s", horizon as u32 * step_secs),
+            Grid::Daily => format!("{horizon}d"),
+            Grid::FiveMinute => format!("{}m", horizon * 5),
+            Grid::OneMinute => format!("{horizon}m"),
+        }
+    }
+    pub fn has_book(self) -> bool {
+        matches!(self, Grid::Lake { .. })
+    }
+    /// Bars the fair-value EMA averages over: 60 seconds on the lake, 20 bars on CSV grids.
+    pub fn fair_value_window_bars(self) -> usize {
+        match self {
+            Grid::Lake { step_secs } => (FAIR_VALUE_EMA_SECS / step_secs.max(1)).max(1) as usize,
+            _ => 20,
+        }
+    }
+}
+
+impl StudyConfig {
+    pub fn grid(&self) -> Result<Grid> {
+        Grid::parse(self.resolution.as_deref(), self.step_secs)
+    }
+}
 fn default_features() -> Vec<String> {
     FEATURES.iter().map(|f| (*f).to_owned()).collect()
 }
@@ -334,10 +444,9 @@ pub const CURVE_POINTS: usize = 400;
 /// Z-scores beyond this many standard deviations hold the same position as at the clip.
 const Z_CLIP: f64 = 3.0;
 
-/// Independent periods per year for annualizing a horizon on a grid, assuming a market that
-/// never closes (the lake holds crypto perpetuals).
-fn periods_per_year(step_secs: u32, horizon: usize) -> f64 {
-    365.25 * 86_400.0 / (step_secs as f64 * horizon.max(1) as f64)
+/// Independent periods per year for annualizing a horizon on a grid.
+fn periods_per_year(grid: Grid, horizon: usize) -> f64 {
+    grid.bars_per_year() / horizon.max(1) as f64
 }
 
 /// The costless curve for one variant over aligned (feature, forward return in bps) pairs.
@@ -439,10 +548,20 @@ pub struct StudyResult {
     /// The target every cell was scored against (also in `config`), and its unit.
     pub target: Target,
     pub target_unit: String,
+    /// The bar grid: `1s`, `daily`, `5m`, or `1m`.
+    pub grid: String,
+    /// Features that could not run on this grid, with the reason, instead of failing.
+    pub unavailable: Vec<UnavailableFeature>,
     pub start: NaiveDate,
     pub end: NaiveDate,
     pub symbols: Vec<SymbolCoverage>,
     pub cells: Vec<StudyCell>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UnavailableFeature {
+    pub feature: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,20 +580,78 @@ struct SymbolSeries {
     bars_with_book: usize,
 }
 
-fn load_symbol(
+/// One symbol's bars on the study's grid: tick-built from the lake, or CSV bars through the
+/// SDK loaders (sanitized daily prints, session-filtered intraday prints).
+pub fn load_panel_symbol(
     config: &StudyConfig,
+    grid: Grid,
     symbol: &str,
     start: NaiveDate,
     end: NaiveDate,
+) -> Result<Vec<lake::LakeBar>> {
+    match grid {
+        Grid::Lake { step_secs } => {
+            anyhow::ensure!(
+                config.lake_dir.as_os_str().len() > 0,
+                "the lake grid needs lake_dir"
+            );
+            let sym = LakeSymbol::parse(symbol)
+                .with_context(|| format!("{symbol} is not EXCHANGE:SYMBOL"))?;
+            lake::build_bars(&config.lake_dir, &sym, step_secs, start, end)
+        }
+        Grid::Daily => {
+            let path = config.daily_dir.join(format!("{symbol}.csv"));
+            let mut bars = load_daily(&path)?;
+            let calendar: Option<BTreeSet<NaiveDate>> = config
+                .calendar_symbol
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .and_then(|c| load_daily(&config.daily_dir.join(format!("{c}.csv"))).ok())
+                .map(|bars| bars.iter().map(|b| b.date).collect());
+            sanitize_daily(&mut bars, calendar.as_ref())
+                .map_err(|reason| anyhow::anyhow!("{symbol}: {reason}"))?;
+            bars.retain(|bar| bar.date >= start && bar.date <= end);
+            Ok(bars.iter().map(lake_bar).collect())
+        }
+        Grid::FiveMinute | Grid::OneMinute => {
+            let dir = if grid == Grid::FiveMinute {
+                &config.five_minute_dir
+            } else {
+                &config.one_minute_dir
+            };
+            let path = dir.join(format!("{symbol}.csv"));
+            let dates: HashSet<NaiveDate> = start.iter_days().take_while(|d| *d <= end).collect();
+            let bars = load_intraday(&path, config.session, Some(&dates))?;
+            Ok(bars.iter().map(lake_bar).collect())
+        }
+    }
+}
+
+/// A CSV bar as the study sees it: prices and volume, no order book.
+fn lake_bar(bar: &Bar) -> lake::LakeBar {
+    lake::LakeBar {
+        date: bar.date,
+        time: bar.time,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.volume,
+        book: None,
+    }
+}
+
+fn evaluate_symbol(
+    features: &[String],
+    grid: Grid,
+    symbol: &str,
+    bars: &[lake::LakeBar],
 ) -> Result<SymbolSeries> {
-    let sym =
-        LakeSymbol::parse(symbol).with_context(|| format!("{symbol} is not EXCHANGE:SYMBOL"))?;
-    let bars = lake::build_bars(&config.lake_dir, &sym, config.step_secs, start, end)?;
     let (_, features, bars_with_book) =
-        evaluate_features(&config.features, config.step_secs, &bars)?;
+        evaluate_features(features, grid.step_secs(), bars, grid.has_book())?;
     Ok(SymbolSeries {
         symbol: symbol.to_owned(),
-        book: TargetSeries::from_bars(&bars, config.step_secs),
+        book: TargetSeries::from_bars(bars, grid),
         features,
         bars: bars.len(),
         bars_with_book,
@@ -483,16 +660,21 @@ fn load_symbol(
 
 /// Runs every feature expression over the bars in one streaming pass. Returns the mid series
 /// (`NaN` where the bar has no book), the feature matrix, and the count of bars with a book.
+/// `book_grid` says whether returns read the mid (a bar without a book is a gap) or the close.
 fn evaluate_features(
     expressions: &[String],
     step_secs: u32,
     bars: &[lake::LakeBar],
+    book_grid: bool,
 ) -> Result<(Vec<f64>, BTreeMap<String, Vec<f64>>, usize)> {
     let mut evaluators = Vec::with_capacity(expressions.len());
     for text in expressions {
         let expr =
             feature_expr::parse(text).with_context(|| format!("feature expression {text:?}"))?;
-        evaluators.push((text.clone(), Evaluator::new(&expr, step_secs)));
+        evaluators.push((
+            text.clone(),
+            Evaluator::for_grid(&expr, step_secs, book_grid),
+        ));
     }
     let mut mids = Vec::with_capacity(bars.len());
     let mut features: BTreeMap<String, Vec<f64>> = expressions
@@ -604,7 +786,7 @@ fn cell(
     symbol: &str,
     feature: &str,
     horizon: usize,
-    step: u32,
+    grid: Grid,
     buckets: usize,
     xs: &[f64],
     ys: &[f64],
@@ -649,7 +831,7 @@ fn cell(
     let (bottom_mean, bottom_se) = mean_and_se(&bottom);
     let diff = top_mean - bottom_mean;
     let se = (top_se * top_se + bottom_se * bottom_se).sqrt();
-    let per_year = periods_per_year(step, horizon);
+    let per_year = periods_per_year(grid, horizon);
     let curves = vec![
         costless_curve("zscore", xs, ys, per_year),
         costless_curve("sign", xs, ys, per_year),
@@ -658,7 +840,7 @@ fn cell(
         symbol: symbol.to_owned(),
         feature: feature.to_owned(),
         horizon_bars: horizon,
-        horizon_secs: horizon as u32 * step,
+        horizon_secs: horizon as u32 * grid.step_secs(),
         observations: xs.len(),
         ic,
         top_minus_bottom_bps: diff,
@@ -678,26 +860,80 @@ pub fn run(
     output_dir: &Path,
 ) -> Result<StudyResult> {
     if config.symbols.is_empty() {
-        bail!("the study needs at least one EXCHANGE:SYMBOL");
+        bail!("the study needs at least one symbol");
     }
+    let grid = config.grid()?;
     for feature in &config.features {
         feature_expr::parse(feature).with_context(|| format!("feature expression {feature:?}"))?;
     }
-    fs::create_dir_all(output_dir)?;
     eprintln!(
         "progress: load 0/{} symbols elapsed=0s",
         config.symbols.len()
     );
-    let started = std::time::Instant::now();
-    let series: Vec<SymbolSeries> = config
+    let panel: Vec<(String, Vec<lake::LakeBar>)> = config
         .symbols
         .par_iter()
-        .map(|symbol| load_symbol(config, symbol, start, end))
+        .map(|symbol| {
+            Ok((
+                symbol.clone(),
+                load_panel_symbol(config, grid, symbol, start, end)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    run_on_panel(config, panel, start, end, output_dir)
+}
+
+/// The study over bars already in memory, one series per symbol, on the config's grid. Every
+/// feature that reads the order book on a grid without one is reported as unavailable rather
+/// than failing the study.
+pub fn run_on_panel(
+    config: &StudyConfig,
+    panel: Vec<(String, Vec<lake::LakeBar>)>,
+    start: NaiveDate,
+    end: NaiveDate,
+    output_dir: &Path,
+) -> Result<StudyResult> {
+    let grid = config.grid()?;
+    let started = std::time::Instant::now();
+    fs::create_dir_all(output_dir)?;
+    let has_book = grid.has_book();
+    if !has_book
+        && matches!(
+            config.target,
+            Target::SpreadChange | Target::MicropriceResidual
+        )
+    {
+        bail!(
+            "target {} needs order-book bars; unavailable on the {} grid",
+            config.target.name(),
+            grid.label()
+        );
+    }
+    let mut features = Vec::new();
+    let mut unavailable = Vec::new();
+    for text in &config.features {
+        let expr =
+            feature_expr::parse(text).with_context(|| format!("feature expression {text:?}"))?;
+        if !has_book && feature_expr::needs_book(&expr) {
+            unavailable.push(UnavailableFeature {
+                feature: text.clone(),
+                reason: format!(
+                    "unavailable on this grid: needs order-book bars, and the {} grid has none",
+                    grid.label()
+                ),
+            });
+        } else {
+            features.push(text.clone());
+        }
+    }
+    let series: Vec<SymbolSeries> = panel
+        .par_iter()
+        .map(|(symbol, bars)| evaluate_symbol(&features, grid, symbol, bars))
         .collect::<Result<Vec<_>>>()?;
     eprintln!(
         "progress: load {}/{} symbols loaded elapsed={}s",
         series.len(),
-        config.symbols.len(),
+        panel.len(),
         started.elapsed().as_secs()
     );
     // The target per symbol and horizon, shared by every feature.
@@ -712,9 +948,9 @@ pub fn run(
         })
         .collect();
     let mut cells = Vec::new();
-    let total = (series.len() + 1) * config.features.len() * config.horizons.len();
+    let total = (series.len() + 1) * features.len() * config.horizons.len();
     let mut done = 0usize;
-    for feature in &config.features {
+    for feature in &features {
         for (hi, &horizon) in config.horizons.iter().enumerate() {
             let mut pooled_x = Vec::new();
             let mut pooled_y = Vec::new();
@@ -729,7 +965,7 @@ pub fn run(
                         &s.symbol,
                         feature,
                         horizon,
-                        config.step_secs,
+                        grid,
                         config.buckets,
                         &xs,
                         &ys,
@@ -744,7 +980,7 @@ pub fn run(
                     "ALL",
                     feature,
                     horizon,
-                    config.step_secs,
+                    grid,
                     config.buckets,
                     &pooled_x,
                     &pooled_y,
@@ -761,6 +997,8 @@ pub fn run(
         config: config.clone(),
         target: config.target,
         target_unit: config.target.unit().to_owned(),
+        grid: grid.label(),
+        unavailable,
         start,
         end,
         symbols: series
@@ -830,7 +1068,15 @@ pub fn summary_table(result: &StudyResult) -> String {
         result.symbols[0].symbol.as_str()
     };
     let unit = result.target.unit();
-    let _ = writeln!(out, "target: {} ({unit})", result.target.name());
+    let _ = writeln!(
+        out,
+        "grid: {} · target: {} ({unit})",
+        result.grid,
+        result.target.name()
+    );
+    for skipped in &result.unavailable {
+        let _ = writeln!(out, "{}: {}", skipped.feature, skipped.reason);
+    }
     let _ = writeln!(
         out,
         "{:<16} {:>8} {:>10} {:>9} {:>12} {:>8} {:>8} {:>10}",
@@ -843,12 +1089,18 @@ pub fn summary_table(result: &StudyResult) -> String {
         "sharpe",
         "brkeven"
     );
+    let horizon_text = |c: &StudyCell| match result.grid.as_str() {
+        "daily" => format!("{}d", c.horizon_bars),
+        "5m" => format!("{}m", c.horizon_bars * 5),
+        "1m" => format!("{}m", c.horizon_bars),
+        _ => format!("{}s", c.horizon_secs),
+    };
     for c in result.cells.iter().filter(|c| c.symbol == symbol) {
         let _ = writeln!(
             out,
-            "{:<16} {:>7}s {:>10} {:>+9.4} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4}",
+            "{:<16} {:>8} {:>10} {:>+9.4} {:>+12.3} {:>+8.1} {:>+8.2} {:>+10.4}",
             c.feature,
-            c.horizon_secs,
+            horizon_text(c),
             c.observations,
             c.ic,
             c.top_minus_bottom_bps,
@@ -969,7 +1221,7 @@ mod tests {
     #[test]
     fn fair_value_ema_carries_across_gaps_and_tracks_the_mid() {
         let bars = synthetic_grid();
-        let series = TargetSeries::from_bars(&bars, 1);
+        let series = TargetSeries::from_bars(&bars, Grid::Lake { step_secs: 1 });
         assert_eq!(series.fair_values.len(), bars.len());
         let with_book: Vec<usize> = (0..bars.len())
             .filter(|&i| bars[i].book.is_some())
@@ -1000,8 +1252,9 @@ mod tests {
     #[test]
     fn spread_predicts_realized_variance_on_the_sol_fixture() {
         let bars = synthetic_grid();
-        let series = TargetSeries::from_bars(&bars, 1);
-        let (_, features, _) = evaluate_features(&["spread_bps".to_owned()], 1, &bars).unwrap();
+        let series = TargetSeries::from_bars(&bars, Grid::Lake { step_secs: 1 });
+        let (_, features, _) =
+            evaluate_features(&["spread_bps".to_owned()], 1, &bars, true).unwrap();
         let spread = &features["spread_bps"];
         let (xs, ys) = pairs(
             spread,
@@ -1020,8 +1273,182 @@ mod tests {
             "the spread says nothing about direction"
         );
         // The cell carries the same IC and its curves run on the target.
-        let c = cell("SOL", "spread_bps", 30, 1, 10, &xs, &ys);
+        let c = cell(
+            "SOL",
+            "spread_bps",
+            30,
+            Grid::Lake { step_secs: 1 },
+            10,
+            &xs,
+            &ys,
+        );
         assert!((c.ic - ic).abs() < 1e-12 && c.curves[0].curve.len() > 0);
+    }
+
+    /// Daily OHLCV bars with no book, as the CSV loaders produce them.
+    fn daily_bars(rows: &[(f64, f64, f64, f64, f64)]) -> Vec<lake::LakeBar> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, &(open, high, low, close, volume))| lake::LakeBar {
+                date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap() + chrono::Days::new(i as u64),
+                time: chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+                open,
+                high,
+                low,
+                close,
+                volume,
+                book: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ohlcv_bases_compute_on_csv_bars() {
+        let bars = daily_bars(&[
+            (100.0, 101.0, 99.0, 100.0, 1000.0),
+            (100.5, 103.0, 100.0, 102.0, 1100.0),
+            (101.0, 102.0, 100.0, 101.0, 900.0),
+            (101.5, 105.0, 101.0, 104.0, 1200.0),
+            (103.0, 104.0, 102.0, 103.0, 1000.0),
+        ]);
+        let names: Vec<String> = [
+            "return_1",
+            "return_2",
+            "range_bps",
+            "gap_bps",
+            "high_3_distance",
+            "volume | zscore 3",
+        ]
+        .iter()
+        .map(|f| (*f).to_owned())
+        .collect();
+        let (mids, features, with_book) = evaluate_features(&names, 86_400, &bars, false).unwrap();
+        assert_eq!(with_book, 0);
+        assert!(mids.iter().all(|m| m.is_nan()), "no book, no mid series");
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let r1 = &features["return_1"];
+        assert!(r1[0].is_nan() && close(r1[1], 200.0) && close(r1[2], (101.0 / 102.0 - 1.0) * 1e4));
+        let r2 = &features["return_2"];
+        assert!(r2[1].is_nan() && close(r2[2], 100.0) && close(r2[3], (104.0 / 102.0 - 1.0) * 1e4));
+        let range = &features["range_bps"];
+        assert!(close(range[0], 200.0) && close(range[1], 3.0 / 102.0 * 1e4));
+        let gap = &features["gap_bps"];
+        assert!(
+            gap[0].is_nan() && close(gap[1], 50.0) && close(gap[4], (103.0 / 104.0 - 1.0) * 1e4)
+        );
+        let high = &features["high_3_distance"];
+        assert!(
+            high[1].is_nan()
+                && close(high[2], (101.0 / 103.0 - 1.0) * 1e4)
+                && close(high[3], (104.0 / 105.0 - 1.0) * 1e4)
+        );
+        let vz = &features["volume | zscore 3"];
+        assert!(
+            vz[1].is_nan() && vz[2].is_finite() && vz[2] < 0.0,
+            "900 is below the 3-bar mean"
+        );
+        // The close stands in for the mid on an OHLCV grid.
+        let series = TargetSeries::from_bars(&bars, Grid::Daily);
+        assert_eq!(series.mids, vec![100.0, 102.0, 101.0, 104.0, 103.0]);
+        assert!(series.spreads.iter().all(|s| s.is_nan()));
+        assert!(close(target_series(&series, Target::Return, 1)[0], 200.0));
+        // Grammar: windows must be positive, and book-only bases are known as such.
+        assert!(feature_expr::parse("return_0").is_err());
+        assert!(feature_expr::parse("high_252_distance | zscore 20").is_ok());
+        assert!(!feature_expr::needs_book(
+            &feature_expr::parse("return_5 | times volume").unwrap()
+        ));
+        assert!(feature_expr::needs_book(
+            &feature_expr::parse("volume | times obi_l1").unwrap()
+        ));
+        assert!(feature_expr::needs_book(
+            &feature_expr::parse("spread_bps").unwrap()
+        ));
+        assert_eq!(Grid::parse(Some("daily"), 1).unwrap(), Grid::Daily);
+        assert_eq!(Grid::parse(None, 5).unwrap(), Grid::Lake { step_secs: 5 });
+        assert!(Grid::parse(Some("weekly"), 1).is_err());
+        assert_eq!(Grid::Daily.horizon_label(5), "5d");
+        assert_eq!(Grid::FiveMinute.horizon_label(3), "15m");
+    }
+
+    /// The done line: a daily study of `return_1 | zscore 20` on examples/data runs end to end
+    /// through the CSV loader, and an in-memory panel built the same way gives the same IC.
+    #[test]
+    fn daily_study_matches_an_in_memory_panel() {
+        let data = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/data/eod"));
+        let config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: vec!["DEMO.US".to_owned()],
+            step_secs: 1,
+            resolution: Some("daily".to_owned()),
+            daily_dir: data.to_path_buf(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: Some("DEMO.US".to_owned()),
+            session: SessionKind::Regular,
+            features: vec!["return_1 | zscore 20".to_owned(), "obi_l1".to_owned()],
+            horizons: vec![1, 5],
+            decision_delay_bars: 1,
+            buckets: 10,
+            target: Target::Return,
+        };
+        let start = NaiveDate::from_ymd_opt(2019, 1, 1).unwrap();
+        let end = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let out = std::env::temp_dir().join(format!("tessera-wb04-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out);
+        let result = run(&config, start, end, &out.join("csv")).unwrap();
+        assert_eq!(result.grid, "daily");
+        assert_eq!(result.unavailable.len(), 1);
+        assert_eq!(result.unavailable[0].feature, "obi_l1");
+        assert!(
+            result.unavailable[0]
+                .reason
+                .contains("unavailable on this grid")
+        );
+        assert!(
+            result
+                .cells
+                .iter()
+                .all(|c| c.feature == "return_1 | zscore 20")
+        );
+        let csv_cell = |h: usize| result.cells.iter().find(|c| c.horizon_bars == h).unwrap();
+        assert!(csv_cell(1).observations > 1_000 && csv_cell(1).horizon_secs == 86_400);
+        assert!(csv_cell(1).ic.is_finite() && csv_cell(5).ic.is_finite());
+        let summary = summary_table(&result);
+        assert!(summary.contains("grid: daily") && summary.contains("obi_l1: unavailable"));
+
+        // The same panel in memory: the SDK's daily loader, sanitized on the same calendar.
+        let mut bars = load_daily(&data.join("DEMO.US.csv")).unwrap();
+        let calendar: BTreeSet<NaiveDate> = bars.iter().map(|b| b.date).collect();
+        sanitize_daily(&mut bars, Some(&calendar)).unwrap();
+        bars.retain(|b| b.date >= start && b.date <= end);
+        let panel: Vec<lake::LakeBar> = bars.iter().map(lake_bar).collect();
+        assert_eq!(panel.len(), result.symbols[0].bars);
+        let again = run_on_panel(
+            &config,
+            vec![("DEMO.US".to_owned(), panel.clone())],
+            start,
+            end,
+            &out.join("panel"),
+        )
+        .unwrap();
+        for h in [1, 5] {
+            let a = csv_cell(h);
+            let b = again.cells.iter().find(|c| c.horizon_bars == h).unwrap();
+            assert_eq!(a.ic, b.ic, "IC at horizon {h}");
+            assert_eq!(a.observations, b.observations);
+        }
+        // And straight from the evaluator, without the study machinery.
+        let (_, features, _) =
+            evaluate_features(&["return_1 | zscore 20".to_owned()], 86_400, &panel, false).unwrap();
+        let series = TargetSeries::from_bars(&panel, Grid::Daily);
+        let (xs, ys) = pairs(
+            &features["return_1 | zscore 20"],
+            &target_series(&series, Target::Return, 5),
+            1,
+        );
+        assert_eq!(spearman(&xs, &ys), csv_cell(5).ic);
+        let _ = fs::remove_dir_all(&out);
     }
 
     /// The pre-expression feature switch, kept as the parity reference for the eight names.
@@ -1109,7 +1536,7 @@ mod tests {
     fn expressions_reproduce_the_original_eight_features_and_their_ic() {
         let bars = synthetic_grid();
         let names: Vec<String> = FEATURES.iter().map(|f| (*f).to_owned()).collect();
-        let (mids, features, with_book) = evaluate_features(&names, 1, &bars).unwrap();
+        let (mids, features, with_book) = evaluate_features(&names, 1, &bars, true).unwrap();
         assert_eq!(with_book, bars.iter().filter(|b| b.book.is_some()).count());
         for name in FEATURES {
             let legacy: Vec<f64> = bars
@@ -1137,7 +1564,7 @@ mod tests {
         }
         // And a transformed expression runs through the same path.
         let (_, derived, _) =
-            evaluate_features(&["obi_l1 | zscore 30".to_owned()], 1, &bars).unwrap();
+            evaluate_features(&["obi_l1 | zscore 30".to_owned()], 1, &bars, true).unwrap();
         assert!(
             derived["obi_l1 | zscore 30"]
                 .iter()
@@ -1145,7 +1572,7 @@ mod tests {
                 .count()
                 > 2_000
         );
-        let err = evaluate_features(&["obi_l1 | smooth 3".to_owned()], 1, &bars).unwrap_err();
+        let err = evaluate_features(&["obi_l1 | smooth 3".to_owned()], 1, &bars, true).unwrap_err();
         assert!(format!("{err:#}").contains("unknown transform"));
     }
 
@@ -1153,7 +1580,7 @@ mod tests {
     fn buckets_split_by_feature_rank_and_find_a_monotone_edge() {
         let xs: Vec<f64> = (0..1000).map(|i| (i % 100) as f64).collect();
         let ys: Vec<f64> = xs.iter().map(|x| x * 0.1).collect();
-        let c = cell("T", "obi_l1", 1, 1, 10, &xs, &ys);
+        let c = cell("T", "obi_l1", 1, Grid::Lake { step_secs: 1 }, 10, &xs, &ys);
         assert_eq!(c.buckets.len(), 10);
         assert!(c.buckets[9].forward_bps > c.buckets[0].forward_bps);
         assert!(c.top_minus_bottom_bps > 0.0 && c.top_minus_bottom_t > 5.0);
@@ -1220,7 +1647,8 @@ mod tests {
         // Annualization scales with the square root of the periods per year.
         let yearly = costless_curve("zscore", &xs, &ys, 4.0);
         assert!((yearly.sharpe - 2.0 * z.sharpe).abs() < 1e-9);
-        assert!((periods_per_year(1, 60) - 525_960.0).abs() < 1e-6);
+        assert!((periods_per_year(Grid::Lake { step_secs: 1 }, 60) - 525_960.0).abs() < 1e-6);
+        assert_eq!(periods_per_year(Grid::Daily, 5), 252.0 / 5.0);
     }
 
     #[test]

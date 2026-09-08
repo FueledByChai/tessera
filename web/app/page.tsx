@@ -1481,7 +1481,10 @@ type StudyCurve = {
   curve: { observation: number; cumulative_bps: number }[];
 };
 type StudyResult = {
-  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number; target?: string };
+  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number; target?: string; resolution?: string };
+  // The bar grid (`1s`, `daily`, `5m`, `1m`) and the features that could not run on it.
+  grid?: string;
+  unavailable?: { feature: string; reason: string }[];
   // The forward quantity every cell is scored against and its unit (absent on older results).
   target?: string;
   target_unit?: string;
@@ -1508,7 +1511,14 @@ const STUDY_FEATURES = [
   ["spread_bps", "Spread (bps)"],
   ["return_1", "Last bar return (bps)"],
   ["signed_volume", "Signed volume"],
+  ["range_bps", "Bar range (bps)"],
+  ["gap_bps", "Open gap vs previous close (bps)"],
+  ["high_252_distance", "Close vs 252-bar high (bps)"],
 ] as const;
+/** Bases that need order-book bars: pre-ticked on the lake, reported unavailable on CSV grids. */
+const BOOK_FEATURES = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "signed_volume"];
+const CSV_GRIDS = ["daily", "5m", "1m"] as const;
+const LAKE_STEPS = [1, 2, 5, 10, 15, 30] as const;
 
 const STUDY_TARGETS = [
   ["return", "Forward return (bps)"],
@@ -1581,7 +1591,7 @@ function StudiesWorkspace() {
   const [selected, setSelected] = useState<string>("");
   const [detail, setDetail] = useState<{ study: StudyRecord; result: StudyResult | null } | null>(null);
   const [symbols, setSymbols] = useState<string[]>([]);
-  const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id));
+  const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id).filter((id) => BOOK_FEATURES.includes(id) || id === "return_1"));
   // Free-form feature expressions, one per line: base series plus streaming transforms.
   const [expressions, setExpressions] = useState("");
   const customFeatures = useMemo(
@@ -1589,7 +1599,12 @@ function StudiesWorkspace() {
     [expressions],
   );
   const allFeatures = useMemo(() => [...features, ...customFeatures], [features, customFeatures]);
-  const [step, setStep] = useState(1);
+  // The grid: lake seconds ("1".."30") or a CSV resolution ("daily", "5m", "1m").
+  const [gridChoice, setGridChoice] = useState("1");
+  const csvGrid = (CSV_GRIDS as readonly string[]).includes(gridChoice);
+  const step = csvGrid ? 1 : Number(gridChoice);
+  const [csvSymbols, setCsvSymbols] = useState("SPY.US");
+  const csvList = useMemo(() => csvSymbols.split(/[\s,]+/).map((x) => x.trim().toUpperCase()).filter(Boolean), [csvSymbols]);
   const [horizons, setHorizons] = useState("1,5,30,60");
   const [delay, setDelay] = useState(1);
   const [target, setTarget] = useState("return");
@@ -1631,6 +1646,9 @@ function StudiesWorkspace() {
   const maxDate = instruments.reduce((m, i) => (m > i.last_date ? m : i.last_date), "");
   const result = detail?.result ?? null;
   const unit = result?.target_unit ?? "bps";
+  const resultGrid = result?.grid ?? `${result?.config.step_secs ?? 1}s`;
+  const horizonLabel = (h: number) =>
+    resultGrid === "daily" ? `${h}d` : resultGrid === "5m" ? `${h * 5}m` : resultGrid === "1m" ? `${h}m` : `${h * (result?.config.step_secs ?? 1)}s`;
   const symbolsInResult = result ? Array.from(new Set(result.cells.map((c) => c.symbol))) : [];
   const scopeSymbol = symbolsInResult.includes(scope) ? scope : symbolsInResult.includes("ALL") ? "ALL" : symbolsInResult[0];
   const cells = result ? result.cells.filter((c) => c.symbol === scopeSymbol) : [];
@@ -1672,8 +1690,9 @@ function StudiesWorkspace() {
           name: form.get("name"),
           start_date: form.get("start_date"),
           end_date: form.get("end_date"),
-          symbols,
+          symbols: csvGrid ? csvList : symbols,
           step_secs: step,
+          resolution: csvGrid ? gridChoice : undefined,
           features: allFeatures,
           horizons: horizons.split(",").map((h) => Number(h.trim())).filter((h) => h > 0),
           decision_delay_bars: delay,
@@ -1694,10 +1713,8 @@ function StudiesWorkspace() {
   return (
     <div className="studies-workspace">
       <section className="panel">
-        <div className="terminal-panel-title"><span>STD</span> NEW FEATURE STUDY · tick lake</div>
-        {instruments.length === 0 ? (
-          <div className="empty-state">No tick lake configured. Set <code>lake_dir</code> in local.toml to a parquet lake with trades, book_snapshots, and book_events.</div>
-        ) : (
+        <div className="terminal-panel-title"><span>STD</span> NEW FEATURE STUDY · {csvGrid ? `${gridChoice} CSV bars` : "tick lake"}</div>
+        {(
           <form onSubmit={submit} noValidate>
             <div className="sweep-form-grid">
               <label>
@@ -1713,12 +1730,16 @@ function StudiesWorkspace() {
                 <input name="end_date" type="date" defaultValue={maxDate} min={minDate} max={maxDate} required />
               </label>
               <label>
-                Sampling grid
-                <select value={step} onChange={(e) => setStep(Number(e.target.value))}>
-                  {[1, 2, 5, 10, 15, 30].map((s) => (
-                    <option key={s} value={s}>{s} second{s > 1 ? "s" : ""}</option>
+                Grid
+                <select value={gridChoice} onChange={(e) => setGridChoice(e.target.value)}>
+                  {LAKE_STEPS.map((s) => (
+                    <option key={s} value={String(s)}>{s} second{s > 1 ? "s" : ""} · tick lake</option>
                   ))}
+                  <option value="daily">Daily bars · CSV</option>
+                  <option value="5m">5-minute bars · CSV</option>
+                  <option value="1m">1-minute bars · CSV</option>
                 </select>
+                <small>{csvGrid ? "SDK loader; horizons and delay are bars of this grid" : "tick-built bars with the order book"}</small>
               </label>
               <label>
                 Horizons (bars)
@@ -1741,7 +1762,22 @@ function StudiesWorkspace() {
             <div className="study-pick-grid">
               <fieldset>
                 <legend>Instruments</legend>
-                {instruments.map((i) => {
+                {csvGrid ? (
+                  <label className="expression-box">
+                    <span>Symbols</span>
+                    <textarea
+                      rows={3}
+                      spellCheck={false}
+                      placeholder={"SPY.US, QQQ.US"}
+                      value={csvSymbols}
+                      onChange={(e) => setCsvSymbols(e.target.value)}
+                    />
+                    <small>comma or newline separated; each needs a {gridChoice} CSV file in the data library. Order-book features are reported unavailable on this grid.</small>
+                  </label>
+                ) : instruments.length === 0 ? (
+                  <div className="empty-state">No tick lake configured. Set <code>lake_dir</code> in local.toml, or pick a CSV grid above.</div>
+                ) : null}
+                {!csvGrid && instruments.map((i) => {
                   const id = `${i.exchange}:${i.symbol}`;
                   return (
                     <label key={id} className="check-row">
@@ -1780,8 +1816,9 @@ function StudiesWorkspace() {
                   />
                   <small>
                     One per line: a base (obi_l1, obi_l5, obi_l10, microprice_bps, spread_bps, trade_imbalance,
-                    return_1, signed_volume, bid, ask, mid, microprice, bid_size, ask_size, bid_depth_l5,
-                    ask_depth_l5, trade_count, buy_volume, sell_volume, volume, close) then transforms:
+                    return_n, signed_volume, bid, ask, mid, microprice, bid_size, ask_size, bid_depth_l5,
+                    ask_depth_l5, trade_count, buy_volume, sell_volume, volume, close, range_bps, gap_bps,
+                    high_n_distance; return_n and high_n_distance take any window) then transforms:
                     ema n, sma n, zscore n, diff n, lag n, rate n, ratio_to &lt;transform&gt;, pct_rank n, abs,
                     sign, clip lo hi, times &lt;base | (expr)&gt;.
                   </small>
@@ -1790,8 +1827,8 @@ function StudiesWorkspace() {
             </div>
             {error && <p className="negative-text">{error}</p>}
             <div className="sweep-submit">
-              <span>{symbols.length} instruments · {allFeatures.length} features · grid {step}s</span>
-              <button className="primary-action" disabled={busy || symbols.length === 0 || allFeatures.length === 0}>
+              <span>{csvGrid ? csvList.length : symbols.length} instruments · {allFeatures.length} features · grid {csvGrid ? gridChoice : `${step}s`}</span>
+              <button className="primary-action" disabled={busy || (csvGrid ? csvList.length === 0 : symbols.length === 0) || allFeatures.length === 0}>
                 Run study →
               </button>
             </div>
@@ -1838,11 +1875,14 @@ function StudiesWorkspace() {
             <>
               <div className="sweep-summary-strip">
                 <strong>{detail.study.name}</strong>
-                <span>{result.start} → {result.end} · {result.config.step_secs}s grid · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
-                <span>{result.symbols.map((s) => `${s.symbol} ${s.bars_with_book.toLocaleString()} bars`).join(" · ")}</span>
+                <span>{result.start} → {result.end} · {resultGrid} grid · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
+                <span>{result.symbols.map((s) => `${s.symbol} ${(s.bars_with_book || s.bars).toLocaleString()} bars`).join(" · ")}</span>
               </div>
+              {result.unavailable && result.unavailable.length > 0 && (
+                <p className="footnote">{result.unavailable.map((u) => `${u.feature}: ${u.reason}`).join(" · ")}</p>
+              )}
               <div className="table-wrap sweep-heatmap"><table>
-                <thead><tr><th>feature ↓ / horizon →</th>{horizonList.map((h) => <th key={h}>{h * result.config.step_secs}s</th>)}</tr></thead>
+                <thead><tr><th>feature ↓ / horizon →</th>{horizonList.map((h) => <th key={h}>{horizonLabel(h)}</th>)}</tr></thead>
                 <tbody>{sortedFeatures.map((feature) => (
                   <tr key={feature}><th>{feature}</th>
                     {horizonList.map((h) => {
@@ -1869,7 +1909,7 @@ function StudiesWorkspace() {
                   {featureList.map((f) => <option key={f} value={f}>{f}</option>)}
                 </select>
                 <select value={bucketCell?.horizon_bars ?? ""} onChange={(e) => setBucketHorizon(Number(e.target.value))}>
-                  {horizonList.map((h) => <option key={h} value={h}>{h * result.config.step_secs}s</option>)}
+                  {horizonList.map((h) => <option key={h} value={h}>{horizonLabel(h)}</option>)}
                 </select>
               </div>
               {bucketCell && (
@@ -1886,7 +1926,7 @@ function StudiesWorkspace() {
                 </table></div>
               )}
               <div className="terminal-panel-title">
-                <span>CRV</span> COSTLESS CURVE{bucketCell ? ` · ${bucketCell.feature} · ${bucketCell.horizon_secs}s` : ""}
+                <span>CRV</span> COSTLESS CURVE{bucketCell ? ` · ${bucketCell.feature} · ${horizonLabel(bucketCell.horizon_bars)}` : ""}
                 <select value={curveVariant} onChange={(e) => setCurveVariant(e.target.value)}>
                   <option value="zscore">position: clipped z-score</option>
                   <option value="sign">position: sign</option>
@@ -1906,7 +1946,7 @@ function StudiesWorkspace() {
                         onClick={() => { setBucketFeature(c.feature); setBucketHorizon(c.horizon_bars); }}
                       >
                         <td>{c.feature}</td>
-                        <td>{c.horizon_secs}s</td>
+                        <td>{horizonLabel(c.horizon_bars)}</td>
                         <td className={icClass(c.ic)}>{signed(c.ic, 4)}</td>
                         <td className={classFor(finite(c.sharpe) ?? undefined)}>{signed(c.sharpe, 2)}</td>
                         <td>{formatNumber(finite(c.turnover), 3)}</td>

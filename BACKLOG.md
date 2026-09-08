@@ -85,7 +85,7 @@ microprice). IC, deciles, and the equity curve all run against the chosen target
 **Done when:** unit tests compute each target on a fixture, and a study of `spread_bps` against
 `realized_variance` on the SOL fixture reports a positive IC.
 
-### WB-04 Panel loader over every bar resolution — `todo` — Blocked by WB-01
+### WB-04 Panel loader over every bar resolution — `done 2026-09-07 WB-04: panel loader over every bar resolution` — Blocked by WB-01
 The study reads its panel through the SDK loader: 1-minute, 5-minute, and daily CSV bars as well
 as tick-built lake bars. Book-only bases report "unavailable on this grid" instead of failing.
 OHLCV bases: `return_n`, `range_bps`, `gap_bps`, `volume | zscore n`, `high_252_distance`.
@@ -140,6 +140,14 @@ that no non-overlapping execution would earn. Add a variant that rebalances ever
 holds until the position flips) and report its Sharpe and breakeven next to the per-bar ones.
 **Done when:** a unit test shows the per-bar and rebalanced variants agree for `h = 1` and the
 rebalanced breakeven of a constant-position feature is finite and far below the per-bar figure.
+
+### WB-12 Studies form knows the grid's features and symbols — `todo` — Blocked by WB-04
+On a CSV grid the form still offers the order-book feature checkboxes (they come back as
+"unavailable on this grid") and takes symbols as typed text. Hide or grey the book features when
+a CSV grid is chosen, pick CSV symbols from the catalog with the run form's instrument picker,
+and pre-tick the OHLCV set (`return_1`, `range_bps`, `gap_bps`, `high_252_distance`).
+**Done when:** the browser check selects the daily grid and finds no order-book checkbox and a
+catalog-backed symbol picker; a submitted daily study reports nothing unavailable.
 
 ## Housekeeping
 

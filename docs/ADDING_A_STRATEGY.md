@@ -102,7 +102,9 @@ with
 ```toml
 lake_dir = "/path/to/lake"
 symbols = ["PARADEX:SOL-USD-PERP", "BINANCE_FUTURES:SOLUSDT"]
-step_secs = 1                       # sampling grid; horizons and delay are in bars of it
+step_secs = 1                       # lake sampling grid; horizons and delay are in bars of it
+# resolution = "daily"              # or "5m" / "1m": CSV bars through the SDK loader instead
+# daily_dir = "examples/data/eod"   # with five_minute_dir / one_minute_dir, calendar_symbol
 features = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "return_1"]
 horizons = [1, 5, 30, 60]
 decision_delay_bars = 1             # bars between observing the book and acting
@@ -120,8 +122,37 @@ obi_l1 | times (spread_bps | zscore 60)    interaction; parentheses nest a pipel
 ```
 
 Bases: `obi_l1`, `obi_l5`, `obi_l10`, `microprice_bps`, `spread_bps`, `trade_imbalance`,
-`return_1`, `signed_volume`, `bid`, `ask`, `mid`, `microprice`, `bid_size`, `ask_size`,
-`bid_depth_l5`, `ask_depth_l5`, `trade_count`, `buy_volume`, `sell_volume`, `volume`, `close`.
+`return_n`, `signed_volume`, `bid`, `ask`, `mid`, `microprice`, `bid_size`, `ask_size`,
+`bid_depth_l5`, `ask_depth_l5`, `trade_count`, `buy_volume`, `sell_volume`, `volume`, `close`,
+`range_bps`, `gap_bps`, `high_n_distance`. `return_n` and `high_n_distance` take any window
+(`return_5`, `high_252_distance`: the close against the highest high of the last 252 bars, in
+bps, never above zero); `range_bps` is the bar's high-low range over its close; `gap_bps` is the
+open against the previous close.
+
+**Grids.** A study runs on tick-built lake bars (`step_secs`, the default) or, with
+`resolution = "daily"`, `"5m"`, or `"1m"`, on CSV bars read through the same SDK loaders a
+backtest uses (daily prints sanitized against `calendar_symbol`, intraday prints in the regular
+session), with plain symbols such as `SPY.US` and `daily_dir` / `five_minute_dir` /
+`one_minute_dir` from `local.toml`. On a CSV grid the close stands in for the mid, returns and
+the OHLCV bases (`return_n`, `range_bps`, `gap_bps`, `volume`, `close`, `high_n_distance`) work
+as usual, and any expression that reads the order book is reported as "unavailable on this
+grid" in the result instead of failing the study; `spread_change` and `microprice_residual`
+targets need the lake. Horizons are bars of the grid (`5` on daily bars is five sessions), and
+Sharpe annualizes with 252 sessions on CSV grids. A daily example:
+
+```bash
+tessera study --config study.toml --start 2019-01-01 --end 2025-12-31 --output-dir target/daily_study
+```
+
+```toml
+resolution = "daily"
+daily_dir = "examples/data/eod"
+calendar_symbol = "DEMO.US"
+symbols = ["DEMO.US"]
+features = ["return_1 | zscore 20", "range_bps | zscore 20", "high_252_distance"]
+horizons = [1, 5, 20]
+decision_delay_bars = 1
+```
 Transforms: `ema n`, `sma n`, `zscore n`, `diff n`, `lag n`, `rate n` (sum over `n` bars per
 second), `ratio_to <transform>` (the value over a transform of itself), `pct_rank n`, `abs`,
 `sign`, `clip lo hi`, `times <base | (expr)>`. Windows count bars; a bar without a book is `NaN`

@@ -22,7 +22,9 @@ use anyhow::{Result, bail};
 
 use crate::lake::{BookFeatures, LakeBar};
 
-/// Base series available on tick-built bars, in the order shown to users.
+/// Base series, in the order shown to users. The first block needs order-book bars (the tick
+/// lake); the OHLCV block works on every grid, CSV bars included. `return_n` and
+/// `high_n_distance` take any window, e.g. `return_5`, `high_252_distance`.
 pub const BASES: &[&str] = &[
     "obi_l1",
     "obi_l5",
@@ -30,7 +32,7 @@ pub const BASES: &[&str] = &[
     "microprice_bps",
     "spread_bps",
     "trade_imbalance",
-    "return_1",
+    "return_n",
     "signed_volume",
     "bid",
     "ask",
@@ -45,7 +47,65 @@ pub const BASES: &[&str] = &[
     "sell_volume",
     "volume",
     "close",
+    "range_bps",
+    "gap_bps",
+    "high_252_distance",
 ];
+
+/// Bases computed from open, high, low, close, and volume alone: available on every grid.
+pub const OHLCV_BASES: &[&str] = &[
+    "return_n",
+    "volume",
+    "close",
+    "range_bps",
+    "gap_bps",
+    "high_n_distance",
+];
+
+/// A windowed base name: `return_5` is `("return_n", 5)`, `high_252_distance` is
+/// `("high_n_distance", 252)`.
+fn windowed_base(name: &str) -> Option<(&'static str, usize)> {
+    let parse = |digits: &str| digits.parse::<usize>().ok().filter(|n| *n >= 1);
+    if let Some(digits) = name.strip_prefix("return_") {
+        return parse(digits).map(|n| ("return_n", n));
+    }
+    if let Some(rest) = name.strip_prefix("high_") {
+        if let Some(digits) = rest.strip_suffix("_distance") {
+            return parse(digits).map(|n| ("high_n_distance", n));
+        }
+    }
+    None
+}
+
+/// The family a base name belongs to (`return_5` -> `return_n`), or `None` if unknown.
+pub fn base_family(name: &str) -> Option<&'static str> {
+    if let Some((family, _)) = windowed_base(name) {
+        return Some(family);
+    }
+    BASES
+        .iter()
+        .copied()
+        .find(|b| *b == name && !matches!(*b, "return_n" | "high_252_distance"))
+}
+
+fn check_base(name: &str) -> Result<()> {
+    if base_family(name).is_none() {
+        bail!("unknown base {name:?}; bases: {}", BASES.join(", "));
+    }
+    Ok(())
+}
+
+/// Whether the expression reads the order book anywhere (including `times` operands), so it
+/// is unavailable on a plain OHLCV grid.
+pub fn needs_book(expr: &Expr) -> bool {
+    let base_needs_book =
+        |name: &str| base_family(name).is_some_and(|family| !OHLCV_BASES.contains(&family));
+    base_needs_book(&expr.base)
+        || expr.transforms.iter().any(|t| match t {
+            Transform::Times(inner) => needs_book(inner),
+            _ => false,
+        })
+}
 
 /// Transform names with their argument shapes, for error messages and the UI hint.
 pub const TRANSFORMS: &[&str] = &[
@@ -202,9 +262,7 @@ impl Parser<'_> {
             Some(Token::Ident(name)) => name,
             other => bail!("expected a base series name, found {other:?}"),
         };
-        if !BASES.contains(&base.as_str()) {
-            bail!("unknown base {base:?}; bases: {}", BASES.join(", "));
-        }
+        check_base(&base)?;
         let mut transforms = Vec::new();
         while self.peek() == Some(&Token::Pipe) {
             self.pos += 1;
@@ -262,9 +320,7 @@ impl Parser<'_> {
                         Some(Token::Ident(name)) => name,
                         other => bail!("times needs a base name or ( expr ), found {other:?}"),
                     };
-                    if !BASES.contains(&base.as_str()) {
-                        bail!("unknown base {base:?}; bases: {}", BASES.join(", "));
-                    }
+                    check_base(&base)?;
                     Expr {
                         base,
                         transforms: Vec::new(),
@@ -307,14 +363,17 @@ pub struct BarInput<'a> {
     pub previous_mid: Option<f64>,
 }
 
-/// Value of a base series on this bar; `None` when the bar has no book.
+/// Value of a per-bar base series on this bar; `None` when the bar has no book (or for the
+/// windowed bases, which the evaluator computes from its own history).
 pub fn base_value(name: &str, input: BarInput<'_>) -> Option<f64> {
     let bar = input.bar;
-    if name == "close" {
-        return Some(bar.close);
-    }
-    if name == "volume" {
-        return Some(bar.volume);
+    match name {
+        "close" => return Some(bar.close),
+        "volume" => return Some(bar.volume),
+        "range_bps" => {
+            return (bar.close > 0.0).then(|| (bar.high - bar.low) / bar.close * 1e4);
+        }
+        _ => {}
     }
     let book: &BookFeatures = bar.book.as_ref()?;
     Some(match name {
@@ -325,14 +384,6 @@ pub fn base_value(name: &str, input: BarInput<'_>) -> Option<f64> {
         "spread_bps" => book.spread_bps,
         "trade_imbalance" => book.trade_imbalance(),
         "signed_volume" => book.buy_volume - book.sell_volume,
-        "return_1" => {
-            let previous = input.previous_mid?;
-            if previous > 0.0 {
-                (book.mid / previous - 1.0) * 1e4
-            } else {
-                return None;
-            }
-        }
         "bid" => book.bid,
         "ask" => book.ask,
         "mid" => book.mid,
@@ -532,13 +583,47 @@ impl State {
 /// Streaming evaluator for one expression on one symbol.
 pub struct Evaluator {
     base: String,
+    base_state: BaseState,
+    /// On a book grid the price is the mid and a bar without a book is a gap; on an OHLCV
+    /// grid the price is the close.
+    book_grid: bool,
     states: Vec<State>,
 }
 
+/// History the windowed bases keep between bars.
+enum BaseState {
+    Plain,
+    /// `return_n`: prices of the last `n + 1` bars.
+    ReturnN(Window),
+    /// `gap_bps`: the previous bar's close.
+    Gap {
+        previous_close: Option<f64>,
+    },
+    /// `high_n_distance`: highs of the last `n` bars.
+    HighDistance(Window),
+}
+
 impl Evaluator {
+    /// An evaluator for order-book bars (the tick lake): see [`Evaluator::for_grid`].
     pub fn new(expr: &Expr, step_secs: u32) -> Self {
+        Self::for_grid(expr, step_secs, true)
+    }
+
+    /// `book_grid` says whether the bars carry an order book. Returns then use the mid and
+    /// treat a bar without a book as a gap; on an OHLCV grid they use the close.
+    pub fn for_grid(expr: &Expr, step_secs: u32, book_grid: bool) -> Self {
+        let base_state = match (windowed_base(&expr.base), expr.base.as_str()) {
+            (Some(("return_n", n)), _) => BaseState::ReturnN(Window::new(n + 1)),
+            (Some(("high_n_distance", n)), _) => BaseState::HighDistance(Window::new(n)),
+            (_, "gap_bps") => BaseState::Gap {
+                previous_close: None,
+            },
+            _ => BaseState::Plain,
+        };
         Self {
             base: expr.base.clone(),
+            base_state,
+            book_grid,
             states: expr
                 .transforms
                 .iter()
@@ -549,7 +634,51 @@ impl Evaluator {
 
     /// The expression's value on this bar (`NaN` when unavailable or not yet warm).
     pub fn next(&mut self, input: BarInput<'_>) -> f64 {
-        let mut x = base_value(&self.base, input).unwrap_or(f64::NAN);
+        let bar = input.bar;
+        let price = if self.book_grid {
+            bar.book.as_ref().map(|b| b.mid).unwrap_or(f64::NAN)
+        } else {
+            bar.close
+        };
+        let mut x = match &mut self.base_state {
+            BaseState::Plain => base_value(&self.base, input).unwrap_or(f64::NAN),
+            BaseState::ReturnN(window) => {
+                window.push(price);
+                match window.values.front() {
+                    Some(&previous) if window.full() && previous > 0.0 => {
+                        (price / previous - 1.0) * 1e4
+                    }
+                    _ => f64::NAN,
+                }
+            }
+            BaseState::Gap { previous_close } => {
+                let gap = match *previous_close {
+                    Some(previous) if previous > 0.0 && bar.open.is_finite() => {
+                        (bar.open / previous - 1.0) * 1e4
+                    }
+                    _ => f64::NAN,
+                };
+                *previous_close = Some(bar.close);
+                gap
+            }
+            BaseState::HighDistance(window) => {
+                window.push(bar.high);
+                if window.full() {
+                    let top = window
+                        .values
+                        .iter()
+                        .cloned()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if top > 0.0 {
+                        (bar.close / top - 1.0) * 1e4
+                    } else {
+                        f64::NAN
+                    }
+                } else {
+                    f64::NAN
+                }
+            }
+        };
         for state in &mut self.states {
             x = state.step(x, input);
         }
