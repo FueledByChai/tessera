@@ -138,6 +138,20 @@ hour of the bar's clock (when the study spans more than one hour); and the featu
 autocorrelation at lag 1 and at the horizon. `daily_ic.csv` and `regimes.csv` hold the tables;
 the studies page shows the per-day IC strip and the regime table for the selected cell.
 
+**Presets and promotion.** The studies page keeps a feature library: named expressions saved
+in the console's catalog database (`GET`/`POST /api/features`), so they survive a service
+restart. "Use" puts one among a study's candidates; "promote" (`POST /api/features/{id}/promote`
+with `{"accepted": true}`, or the "promote to accepted" action on a cell in the results) moves it
+into the accepted set, which every later study regresses its candidates against on top of the
+expressions typed into the form. A promoted feature that cannot run on the chosen grid (an
+order-book base on daily bars) is left out of that study rather than blocking it. A study with an
+accepted set also writes `accepted.parquet` next to its results: `symbol`, `time_us` (the bar's
+close, microseconds UTC), `date`, one Float64 column per accepted expression, and
+`target_<horizon>` per horizon holding what the study scored that bar against (the target
+`decision_delay_bars` later, over the horizon; warm-up bars are dropped, targets past the end of
+the data are NaN). It downloads from the results strip (`GET /api/studies/{id}/export`) and reads
+with `tessera parquet-schema --path <file>` (`--csv-out` for a CSV copy), ready for a model fit.
+
 **Aggregation and lifting.** On an intraday grid `agg daily` is a running intraday feature
 (today's volume so far, today's realized variance so far). On the daily grid it lifts: with
 `intraday_source = "1m"` (or `"5m"`; the service picks the finest library present) each

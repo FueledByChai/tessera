@@ -1443,6 +1443,16 @@ function MultiRunChart({ details }: { details: RunDetail[] }) {
   );
 }
 
+// A named feature expression in the catalog; promoted ones form the accepted set (WB-09).
+type FeaturePreset = {
+  id: string;
+  name: string;
+  expression: string;
+  note: string;
+  accepted: boolean;
+  created_at: string;
+  promoted_at?: string | null;
+};
 type StudyRecord = {
   id: string;
   name: string;
@@ -1506,6 +1516,8 @@ type StudyResult = {
   // The forward quantity every cell is scored against and its unit (absent on older results).
   target?: string;
   target_unit?: string;
+  // `accepted.parquet` next to the study: the accepted features and targets for model fitting.
+  accepted_export?: string | null;
   start: string;
   end: string;
   symbols: { symbol: string; bars: number; bars_with_book: number }[];
@@ -1668,6 +1680,14 @@ function StudiesWorkspace() {
   const [studies, setStudies] = useState<StudyRecord[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [detail, setDetail] = useState<{ study: StudyRecord; result: StudyResult | null } | null>(null);
+  // The feature library: named expressions in the catalog; the promoted ones are the accepted
+  // set every study regresses its candidates against.
+  const [library, setLibrary] = useState<FeaturePreset[]>([]);
+  const [libName, setLibName] = useState("");
+  const [libExpression, setLibExpression] = useState("");
+  const [libNote, setLibNote] = useState("");
+  const [libError, setLibError] = useState("");
+  const promoted = useMemo(() => library.filter((p) => p.accepted), [library]);
   const [symbols, setSymbols] = useState<string[]>([]);
   const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id).filter((id) => BOOK_FEATURES.includes(id) || id === "return_1"));
   // Free-form feature expressions, one per line: base series plus streaming transforms.
@@ -1698,12 +1718,14 @@ function StudiesWorkspace() {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    const [i, s] = await Promise.all([
+    const [i, s, f] = await Promise.all([
       fetch(`${API}/lake/instruments`, { cache: "no-store" }),
       fetch(`${API}/studies`, { cache: "no-store" }),
+      fetch(`${API}/features`, { cache: "no-store" }),
     ]);
     if (i.ok) setInstruments(await i.json());
     if (s.ok) setStudies(await s.json());
+    if (f.ok) setLibrary(await f.json());
   }, []);
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);
@@ -1761,6 +1783,37 @@ function StudiesWorkspace() {
     .filter((c) => finite(c.breakeven_bps) != null)
     .sort((a, b) => (finite(b.breakeven_bps) ?? 0) - (finite(a.breakeven_bps) ?? 0));
   const RANK_CAP = 12;
+
+  async function libraryCall(path: string, init: RequestInit) {
+    setLibError("");
+    try {
+      const response = await fetch(`${API}/features${path}`, init);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(body.error ?? response.statusText);
+      }
+      await refresh();
+      return true;
+    } catch (caught) {
+      setLibError(caught instanceof Error ? caught.message : String(caught));
+      return false;
+    }
+  }
+  const saveFeature = (name: string, expression: string, note: string, accepted: boolean) =>
+    libraryCall("", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, expression, note, accepted }) });
+  const promoteFeature = (id: string, accepted: boolean) =>
+    libraryCall(`/${id}/promote`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ accepted }) });
+  const deleteFeature = (id: string) => libraryCall(`/${id}`, { method: "DELETE" });
+  // "use" puts a saved expression among the candidates: a plain base ticks its checkbox, anything
+  // else goes on its own line in the expressions box.
+  const applyFeature = (preset: FeaturePreset) => {
+    if (STUDY_FEATURES.some(([id]) => id === preset.expression)) {
+      if (!features.includes(preset.expression)) setFeatures([...features, preset.expression]);
+    } else if (!customFeatures.includes(preset.expression)) {
+      setExpressions((text) => (text.trim() ? `${text.trimEnd()}\n${preset.expression}` : preset.expression));
+    }
+  };
+  const acceptedInLibrary = (expression: string) => promoted.some((p) => p.expression === expression);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1919,7 +1972,10 @@ function StudiesWorkspace() {
                     value={acceptedText}
                     onChange={(e) => setAcceptedText(e.target.value)}
                   />
-                  <small>Regressed out of every feature before its incremental IC, so a new feature is scored on what it adds.</small>
+                  <small>
+                    Regressed out of every feature before its incremental IC, so a new feature is scored on what it adds.
+                    {promoted.length > 0 ? ` The library's accepted set is always included: ${promoted.map((p) => p.expression).join(", ")}.` : " Promote features in the library below to build a standing accepted set."}
+                  </small>
                 </label>
                 <label className="expression-box">
                   <span>Expression notes</span>
@@ -1945,6 +2001,59 @@ function StudiesWorkspace() {
               </button>
             </div>
           </form>
+        )}
+      </section>
+
+      <section className="panel feature-library">
+        <div className="terminal-panel-title"><span>LIB</span> FEATURE LIBRARY · {promoted.length} accepted · {library.length} saved</div>
+        <form
+          className="sweep-form-grid feature-save"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void saveFeature(libName, libExpression, libNote, false).then((ok) => {
+              if (ok) {
+                setLibName("");
+                setLibExpression("");
+                setLibNote("");
+              }
+            });
+          }}
+        >
+          <label>
+            Name
+            <input value={libName} onChange={(e) => setLibName(e.target.value)} maxLength={80} placeholder="spread z60" />
+          </label>
+          <label>
+            Expression
+            <input value={libExpression} onChange={(e) => setLibExpression(e.target.value)} spellCheck={false} placeholder="spread_bps | zscore 60" />
+          </label>
+          <label>
+            Note
+            <input value={libNote} onChange={(e) => setLibNote(e.target.value)} maxLength={200} placeholder="why it earned a place" />
+          </label>
+          <button className="secondary-action" type="submit" disabled={!libName.trim() || !libExpression.trim()}>Save feature</button>
+        </form>
+        {libError && <p className="negative-text">{libError}</p>}
+        {library.length ? (
+          <div className="table-wrap"><table className="feature-library-table">
+            <thead><tr><th>Name</th><th>Expression</th><th>Status</th><th>Note</th><th>Saved</th><th>Actions</th></tr></thead>
+            <tbody>{library.map((p) => (
+              <tr key={p.id} className={p.accepted ? "accepted" : ""}>
+                <td>{p.name}</td>
+                <td className="feature-expression">{p.expression}</td>
+                <td><em>{p.accepted ? "ACCEPTED" : "candidate"}</em></td>
+                <td>{p.note}</td>
+                <td>{p.created_at.slice(0, 10)}</td>
+                <td className="feature-actions">
+                  <button type="button" className="text-action" onClick={() => applyFeature(p)}>use</button>
+                  <button type="button" className="text-action" onClick={() => void promoteFeature(p.id, !p.accepted)}>{p.accepted ? "demote" : "promote"}</button>
+                  <button type="button" className="text-action" onClick={() => void deleteFeature(p.id)}>delete</button>
+                </td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        ) : (
+          <div className="empty-state">No saved features yet. Save an expression here or promote a cell from a study's results; promoted features are regressed out of every candidate and exported with the targets.</div>
         )}
       </section>
 
@@ -1989,6 +2098,11 @@ function StudiesWorkspace() {
                 <strong>{detail.study.name}</strong>
                 <span>{result.start} → {result.end} · {resultGrid} grid · {(result.mode ?? result.config.mode ?? "time_series").replace("_", "-")} · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
                 <span>{result.symbols.map((s) => `${s.symbol} ${(s.bars_with_book || s.bars).toLocaleString()} bars`).join(" · ")}</span>
+                {result.accepted_export && (
+                  <a className="study-export" href={`${API}/studies/${detail.study.id}/export`} download>
+                    {result.accepted_export} ↓ accepted features + targets
+                  </a>
+                )}
               </div>
               {result.series && result.series.length > 0 && (
                 <p className="footnote">Series available as bases, joined as-of availability: {result.series.join(", ")}.</p>
@@ -2046,6 +2160,17 @@ function StudiesWorkspace() {
                   <option value="zscore">position: clipped z-score</option>
                   <option value="sign">position: sign</option>
                 </select>
+                {bucketCell && (acceptedInLibrary(bucketCell.feature) ? (
+                  <em className="accepted-tag">accepted</em>
+                ) : (
+                  <button
+                    type="button"
+                    className="text-action"
+                    onClick={() => void saveFeature(bucketCell.feature, bucketCell.feature, `promoted from ${detail.study.name}`, true)}
+                  >
+                    promote to accepted
+                  </button>
+                ))}
               </div>
               {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
               <p className="footnote">{bucketCell?.cross_section ? `Long the top decile and short the bottom decile across symbols, equal weights on each side, rebalanced every date and paid the target over the horizon, zero costs. Turnover is the absolute weight change per date (a full swap of both sides is 4); breakeven is the cost per unit traded that would zero the mean P&L. Mean daily IC ${signed(bucketCell.ic, 4)} over ${bucketCell.cross_section.dates} dates, t=${formatNumber(finite(bucketCell.cross_section.ic_t), 1)}, ${Math.round(bucketCell.cross_section.ic_positive_share * 100)}% of dates positive.` : "Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L."}</p>

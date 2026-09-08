@@ -685,6 +685,43 @@ pub fn build_bars(
 
 /// Diagnostics for one symbol-day: epochs, event mix, and how often the reconstructed touch
 /// brackets the trades. Used to validate a venue's delta semantics before trusting features.
+/// A parquet file's schema and first rows, as `tessera parquet-schema` prints them: the row
+/// and column counts, every column with its dtype, the first `rows`, and the distinct values of
+/// any string column with at most twelve. `csv_out` also writes the whole table as CSV.
+pub fn describe_parquet(path: &Path, rows: usize, csv_out: Option<&Path>) -> Result<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut frame = ParquetReader::new(file).finish()?;
+    if let Some(csv) = csv_out {
+        CsvWriter::new(fs::File::create(csv)?).finish(&mut frame)?;
+        let _ = writeln!(out, "wrote {}", csv.display());
+    }
+    let _ = writeln!(out, "{} rows x {} columns", frame.height(), frame.width());
+    for (name, dtype) in frame.get_column_names().iter().zip(frame.dtypes()) {
+        let _ = writeln!(out, "  {name}: {dtype:?}");
+    }
+    let _ = writeln!(out, "{}", frame.head(Some(rows)));
+    let names: Vec<String> = frame
+        .get_column_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    for name in names {
+        let Ok(column) = frame.column(&name) else {
+            continue;
+        };
+        if matches!(column.dtype(), DataType::String | DataType::Binary) {
+            if let Ok(unique) = column.as_materialized_series().unique() {
+                if unique.len() <= 12 {
+                    let _ = writeln!(out, "  distinct {name}: {}", unique.head(Some(12)));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn diagnose_day(lake: &Path, sym: &LakeSymbol, date: NaiveDate) -> Result<String> {
     use std::fmt::Write;
     let trades = read_trades(lake, sym, date)?;

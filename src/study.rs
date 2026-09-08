@@ -1034,6 +1034,9 @@ pub struct StudyResult {
     pub cells: Vec<StudyCell>,
     /// One event study per registered `event` series: the mean price path around its events.
     pub events: Vec<EventStudy>,
+    /// The file next to the study holding the accepted features and the targets for model
+    /// fitting (`accepted.parquet`), when the study has an accepted set.
+    pub accepted_export: Option<String>,
 }
 
 /// The average cumulative return path around the events of one series, normalised to zero
@@ -1988,6 +1991,18 @@ fn run_study(
             );
         }
     }
+    let accepted_export = if config.accepted.is_empty() {
+        None
+    } else {
+        write_accepted_frame(
+            &output_dir.join("accepted.parquet"),
+            config,
+            grid,
+            &series,
+            &targets,
+        )?;
+        Some("accepted.parquet".to_owned())
+    };
     let result = StudyResult {
         config: config.clone(),
         target: config.target,
@@ -2008,6 +2023,7 @@ fn run_study(
             .collect(),
         cells,
         events,
+        accepted_export,
     };
     fs::write(
         output_dir.join("study.json"),
@@ -2108,6 +2124,74 @@ fn run_study(
     Ok(result)
 }
 
+/// The accepted features and the targets, one row per bar per symbol, for model fitting outside
+/// the study: `symbol`, `time_us` (the bar's close instant, microseconds UTC), `date`, one
+/// Float64 column per accepted expression, and `target_<horizon>` per horizon holding what the
+/// study scores that bar against (the target `decision_delay_bars` later, over the horizon).
+/// Bars where an accepted feature is not yet defined (warm-up) are left out; a target that
+/// runs past the data is NaN. Returns the row count.
+fn write_accepted_frame(
+    path: &Path,
+    config: &StudyConfig,
+    grid: Grid,
+    series: &[SymbolSeries],
+    targets: &[Vec<Vec<f64>>],
+) -> Result<usize> {
+    use polars::prelude::*;
+    let mut symbols: Vec<String> = Vec::new();
+    let mut times: Vec<i64> = Vec::new();
+    let mut dates: Vec<String> = Vec::new();
+    let mut accepted: Vec<Vec<f64>> = vec![Vec::new(); config.accepted.len()];
+    let mut forward: Vec<Vec<f64>> = vec![Vec::new(); config.horizons.len()];
+    for (s, symbol_targets) in series.iter().zip(targets) {
+        for i in 0..s.bars {
+            let defined = s
+                .accepted
+                .iter()
+                .all(|a| a.get(i).is_some_and(|v| v.is_finite()));
+            if !defined {
+                continue;
+            }
+            symbols.push(s.symbol.clone());
+            times.push(s.keys[i]);
+            dates.push(s.dates[i].to_string());
+            for (column, values) in accepted.iter_mut().zip(&s.accepted) {
+                column.push(values[i]);
+            }
+            for (column, values) in forward.iter_mut().zip(symbol_targets) {
+                column.push(
+                    values
+                        .get(i + config.decision_delay_bars)
+                        .copied()
+                        .unwrap_or(f64::NAN),
+                );
+            }
+        }
+    }
+    let symbols_len = symbols.len();
+    let mut columns = vec![
+        Column::new("symbol".into(), symbols),
+        Column::new("time_us".into(), times),
+        Column::new("date".into(), dates),
+    ];
+    let mut seen: HashSet<String> = HashSet::new();
+    for (name, values) in config.accepted.iter().zip(accepted) {
+        if seen.insert(name.clone()) {
+            columns.push(Column::new(name.as_str().into(), values));
+        }
+    }
+    for (&horizon, values) in config.horizons.iter().zip(forward) {
+        let name = format!("target_{}", grid.horizon_label(horizon));
+        if seen.insert(name.clone()) {
+            columns.push(Column::new(name.as_str().into(), values));
+        }
+    }
+    let mut frame = DataFrame::new(symbols_len, columns)?;
+    let file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    ParquetWriter::new(file).finish(&mut frame)?;
+    Ok(frame.height())
+}
+
 /// A compact text table of the pooled (or single-symbol) results.
 pub fn summary_table(result: &StudyResult) -> String {
     use std::fmt::Write;
@@ -2130,6 +2214,13 @@ pub fn summary_table(result: &StudyResult) -> String {
     }
     for skipped in &result.unavailable {
         let _ = writeln!(out, "{}: {}", skipped.feature, skipped.reason);
+    }
+    if let Some(file) = &result.accepted_export {
+        let _ = writeln!(
+            out,
+            "accepted set: {} → {file}",
+            result.config.accepted.join(", ")
+        );
     }
     for study in &result.events {
         let _ = writeln!(
@@ -3138,6 +3229,122 @@ mod tests {
             (r[0] + 2.0).abs() < 1e-9,
             "a constant regressor falls back to demeaning: {r:?}"
         );
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    /// WB-09: with an accepted set, the study writes the accepted features and the targets to
+    /// parquet for model fitting, and the file reads back through the `parquet-schema` path with
+    /// the same columns and the values the study scored.
+    #[test]
+    fn accepted_export_round_trips_through_parquet() {
+        let bars = synthetic_grid();
+        let day = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let mut config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: vec!["BINANCE_FUTURES:SOLUSDT".to_owned()],
+            step_secs: 1,
+            resolution: None,
+            daily_dir: PathBuf::new(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: None,
+            session: SessionKind::Regular,
+            features: vec!["obi_l5".to_owned()],
+            horizons: vec![5, 30],
+            decision_delay_bars: 1,
+            buckets: 10,
+            target: Target::Return,
+            series: Vec::new(),
+            lake_series: false,
+            mode: StudyMode::TimeSeries,
+            intraday_source: None,
+            event_window: 20,
+            accepted: vec!["spread_bps".to_owned(), "obi_l1 | zscore 60".to_owned()],
+        };
+        let out = std::env::temp_dir().join(format!("tessera-wb09-{}", std::process::id()));
+        let panel = || vec![("BINANCE_FUTURES:SOLUSDT".to_owned(), bars.clone())];
+        let result =
+            run_on_panel_with_series(&config, panel(), Vec::new(), day, day, &out).unwrap();
+        assert_eq!(result.accepted_export.as_deref(), Some("accepted.parquet"));
+        let path = out.join("accepted.parquet");
+        let expected_columns = [
+            "symbol",
+            "time_us",
+            "date",
+            "spread_bps",
+            "obi_l1 | zscore 60",
+            "target_5s",
+            "target_30s",
+        ];
+        // The schema as `tessera parquet-schema` prints it.
+        let described = crate::lake::describe_parquet(&path, 3, None).unwrap();
+        for column in expected_columns {
+            assert!(
+                described.contains(column),
+                "{column} missing from:\n{described}"
+            );
+        }
+        assert!(described.contains("target_5s: Float64"), "{described}");
+        assert!(described.contains("time_us: Int64"), "{described}");
+        // And the values: every bar where the accepted set is defined, the feature as the
+        // study evaluated it, and the target the study scored that bar against.
+        use polars::prelude::*;
+        let frame = ParquetReader::new(fs::File::open(&path).unwrap())
+            .finish()
+            .unwrap();
+        let names: Vec<&str> = frame
+            .get_column_names()
+            .iter()
+            .map(|n| n.as_str())
+            .collect();
+        assert_eq!(names, expected_columns);
+        let (_, values, _) = evaluate_features(&config.accepted, 1, &bars, true).unwrap();
+        let spread = &values["spread_bps"];
+        let z = &values["obi_l1 | zscore 60"];
+        let exported: Vec<usize> = (0..bars.len())
+            .filter(|&i| spread[i].is_finite() && z[i].is_finite())
+            .collect();
+        assert!(exported.len() > 1_000 && exported.len() < bars.len());
+        assert_eq!(frame.height(), exported.len());
+        let grid = Grid::Lake { step_secs: 1 };
+        let book = TargetSeries::from_bars(&bars, grid);
+        let target_5 = target_series(&book, Target::Return, 5);
+        let column = |name: &str| frame.column(name).unwrap().as_materialized_series().clone();
+        let times = column("time_us");
+        let times = times.i64().unwrap();
+        let spreads = column("spread_bps");
+        let spreads = spreads.f64().unwrap();
+        let targets = column("target_5s");
+        let targets = targets.f64().unwrap();
+        for (row, &i) in exported.iter().enumerate().step_by(97) {
+            assert_eq!(times.get(row).unwrap(), bar_close_us(&bars[i], grid));
+            assert_eq!(spreads.get(row).unwrap(), spread[i]);
+            let scored = target_5[i + config.decision_delay_bars];
+            let written = targets.get(row).unwrap();
+            assert!(
+                (scored.is_nan() && written.is_nan()) || scored == written,
+                "row {row}: scored {scored} written {written}"
+            );
+        }
+        let symbols = column("symbol");
+        assert_eq!(
+            symbols.str().unwrap().get(0).unwrap(),
+            "BINANCE_FUTURES:SOLUSDT"
+        );
+        assert!(summary_table(&result).contains("accepted.parquet"));
+        // The CSV side of parquet-schema writes the same table.
+        let csv = out.join("accepted.csv");
+        crate::lake::describe_parquet(&path, 1, Some(&csv)).unwrap();
+        assert_eq!(
+            fs::read_to_string(&csv).unwrap().lines().count(),
+            exported.len() + 1
+        );
+        // Without an accepted set there is nothing to export.
+        let _ = fs::remove_file(&path);
+        config.accepted.clear();
+        let bare = run_on_panel_with_series(&config, panel(), Vec::new(), day, day, &out).unwrap();
+        assert!(bare.accepted_export.is_none());
+        assert!(!path.exists());
         let _ = fs::remove_dir_all(&out);
     }
 

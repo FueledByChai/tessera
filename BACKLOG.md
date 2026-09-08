@@ -121,7 +121,7 @@ autocorrelation.
 **Done when:** a feature that is a linear copy of an accepted feature reports incremental IC near
 zero in a test; the UI shows the per-day IC strip and the regime table.
 
-### WB-09 Presets and promotion — `todo` — Blocked by WB-02
+### WB-09 Presets and promotion — `done 2026-09-08 WB-09: feature presets, promotion, accepted-feature parquet export` — Blocked by WB-02
 Named feature expressions saved in SQLite, a "promote to accepted" action, and a parquet export of
 accepted features plus targets for model fitting.
 **Done when:** a preset survives a service restart, promotion changes what WB-08 orthogonalizes
@@ -213,3 +213,11 @@ answers on 8787, so on CI it currently proves nothing. Add `playwright` as a web
 install its Chromium in the workflow, and run the check against the built bundle with the
 bundled example data (a scratch `TESSERA_ROOT` with `examples/`, one run, one study fixture).
 **Done when:** the CI job logs `layout-check: ok` and a deliberate bare-`fr` regression fails it.
+
+### HK-08 Layout check skips pages the console cannot supply — `todo`
+`web/scripts/layout-check.mjs` reports eight "could not open" failures when the console on 8787
+has no runs or strategies (a scratch instance on an empty catalog, seen during WB-09), so a
+check run beside a scratch service fails for reasons unrelated to the layout. Pages the console
+cannot supply should be listed as skipped, like a missing console, while the rest are measured.
+**Done when:** the check run against an empty catalog exits 0 with the run and strategy pages
+listed as skipped and the studies page measured.

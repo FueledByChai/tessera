@@ -236,34 +236,10 @@ fn main() -> Result<()> {
             rows,
             csv_out,
         } => {
-            use polars::prelude::*;
-            let mut frame = ParquetReader::new(std::fs::File::open(&path)?).finish()?;
-            if let Some(out) = csv_out {
-                CsvWriter::new(std::fs::File::create(&out)?).finish(&mut frame)?;
-                println!("wrote {}", out.display());
-            }
-            println!("{} rows x {} columns", frame.height(), frame.width());
-            for (name, dtype) in frame.get_column_names().iter().zip(frame.dtypes()) {
-                println!("  {name}: {dtype:?}");
-            }
-            println!("{}", frame.head(Some(rows)));
-            let names: Vec<String> = frame
-                .get_column_names()
-                .iter()
-                .map(|name| name.to_string())
-                .collect();
-            for name in names {
-                let Ok(column) = frame.column(&name) else {
-                    continue;
-                };
-                if matches!(column.dtype(), DataType::String | DataType::Binary) {
-                    if let Ok(unique) = column.as_materialized_series().unique() {
-                        if unique.len() <= 12 {
-                            println!("  distinct {name}: {}", unique.head(Some(12)));
-                        }
-                    }
-                }
-            }
+            print!(
+                "{}",
+                tessera::lake::describe_parquet(&path, rows, csv_out.as_deref())?
+            );
         }
     }
     Ok(())

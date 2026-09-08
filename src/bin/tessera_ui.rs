@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode};
-use axum::response::Html;
-use axum::routing::{get, post};
+use axum::response::{Html, IntoResponse};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::Los_Angeles;
@@ -617,7 +617,7 @@ async fn main() -> Result<()> {
             "http://127.0.0.1:5173".parse::<HeaderValue>()?,
             "http://localhost:5173".parse::<HeaderValue>()?,
         ])
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
     let web_dist = state.root.join("web").join("dist");
     let web_ready = web_dist.join("index.html").is_file();
@@ -664,6 +664,13 @@ async fn main() -> Result<()> {
         .route("/api/sweeps", get(list_sweeps).post(create_sweep))
         .route("/api/studies", get(list_studies).post(create_study))
         .route("/api/studies/{id}", get(study_detail))
+        .route("/api/studies/{id}/export", get(study_export))
+        .route(
+            "/api/features",
+            get(list_feature_presets).post(create_feature_preset),
+        )
+        .route("/api/features/{id}", delete(remove_feature_preset))
+        .route("/api/features/{id}/promote", post(promote_feature_preset))
         .route("/api/lake/instruments", get(lake_instruments))
         .route("/api/sweeps/{id}", get(sweep_detail))
         .route(
@@ -760,6 +767,15 @@ fn migrate(connection: &Connection) -> Result<()> {
              costs_enabled INTEGER NOT NULL DEFAULT 1,
              created_at TEXT NOT NULL,
              immutable INTEGER NOT NULL DEFAULT 1
+         );
+         CREATE TABLE IF NOT EXISTS feature_presets (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL UNIQUE,
+             expression TEXT NOT NULL,
+             note TEXT NOT NULL DEFAULT '',
+             accepted INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL,
+             promoted_at TEXT
          );
          CREATE TABLE IF NOT EXISTS data_updates (
              id TEXT PRIMARY KEY,
@@ -4406,7 +4422,7 @@ fn validate_study_request(
             "step_secs must divide a minute (1, 2, 5, 10, 15, 30)"
         );
     }
-    let config = tessera::study::StudyConfig {
+    let mut config = tessera::study::StudyConfig {
         lake_dir,
         symbols,
         step_secs: request.step_secs,
@@ -4462,20 +4478,285 @@ fn validate_study_request(
             .filter(|a| !a.is_empty())
             .collect(),
     };
-    // Bases may be declared series, plus the lake side feeds on the lake grid.
+    let names = study_base_names(data, grid.has_book());
+    // Every promoted preset joins the accepted set (WB-09); one that cannot run on this grid
+    // (an order-book or lake-feed feature on CSV bars) is left out rather than blocking it.
+    let promoted: Vec<String> = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        promoted_expressions(&connection)?
+    }
+    .into_iter()
+    .filter(|expression| {
+        tessera::feature_expr::parse_with(expression, &names)
+            .is_ok_and(|expr| grid.has_book() || !tessera::feature_expr::needs_book(&expr))
+    })
+    .collect();
+    config.accepted = merge_accepted(&config.accepted, &promoted);
+    for feature in config.features.iter().chain(&config.accepted) {
+        tessera::feature_expr::parse_with(feature, &names)
+            .with_context(|| format!("feature expression {feature:?}"))?;
+    }
+    Ok((config, start, end))
+}
+
+/// The bases an expression may use beyond the bar: the declared series, plus the lake side
+/// feeds when the grid has an order book.
+fn study_base_names(data: &tessera::local_config::DataLibrary, book_grid: bool) -> Vec<String> {
     let mut names: Vec<String> = data.series.iter().map(|s| s.name.clone()).collect();
-    if grid.has_book() {
+    if book_grid {
         names.extend(
             tessera::study::LAKE_SERIES
                 .iter()
                 .map(|(n, _, _)| (*n).to_owned()),
         );
     }
-    for feature in config.features.iter().chain(&config.accepted) {
-        tessera::feature_expr::parse_with(feature, &names)
-            .with_context(|| format!("feature expression {feature:?}"))?;
+    names
+}
+
+/// A named feature expression in the catalog (WB-09). Promoted presets form the accepted set
+/// every study regresses its candidates against before their incremental IC.
+#[derive(Debug, Clone, Serialize)]
+struct FeaturePresetRecord {
+    id: String,
+    name: String,
+    expression: String,
+    note: String,
+    accepted: bool,
+    created_at: String,
+    promoted_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveFeaturePresetRequest {
+    name: String,
+    expression: String,
+    #[serde(default)]
+    note: String,
+    /// Save it straight into the accepted set.
+    #[serde(default)]
+    accepted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromoteFeatureRequest {
+    accepted: bool,
+}
+
+const FEATURE_PRESET_COLUMNS: &str =
+    "id, name, expression, note, accepted, created_at, promoted_at";
+
+fn map_feature_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeaturePresetRecord> {
+    Ok(FeaturePresetRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        expression: row.get(2)?,
+        note: row.get(3)?,
+        accepted: row.get::<_, i64>(4)? != 0,
+        created_at: row.get(5)?,
+        promoted_at: row.get(6)?,
+    })
+}
+
+/// Every preset, the accepted ones first, then by name.
+fn query_feature_presets(connection: &Connection) -> Result<Vec<FeaturePresetRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {FEATURE_PRESET_COLUMNS} FROM feature_presets
+         ORDER BY accepted DESC, name COLLATE NOCASE"
+    ))?;
+    let rows = statement.query_map([], map_feature_preset)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn query_feature_preset(connection: &Connection, id: &str) -> Result<FeaturePresetRecord> {
+    connection
+        .query_row(
+            &format!("SELECT {FEATURE_PRESET_COLUMNS} FROM feature_presets WHERE id = ?1"),
+            [id],
+            map_feature_preset,
+        )
+        .optional()?
+        .with_context(|| format!("unknown feature preset {id}"))
+}
+
+/// Saves a named expression. An existing name is updated in place and keeps its promotion,
+/// so a promoted feature can be refined without falling out of the accepted set.
+fn save_feature_preset(
+    connection: &Connection,
+    name: &str,
+    expression: &str,
+    note: &str,
+    accepted: bool,
+) -> Result<FeaturePresetRecord> {
+    let name = name.trim();
+    let expression = expression.trim();
+    anyhow::ensure!(
+        !name.is_empty() && name.len() <= 80,
+        "preset name must contain 1 to 80 characters"
+    );
+    anyhow::ensure!(!expression.is_empty(), "the preset needs an expression");
+    let now = Utc::now().to_rfc3339();
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT id FROM feature_presets WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id = match existing {
+        Some(id) => {
+            connection.execute(
+                "UPDATE feature_presets
+                 SET expression = ?2, note = ?3,
+                     promoted_at = CASE WHEN accepted = 0 AND ?4 THEN ?5 ELSE promoted_at END,
+                     accepted = MAX(accepted, ?4)
+                 WHERE id = ?1",
+                params![id, expression, note.trim(), accepted, now],
+            )?;
+            id
+        }
+        None => {
+            let id = format!("feature-{}", Utc::now().format("%Y%m%dT%H%M%S%.6fZ"));
+            connection.execute(
+                "INSERT INTO feature_presets
+                 (id, name, expression, note, accepted, created_at, promoted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    name,
+                    expression,
+                    note.trim(),
+                    accepted,
+                    now,
+                    accepted.then(|| now.clone())
+                ],
+            )?;
+            id
+        }
+    };
+    query_feature_preset(connection, &id)
+}
+
+/// Promotes a preset into the accepted set, or takes it back out.
+fn set_feature_promoted(
+    connection: &Connection,
+    id: &str,
+    accepted: bool,
+) -> Result<FeaturePresetRecord> {
+    let promoted_at = accepted.then(|| Utc::now().to_rfc3339());
+    let changed = connection.execute(
+        "UPDATE feature_presets SET accepted = ?2, promoted_at = ?3 WHERE id = ?1",
+        params![id, accepted, promoted_at],
+    )?;
+    anyhow::ensure!(changed == 1, "unknown feature preset {id}");
+    query_feature_preset(connection, id)
+}
+
+fn delete_feature_preset(connection: &Connection, id: &str) -> Result<()> {
+    let changed = connection.execute("DELETE FROM feature_presets WHERE id = ?1", [id])?;
+    anyhow::ensure!(changed == 1, "unknown feature preset {id}");
+    Ok(())
+}
+
+/// The expressions of every promoted preset, oldest promotion first.
+fn promoted_expressions(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT expression FROM feature_presets WHERE accepted = 1
+         ORDER BY promoted_at, name COLLATE NOCASE",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// A study's accepted set: what the request asked for, then every promoted preset, trimmed
+/// and once each.
+fn merge_accepted(requested: &[String], promoted: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for expression in requested.iter().chain(promoted) {
+        let expression = expression.trim();
+        if !expression.is_empty() && !out.iter().any(|seen| seen == expression) {
+            out.push(expression.to_owned());
+        }
     }
-    Ok((config, start, end))
+    out
+}
+
+async fn list_feature_presets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<FeaturePresetRecord>>, ApiError> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    Ok(Json(query_feature_presets(&connection)?))
+}
+
+async fn create_feature_preset(
+    State(state): State<AppState>,
+    Json(request): Json<SaveFeaturePresetRequest>,
+) -> Result<(StatusCode, Json<FeaturePresetRecord>), ApiError> {
+    // The expression must parse with every base the widest grid offers.
+    let names = study_base_names(&state.local.data, true);
+    let expression = request.expression.trim();
+    tessera::feature_expr::parse_with(expression, &names)
+        .with_context(|| format!("feature expression {expression:?}"))?;
+    let connection = state.database.lock().expect("database lock poisoned");
+    let preset = save_feature_preset(
+        &connection,
+        &request.name,
+        expression,
+        &request.note,
+        request.accepted,
+    )?;
+    Ok((StatusCode::CREATED, Json(preset)))
+}
+
+async fn promote_feature_preset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<PromoteFeatureRequest>,
+) -> Result<Json<FeaturePresetRecord>, ApiError> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    Ok(Json(set_feature_promoted(
+        &connection,
+        &id,
+        request.accepted,
+    )?))
+}
+
+async fn remove_feature_preset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    delete_feature_preset(&connection, &id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The study's accepted features and targets (`accepted.parquet`) as a download.
+async fn study_export(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<axum::response::Response, ApiError> {
+    let study = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        query_studies(&connection, 1000)?
+            .into_iter()
+            .find(|study| study.id == id)
+            .context("unknown study")?
+    };
+    let dir = checked_artifact_path(&state.root, &study.artifact_dir)?;
+    let bytes = tokio::fs::read(dir.join("accepted.parquet"))
+        .await
+        .context("this study has no accepted-feature export; run it with an accepted set")?;
+    let disposition = format!("attachment; filename=\"{}-accepted.parquet\"", study.id);
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.apache.parquet".to_owned(),
+            ),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 fn insert_study(state: &AppState, record: &StudyRecord) -> Result<()> {
@@ -6063,6 +6344,77 @@ mod tests {
     }
 
     use super::*;
+
+    /// WB-09: a feature preset lives in the catalog database, so it is still there after the
+    /// service restarts (a fresh connection to the same file), and its promotion with it.
+    #[test]
+    fn feature_presets_survive_reopening_the_catalog() {
+        let dir = std::env::temp_dir().join(format!("tessera-wb09-catalog-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tessera_ui.sqlite3");
+        let preset = {
+            let connection = Connection::open(&path).unwrap();
+            migrate(&connection).unwrap();
+            let preset =
+                save_feature_preset(&connection, "spread z", "spread_bps | zscore 60", "", false)
+                    .unwrap();
+            assert!(!preset.accepted && preset.promoted_at.is_none());
+            assert!(promoted_expressions(&connection).unwrap().is_empty());
+            set_feature_promoted(&connection, &preset.id, true).unwrap()
+        };
+        assert!(preset.accepted && preset.promoted_at.is_some());
+        // The service restarts: a new connection, the same file, the same migration.
+        let connection = Connection::open(&path).unwrap();
+        migrate(&connection).unwrap();
+        let presets = query_feature_presets(&connection).unwrap();
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].id, preset.id);
+        assert_eq!(presets[0].name, "spread z");
+        assert_eq!(presets[0].expression, "spread_bps | zscore 60");
+        assert!(presets[0].accepted && presets[0].promoted_at.is_some());
+        assert_eq!(
+            promoted_expressions(&connection).unwrap(),
+            vec!["spread_bps | zscore 60"]
+        );
+        // Demotion takes it out of the accepted set; deletion removes it.
+        let demoted = set_feature_promoted(&connection, &preset.id, false).unwrap();
+        assert!(!demoted.accepted && demoted.promoted_at.is_none());
+        assert!(promoted_expressions(&connection).unwrap().is_empty());
+        delete_feature_preset(&connection, &preset.id).unwrap();
+        assert!(query_feature_presets(&connection).unwrap().is_empty());
+        drop(connection);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// WB-09: promoting a preset changes what every study regresses candidates against: the
+    /// accepted set is the request's own expressions plus every promoted preset, once each.
+    #[test]
+    fn promoted_features_join_the_accepted_set() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        let obi = save_feature_preset(&connection, "obi", "obi_l1", "", true).unwrap();
+        save_feature_preset(&connection, "spread", "spread_bps", "candidate", false).unwrap();
+        assert_eq!(promoted_expressions(&connection).unwrap(), vec!["obi_l1"]);
+        let promoted = promoted_expressions(&connection).unwrap();
+        assert_eq!(
+            merge_accepted(&["spread_bps".to_owned(), " obi_l1 ".to_owned()], &promoted),
+            vec!["spread_bps", "obi_l1"]
+        );
+        assert_eq!(merge_accepted(&[], &promoted), vec!["obi_l1"]);
+        assert!(merge_accepted(&[" ".to_owned()], &[]).is_empty());
+        // Saving under an existing name updates the expression and keeps the promotion, so a
+        // promoted feature can be refined without falling out of the accepted set.
+        let again = save_feature_preset(&connection, "obi", "obi_l5", "", false).unwrap();
+        assert_eq!(again.id, obi.id);
+        assert!(again.accepted);
+        assert_eq!(promoted_expressions(&connection).unwrap(), vec!["obi_l5"]);
+        assert_eq!(query_feature_presets(&connection).unwrap().len(), 2);
+        set_feature_promoted(&connection, &obi.id, false).unwrap();
+        assert!(promoted_expressions(&connection).unwrap().is_empty());
+        // Names are trimmed and bounded; a blank expression is refused.
+        assert!(save_feature_preset(&connection, "  ", "obi_l1", "", false).is_err());
+        assert!(save_feature_preset(&connection, "x", "   ", "", false).is_err());
+    }
 
     #[test]
     fn sweep_expansion_is_deterministic_and_axis_ordered() {
