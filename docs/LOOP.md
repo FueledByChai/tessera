@@ -4,7 +4,9 @@ How development and research run without a person in the middle of every step. T
 
 - `CLAUDE.md`: the standing rules any agent follows in this checkout.
 - `scripts/check.sh`: the definition of done as a command (fmt, tests, build, example parity,
-  web, private checks). Green means a ticket may be committed.
+  web, private checks). Green means a ticket may be committed. CI (`.github/workflows/ci.yml`)
+  runs the same script: `--quick` in the engine job and `--web-only` in the web job, so a
+  parity break fails the pull request the way it fails the checkout.
 - `BACKLOG.md`: the ticket queue. Every ticket has a **Done when** line that a test or fixture
   proves.
 - `/next-ticket`: the command that takes the next ticket to done (`.claude/commands/next-ticket.md`).

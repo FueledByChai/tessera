@@ -1,5 +1,12 @@
 name: CI
 
+# The definition of done, run by the same script a developer runs locally (scripts/check.sh),
+# so CI and the checkout agree on what "passing" means. The engine job is
+# `scripts/check.sh --quick`: fmt, tests, build, and parity of the bundled examples against
+# examples/expected (the private checks skip, since that checkout is not here). The web job is
+# `scripts/check.sh --web-only`: typecheck, lint, theme check, build; the headless layout and
+# chart checks report that they skipped until a Chromium is installed on the runner (HK-07).
+
 on:
   push:
     branches: [main]
@@ -9,8 +16,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Rust (fmt, check, test)
+  engine:
+    name: Engine (scripts/check.sh --quick)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,22 +25,11 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo check --all-targets
-      - run: cargo test
-      - name: Run the bundled example against the synthetic data
-        run: |
-          cargo run --release --bin tessera -- run-strategy \
-            --config examples/configs/rsi_mean_reversion.toml \
-            --start 2019-01-01 --end 2025-12-31 --output-dir target/ci_rsi_demo
-          test -f target/ci_rsi_demo/report.html
+      - run: scripts/check.sh --quick
 
   web:
-    name: Web (lint, build)
+    name: Web (scripts/check.sh --web-only)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: web
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -42,6 +38,5 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run build
+        working-directory: web
+      - run: scripts/check.sh --web-only

@@ -3,7 +3,9 @@
 #
 #   scripts/check.sh                  everything: fmt, tests, build, parity, web, private checks
 #   scripts/check.sh --no-web         skip the web typecheck/lint/build (slow on iCloud checkouts)
-#   scripts/check.sh --quick          skip web and the private checks
+#   scripts/check.sh --quick          skip web and the private checks (the CI engine job)
+#   scripts/check.sh --web-only       only the web step (the CI web job); the headless layout
+#                                     and chart checks skip themselves without a Chromium
 #   scripts/check.sh --refresh-baseline
 #                                     rewrite examples/expected from the current engine; only after
 #                                     an intentional results change, and say so in the commit
@@ -17,19 +19,26 @@ cd "$ROOT"
 
 NO_WEB=0
 QUICK=0
+WEB_ONLY=0
 REFRESH=0
 for arg in "$@"; do
   case "$arg" in
     --no-web) NO_WEB=1 ;;
     --quick) QUICK=1; NO_WEB=1 ;;
+    --web-only) WEB_ONLY=1; QUICK=1 ;;
     --refresh-baseline) REFRESH=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
+if [ "$WEB_ONLY" = 1 ] && [ "$NO_WEB" = 1 ]; then
+  echo "--web-only and --no-web/--quick exclude each other" >&2
+  exit 2
+fi
 
 step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 
+if [ "$WEB_ONLY" = 0 ]; then
 step "cargo fmt --check"
 cargo fmt --all --check
 
@@ -63,6 +72,7 @@ for strategy in rsi_mean_reversion moving_average_cross; do
   done
   echo "parity ok: $strategy"
 done
+fi
 
 if [ "$NO_WEB" = 0 ]; then
   step "web typecheck, lint, theme check, build, layout check"

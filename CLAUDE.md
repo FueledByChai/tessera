@@ -36,6 +36,8 @@ have to be repeated in chat.
 A ticket is not done until the check passes and the commit includes the test or fixture that
 proves the acceptance line in `BACKLOG.md`. If an engine change intentionally alters results,
 refresh the baseline with `scripts/check.sh --refresh-baseline` and say why in the commit.
+CI runs the same script (`--quick` engine job, `--web-only` web job); there are no separate
+hand-written CI steps to keep in sync.
 
 ## Git
 

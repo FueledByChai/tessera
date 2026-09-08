@@ -170,7 +170,7 @@ Show dropped off-calendar rows, dropped spikes, and skipped symbols from the run
 Overview tab, with the skipped symbols listed on the Symbols tab.
 **Done when:** a run over `examples/data` with an injected holiday row shows the count in the UI.
 
-### HK-03 CI runs scripts/check.sh — `todo`
+### HK-03 CI runs scripts/check.sh — `done 2026-09-08 HK-03: CI runs scripts/check.sh (--quick engine job, --web-only web job)`
 Replace the hand-written CI steps with `scripts/check.sh --quick` plus the web job.
 **Done when:** the workflow file calls the script and a deliberate parity break fails CI locally
 with `act` or in a PR.
