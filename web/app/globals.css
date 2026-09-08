@@ -404,7 +404,7 @@ a { color: inherit; text-decoration: inherit; }
 }
 .automation-create {
   display: grid;
-  grid-template-columns: 1.4fr 1fr 120px 1.2fr auto auto;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 120px minmax(0, 1.2fr) auto auto;
   gap: 10px;
   align-items: center;
   padding: 16px;
@@ -412,7 +412,7 @@ a { color: inherit; text-decoration: inherit; }
 @media (max-width: 1000px) {
   .automation-list article,
   .automation-create {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 .correlation-table-ui th,
@@ -519,7 +519,7 @@ a { color: inherit; text-decoration: inherit; }
 }
 .portfolio-source-grid {
   display: grid;
-  grid-template-columns: 1.2fr 0.8fr;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
   border: 1px solid var(--line);
 }
 .source-picker,
@@ -693,7 +693,7 @@ a { color: inherit; text-decoration: inherit; }
 @media (max-width: 1180px) {
   .correlation-grid-ui,
   .capital-mode-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .capital-mode {
     min-height: 0;
@@ -708,14 +708,14 @@ a { color: inherit; text-decoration: inherit; }
 @media (max-width: 760px) {
   .portfolio-fields,
   .portfolio-source-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .source-picker {
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
   .portfolio-history > button {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 5px;
   }
   .app-shell[data-theme="terminal"] .terminal-ribbon span:nth-of-type(2),
@@ -729,7 +729,7 @@ a { color: inherit; text-decoration: inherit; }
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .compare-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -744,7 +744,7 @@ a { color: inherit; text-decoration: inherit; }
   }
   .sweep-form-grid,
   .comparison-picker {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 * {
@@ -976,7 +976,7 @@ nav {
 }
 .run-setup form {
   display: grid;
-  grid-template-columns: 1.4fr 1fr 1fr 1fr;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
   padding: 18px;
   align-items: end;
@@ -1316,7 +1316,7 @@ nav {
 }
 .watch-actions {
   display: grid;
-  grid-template-columns: 1fr 1.25fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
   gap: 8px;
   padding: 0 18px 18px;
 }
@@ -1482,7 +1482,7 @@ nav {
 }
 @media (max-width: 1240px) {
   .catalog-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .catalog-inspector {
     position: static;
@@ -1674,7 +1674,7 @@ nav {
 }
 .catalog-inspector dl div {
   display: grid;
-  grid-template-columns: 74px 1fr;
+  grid-template-columns: 74px minmax(0, 1fr);
   gap: 10px;
   font-size: 12px;
 }
@@ -2274,7 +2274,7 @@ nav {
 }
 .rules-panel li {
   display: grid;
-  grid-template-columns: 34px 1fr;
+  grid-template-columns: 34px minmax(0, 1fr);
   gap: 12px;
   padding: 12px 18px;
   border-bottom: 1px solid var(--line-soft);
@@ -2291,7 +2291,7 @@ nav {
 }
 .assumption-strip {
   display: grid;
-  grid-template-columns: 1fr 1fr 2fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr);
 }
 .assumption-strip div {
   padding: 12px 18px;
@@ -2317,7 +2317,7 @@ nav {
 .preset-save {
   padding: 10px 12px;
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   border-bottom: 1px solid var(--line);
 }
@@ -2437,7 +2437,7 @@ nav {
   opacity: 0.45;
 }
 .toggle-label {
-  grid-template-columns: 18px 1fr;
+  grid-template-columns: 18px minmax(0, 1fr);
   align-content: center;
   align-items: center;
   padding-top: 15px;
@@ -2648,7 +2648,7 @@ nav {
 }
 .report-grid {
   display: grid;
-  grid-template-columns: 1.5fr 0.7fr;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 0.7fr);
   gap: 16px;
   margin-bottom: 16px;
 }
@@ -2912,7 +2912,7 @@ nav {
 }
 .coverage-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 16px;
   margin-bottom: 16px;
 }
@@ -2957,7 +2957,7 @@ nav {
   padding: 18px;
 }
 .watchlist-generator .field-grid {
-  grid-template-columns: 1fr 1fr 1.35fr auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.35fr) auto;
   align-items: end;
 }
 .generate-action {
@@ -3017,7 +3017,7 @@ nav {
     display: none;
   }
   .run-setup form {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .run-setup .run-name {
     grid-column: span 1;
@@ -3033,13 +3033,13 @@ nav {
     border-right: 0;
   }
   .report-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .coverage-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .watchlist-build-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .watchlist-generator .field-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3094,7 +3094,7 @@ nav {
     width: 100%;
   }
   .metrics {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .metric-card:nth-child(2) {
     border-right: 0;
@@ -3103,7 +3103,7 @@ nav {
     border-bottom: 1px solid var(--line);
   }
   .dashboard-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .strategy-row {
     grid-template-columns: 32px minmax(0, 1fr) 22px;
@@ -3116,11 +3116,11 @@ nav {
     overflow-x: auto;
   }
   .run-setup form {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .catalog-layout,
   .strategy-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .catalog-inspector {
     position: static;
@@ -3128,7 +3128,7 @@ nav {
   .field-grid,
   .field-grid.five,
   .field-grid.four {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .strategy-hero,
   .run-title,
@@ -3143,7 +3143,7 @@ nav {
     justify-items: start;
   }
   .code-workspace {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .code-navigator {
     position: static;
@@ -3154,17 +3154,17 @@ nav {
     min-height: 380px;
   }
   .release-form {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .assumption-strip {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .assumption-strip div {
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
   .run-kpis {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .run-kpis .metric-card {
     border-bottom: 1px solid var(--line);
@@ -3177,7 +3177,7 @@ nav {
     padding: 16px 0 0;
   }
   .watchlist-generator .field-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -4070,7 +4070,7 @@ nav {
 
 /* Studies workspace */
 .studies-workspace { display: flex; flex-direction: column; gap: 14px; }
-.study-pick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+.study-pick-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin: 12px 0; }
 .study-pick-grid fieldset { border: 1px solid var(--line, #414141); padding: 10px 12px; margin: 0; }
 .study-pick-grid legend { color: var(--accent, #f89828); font-size: 15px; letter-spacing: 0.08em; }
 .check-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 15px; }
@@ -4085,7 +4085,7 @@ nav {
 .ranked-cells tbody tr.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
 .ranked-cells td.positive { color: #32c832; }
 .ranked-cells td.negative { color: #e03040; }
-@media (max-width: 1100px) { .study-pick-grid { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .study-pick-grid { grid-template-columns: minmax(0, 1fr); } }
 
 /* Data sources */
 .data-sources-panel { display: flex; flex-direction: column; gap: 12px; }
@@ -4100,11 +4100,11 @@ nav {
 .source-facts { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .source-facts strong { color: var(--accent, #f89828); margin-right: 6px; }
 .source-facts code, .source-config-grid code { background: #1a1a1a; padding: 1px 5px; }
-.source-config-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; font-size: 13px; line-height: 1.5; }
+.source-config-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; font-size: 13px; line-height: 1.5; }
 .source-config-grid h3 { color: var(--accent, #f89828); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; margin: 10px 0 4px; }
 .source-config-grid ol { padding-left: 20px; }
 .source-template { background: #050505; border: 1px solid var(--line, #414141); padding: 12px; font-size: 12px; line-height: 1.45; overflow-x: auto; white-space: pre; }
-@media (max-width: 1100px) { .source-config-grid { grid-template-columns: 1fr; } }
+@media (max-width: 1100px) { .source-config-grid { grid-template-columns: minmax(0, 1fr); } }
 
 /* Archived (pre-SDK) catalog rows */
 .catalog-toggle { display: inline-flex; align-items: center; gap: 6px; }
@@ -4184,6 +4184,71 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 .expression-box small {
   color: var(--muted);
   line-height: 1.5;
+}
+
+/* Laptop widths (UI-03): up to 1500 px (a 13-inch MacBook is 1280 to 1470 px wide) the wide
+   grids fit their panel instead of scrolling behind an invisible macOS scrollbar. The monthly
+   heat map, the run history, and the study tables go dense (15 px cells, 13 px headers, tight
+   padding); run names truncate; the studies page stacks its history above the results; under
+   1280 px the study heat map keeps one line per cell (the rest is in the hover title). Both
+   display modes. web/scripts/layout-check.mjs measures this at 1280 and 1440 px. */
+@media (max-width: 1500px) {
+  .app-shell .monthly-panel .table-wrap table,
+  .app-shell .strategy-run-history .table-wrap table,
+  .app-shell .sweep-heatmap table,
+  .app-shell .sweep-heatmap td,
+  .app-shell .ranked-cells {
+    font-size: 15px;
+    line-height: 1.25;
+  }
+  .app-shell .monthly-panel .table-wrap th,
+  .app-shell .strategy-run-history .table-wrap th,
+  .app-shell .sweep-heatmap th,
+  .app-shell .ranked-cells th {
+    font-size: 13px;
+    letter-spacing: 0.04em;
+  }
+  .app-shell .monthly-panel .table-wrap th,
+  .app-shell .monthly-panel .table-wrap td {
+    padding: 6px 7px;
+  }
+  .app-shell .strategy-run-history .table-wrap th,
+  .app-shell .strategy-run-history .table-wrap td,
+  .app-shell .sweep-heatmap th,
+  .app-shell .sweep-heatmap td,
+  .app-shell .ranked-cells th,
+  .app-shell .ranked-cells td {
+    padding: 6px 8px;
+  }
+  .app-shell .sweep-heatmap td small {
+    font-size: 11px;
+  }
+  /* The window column wraps its two dates so ten columns fit; names truncate. */
+  .app-shell .strategy-run-history td.col-text {
+    white-space: normal;
+    max-width: 130px;
+  }
+  .app-shell .runs-table td.run-name {
+    min-width: 0;
+    max-width: 280px;
+  }
+  .app-shell .runs-table td.run-name strong,
+  .app-shell .runs-table td.run-name small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .app-shell .studies-workspace .compare-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 1279px) {
+  .app-shell .sweep-heatmap td small {
+    display: none;
+  }
+  .app-shell .runs-table td.run-name {
+    max-width: 230px;
+  }
 }
 
 /* Form control sizing, both display modes (UI-01, UI-02): every text field, date, number, and

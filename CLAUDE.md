@@ -61,7 +61,9 @@ refresh the baseline with `scripts/check.sh --refresh-baseline` and say why in t
   Navy only as a hover or selection highlight. Form controls in both display modes are 42 px
   boxes with 18 px text and 15 px labels, bottom-anchored so a row's controls share edges; the
   sizing block stays last in `globals.css`. `web/scripts/theme-check.mjs` (run by
-  `scripts/check.sh`) fails on blue backgrounds or borders and on smaller control fonts.
+  `scripts/check.sh`) fails on blue backgrounds or borders, on smaller control fonts, and on
+  bare `fr` grid tracks. Pages must fit a 13-inch laptop: wide tables go dense under 1500 px
+  rather than scrolling; `web/scripts/layout-check.mjs` measures 1280 and 1440 px.
 - Long tables go behind tabs or caps with a "show all"; a page must open at the top.
 - Relative API origin (`import.meta.env.VITE_API_ORIGIN ?? ""`); dev server on 5173 proxies `/api`.
 

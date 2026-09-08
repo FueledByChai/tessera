@@ -36,7 +36,7 @@ the base 10-14 px controls with the 40/42 px height mismatch between text and da
 **Done when:** the browser alignment measurement from UI-01 passes with modern mode selected and
 `theme-check.mjs` gains a modern-mode font-size rule.
 
-### UI-03 Pages fit a 13-inch laptop; wide tables scroll inside their panel — `todo`
+### UI-03 Pages fit a 13-inch laptop; wide tables scroll inside their panel — `done 2026-09-07 UI-03: pages fit a 13-inch laptop`
 On a 13-inch MacBook (1440 or 1280 px wide) the run page's monthly and annual performance
 table (`.monthly-panel`), the studies page's feature-by-horizon heat map and its ranked and
 decile tables, and other dense grids hang off the right edge of the window instead of
@@ -190,3 +190,10 @@ when. Tag releases; the notes are the diff between tags.
 **Done when:** the script over `3022548..main` lists HK-01 and WB-02 under their sections with
 dates; `--archive` on a scratch copy produces a `CHANGELOG.md` containing them and a
 `BACKLOG.md` without them; `scripts/check.sh --quick` runs the script's self-test.
+
+### HK-07 Layout check runs in CI — `todo` — Blocked by HK-03
+`web/scripts/layout-check.mjs` (UI-03) skips when no Chromium is resolvable and when no console
+answers on 8787, so on CI it currently proves nothing. Add `playwright` as a web devDependency,
+install its Chromium in the workflow, and run the check against the built bundle with the
+bundled example data (a scratch `TESSERA_ROOT` with `examples/`, one run, one study fixture).
+**Done when:** the CI job logs `layout-check: ok` and a deliberate bare-`fr` regression fails it.

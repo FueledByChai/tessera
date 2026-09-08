@@ -921,7 +921,7 @@ function RunReport({ detail }: { detail: RunDetail }) {
       <section className="panel monthly-panel">
         <div className="panel-head">
           <div>
-            <p className="eyebrow">Compounded returns</p>
+            <p className="eyebrow">Compounded returns, %</p>
             <h2>Monthly and annual performance</h2>
           </div>
         </div>
@@ -943,14 +943,14 @@ function RunReport({ detail }: { detail: RunDetail }) {
                   <td>{row.year}</td>
                   {row.months.map((value, index) => (
                     <td key={index} className={classFor(value ?? undefined)}>
-                      {value == null ? "—" : percent(value, 1)}
+                      {signed(value, 1)}
                     </td>
                   ))}
                   <td className={classFor(row.annual_return_percent)}>
-                    {percent(row.annual_return_percent, 1)}
+                    {signed(row.annual_return_percent, 1)}
                   </td>
                   <td className={classFor(row.annual_drawdown_percent)}>
-                    {percent(row.annual_drawdown_percent, 1)}
+                    {signed(row.annual_drawdown_percent, 1)}
                   </td>
                 </tr>
               ))}
@@ -1829,7 +1829,7 @@ function StudiesWorkspace() {
                         <td
                           key={h}
                           className={c ? icClass(c.ic) : "pending-cell"}
-                          title={c ? `t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar` : ""}
+                          title={c ? `top-bottom ${signed(c.top_minus_bottom_bps, 2)} bp · breakeven ${signed(c.breakeven_bps, 3)} bp · t=${c.top_minus_bottom_t.toFixed(1)} · n=${c.observations.toLocaleString()} · Sharpe ${formatNumber(finite(c.sharpe), 2)} · turnover ${formatNumber(finite(c.turnover), 3)}/bar` : ""}
                           onClick={() => { if (c) { setBucketFeature(feature); setBucketHorizon(h); } }}
                         >
                           {c ? `${c.ic >= 0 ? "+" : ""}${c.ic.toFixed(4)}` : "·"}

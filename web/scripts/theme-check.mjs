@@ -6,7 +6,9 @@
 //      18px in the form grids (15px for compact toolbar controls), or a label below 15px;
 //   3. outside the terminal scope (so in modern mode, and as the base the terminal inherits)
 //      the last rule in source order that sizes a form control, compact control, or label
-//      falls below those same minimums, or no such rule exists.
+//      falls below those same minimums, or no such rule exists;
+//   4. a grid-template-columns track uses a bare `Nfr` (content-sized minimum) rather than
+//      `minmax(0, Nfr)`, unless the rule's `> *` children declare `min-width: 0`.
 // Colours are checked in the rules scoped to [data-theme="terminal"] (with the terminal's own
 // CSS variables resolved) and in unscoped rules, which apply in terminal mode too. The modern
 // theme's token block on bare `.app-shell` and the body/html ground are its own palette.
@@ -217,6 +219,29 @@ for (const [kind, minimum] of [["control", 18], ["compact", 15], ["label", 15]])
   if (!last) failures.push(`modern mode: no theme-neutral rule sizes form ${kind}s`);
   else if (last.size < minimum) {
     failures.push(`modern mode: last ${kind} size ${last.size}px < ${minimum}px at line ${last.line}: ${last.sel}`);
+  }
+}
+
+// Grid tracks (UI-03): a bare `1fr` track has a minimum width of its content, so a wide table
+// inside it pushes the column, and the page, past the viewport instead of scrolling in its
+// wrapper. Every fractional track must be `minmax(0, Nfr)` unless the rule's direct children
+// declare `min-width: 0`.
+const childMinWidthZero = new Set();
+for (const rule of rules) {
+  for (const part of rule.selector.split(",")) {
+    const trimmed = norm(part);
+    if (trimmed.endsWith("> *") && rule.declarations.some((d) => d.property === "min-width" && d.value === "0")) {
+      childMinWidthZero.add(trimmed.slice(0, -3).trim());
+    }
+  }
+}
+for (const rule of rules) {
+  for (const d of rule.declarations) {
+    if (d.property !== "grid-template-columns") continue;
+    const stripped = d.value.replace(/minmax\([^)]*\)/g, "");
+    if (!/\d\s*fr\b/.test(stripped)) continue;
+    const covered = rule.selector.split(",").every((part) => childMinWidthZero.has(norm(part)));
+    if (!covered) failures.push(`bare fr track at line ${rule.line}: ${norm(rule.selector)} { grid-template-columns: ${d.value} }`);
   }
 }
 
