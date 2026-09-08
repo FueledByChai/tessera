@@ -91,6 +91,9 @@ step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 
 if [ "$WEB_ONLY" = 0 ]; then
+step "backlog status self-test"
+scripts/backlog-status.sh --self-test
+
 step "cargo fmt --check"
 cargo fmt --all --check
 

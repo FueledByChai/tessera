@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Ticket state derived from git (HK-05). A ticket is done when a commit whose subject starts
+# with its id (`HK-01: ...`) is reachable from the ref, main by default; BACKLOG.md carries only
+# the claims: no state (or `todo`), `doing` while someone works it, `blocked <reason>`.
+#
+#   scripts/backlog-status.sh                 every ticket: id, state, date, sha, blockers, title
+#   scripts/backlog-status.sh --next          the id of the first todo whose blockers are done
+#                                             (exit 1 when there is none)
+#   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default main)
+#   scripts/backlog-status.sh --backlog <f>   another backlog file (default BACKLOG.md)
+#   scripts/backlog-status.sh --self-test     a fixture repo: a `doing` ticket with a landed
+#                                             commit reports as done, blockers gate --next
+#
+# A heading reads `### <ID> <title>`, optionally followed by ` — \`<state>\`` and
+# ` — Blocked by <ID>, <ID>`. The first commit (oldest) whose subject starts with the id gives
+# the date and sha. `done` beats a `doing` or `blocked` claim left behind.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REF=main
+BACKLOG="$ROOT/BACKLOG.md"
+MODE=table
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --next) MODE=next ;;
+    --self-test) MODE=selftest ;;
+    --ref) REF="$2"; shift ;;
+    --backlog) BACKLOG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# Prints the table (mode table) or the next ticket id (mode next) for a backlog file against a
+# ref, from the current directory's repository.
+status() {
+  local backlog="$1" ref="$2" mode="$3"
+  git log --reverse --date=short --format='%h %ad %s' "$ref" -- 2>/dev/null \
+    | perl -e '
+      my ($backlog, $mode) = @ARGV;
+      my %done;
+      while (my $line = <STDIN>) {
+        chomp $line;
+        my ($sha, $date, $subject) = split / /, $line, 3;
+        next unless defined $subject && $subject =~ /^([A-Z]+-\d+):/;
+        $done{$1} //= [$date, $sha];
+      }
+      open my $fh, "<", $backlog or die "cannot read $backlog: $!";
+      my @tickets;
+      while (my $line = <$fh>) {
+        chomp $line;
+        next unless $line =~ /^### (\S+) (.*)$/;
+        my ($id, $rest) = ($1, $2);
+        my @parts = split / — /, $rest;
+        my $title = shift @parts;
+        my ($claim, @blockers) = ("", ());
+        for my $part (@parts) {
+          if ($part =~ /^`(.*)`$/) { $claim = $1; }
+          elsif ($part =~ /^Blocked by (.*)$/) { push @blockers, split /,\s*/, $1; }
+        }
+        my $state = $done{$id} ? "done"
+                  : $claim =~ /^blocked/ ? "blocked"
+                  : $claim eq "doing" ? "doing"
+                  : "todo";
+        push @tickets, { id => $id, title => $title, state => $state, claim => $claim, blockers => \@blockers };
+      }
+      close $fh;
+      my %state = map { $_->{id} => $_->{state} } @tickets;
+      my $ready = sub {
+        my $t = shift;
+        return 0 unless $t->{state} eq "todo";
+        for my $b (@{ $t->{blockers} }) { return 0 unless ($state{$b} // "") eq "done"; }
+        return 1;
+      };
+      if ($mode eq "next") {
+        for my $t (@tickets) { if ($ready->($t)) { print "$t->{id}\n"; exit 0; } }
+        print STDERR "no todo ticket has all its blockers done\n";
+        exit 1;
+      }
+      printf "%-6s %-8s %-10s %-8s %-6s %-22s %s\n", "id", "state", "date", "sha", "ready", "blocked by", "title";
+      for my $t (@tickets) {
+        my ($date, $sha) = $done{ $t->{id} } ? @{ $done{ $t->{id} } } : ("-", "-");
+        my $blockers = join ",", map { $_ . (($state{$_} // "") eq "done" ? "" : "!") } @{ $t->{blockers} };
+        my $state = $t->{state};
+        $state .= " (was $t->{claim})" if $state eq "done" && $t->{claim} ne "" && $t->{claim} ne "todo";
+        $state = $t->{claim} if $state eq "blocked";
+        printf "%-6s %-8s %-10s %-8s %-6s %-22s %s\n", $t->{id}, $state, $date, $sha, ($ready->($t) ? "yes" : ""), $blockers, $t->{title};
+      }
+    ' "$backlog" "$mode"
+}
+
+self_test() {
+  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tessera-backlog-status.XXXXXX")"
+  trap 'rm -rf "$SELF_TEST_DIR"' EXIT
+  local dir="$SELF_TEST_DIR"
+  (
+    cd "$dir"
+    git init -q
+    git config user.email "self-test@example.com"
+    git config user.name "self-test"
+    cat > BACKLOG.md <<'EOF'
+# Fixture queue
+
+### AA-01 First — `doing`
+Body.
+**Done when:** it lands.
+
+### AA-02 Second — `todo` — Blocked by AA-01
+### AA-03 Third — `blocked waiting on data`
+### AA-04 Fourth
+### AA-05 Fifth — `todo` — Blocked by AA-03, AA-04
+EOF
+    git add BACKLOG.md
+    git commit -q -m "Scaffold the fixture queue"
+    # Nothing landed yet: AA-01 is still the doing claim; AA-04 is the first ready todo.
+    next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next)"
+    [ "$next" = "AA-04" ] || { echo "self-test: expected AA-04 next before anything landed, got $next"; exit 1; }
+    # AA-01 lands while its line still says doing: git wins, with the commit's date and sha.
+    git commit -q --allow-empty -m "AA-01: first landed"
+    sha="$(git rev-parse --short HEAD)"
+    today="$(git log -1 --date=short --format=%ad)"
+    table="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD)"
+    echo "$table" | grep -q "^AA-01  done (was doing) *$today *$sha" \
+      || { echo "self-test: AA-01 should be done on $today at $sha:"; echo "$table"; exit 1; }
+    echo "$table" | grep -q "^AA-02  todo .* yes .*AA-01 " \
+      || { echo "self-test: AA-02 should be a ready todo once AA-01 landed:"; echo "$table"; exit 1; }
+    echo "$table" | grep -q "^AA-03  blocked waiting on data" \
+      || { echo "self-test: AA-03 should keep its blocked claim:"; echo "$table"; exit 1; }
+    echo "$table" | grep -q "^AA-05  todo .*AA-03!,AA-04!" \
+      || { echo "self-test: AA-05 should show both blockers unmet:"; echo "$table"; exit 1; }
+    next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next)"
+    [ "$next" = "AA-02" ] || { echo "self-test: expected AA-02 next, got $next"; exit 1; }
+    # A second commit for AA-01 does not move its date; the first one counts.
+    git commit -q --allow-empty -m "AA-01: a follow-up fix"
+    "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD | grep -q "^AA-01  done (was doing) *$today *$sha" \
+      || { echo "self-test: the first AA-01 commit should still date it"; exit 1; }
+    # Everything ready landed: --next says so and exits 1.
+    git commit -q --allow-empty -m "AA-02: second"
+    git commit -q --allow-empty -m "AA-04: fourth"
+    if "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next 2>/dev/null; then
+      echo "self-test: --next should fail with nothing ready (AA-03 is blocked, AA-05 waits on it)"; exit 1
+    fi
+  )
+  echo "backlog-status self-test passed"
+}
+
+# The backlog's own repository answers, so a fixture backlog is judged by its fixture history.
+case "$MODE" in
+  selftest) self_test ;;
+  *) (cd "$(dirname "$BACKLOG")" && status "$BACKLOG" "$REF" "$MODE") ;;
+esac

@@ -48,7 +48,10 @@ hand-written CI steps to keep in sync.
   beside it (`TESSERA_PRIVATE_ROOT` overrides), writes `local.toml` from the main one with its
   relative paths made absolute, links `web/node_modules`, and builds the private legacy crate
   against the worktree's engine; `scripts/check.sh --resolve` shows what a run would use.
-- Update `BACKLOG.md` in the same commit: status, date, commit summary.
+- Git is the record of done: `scripts/backlog-status.sh` derives each ticket's state from the
+  commit whose subject carries its id (`--next` names the next ticket). `BACKLOG.md` holds only
+  `todo`, `doing`, and `blocked` claims; clear the `doing` claim in the ticket's commit and never
+  write a done line.
 
 ## Engine and data rules
 

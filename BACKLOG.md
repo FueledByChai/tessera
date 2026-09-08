@@ -6,13 +6,17 @@ long-form acceptance criteria; this file is the executable queue. Protocol:
 - One ticket per commit. The commit message starts with the id. `scripts/check.sh` must pass.
 - A ticket's **Done when** line names a test, fixture, or measurable output that ships in the
   same commit. If it cannot be tested, rewrite the ticket until it can.
-- States: `todo`, `doing`, `done <date>` (the commit carries the id; `git log --grep WB-01`), `blocked <reason>`. Take the first `todo`
-  whose `Blocked by` tickets are done. Never take two at once.
+- Git is the record of done: a ticket is done when a commit whose subject starts with its id
+  is on `main`. `scripts/backlog-status.sh` lists every ticket with its derived state, date,
+  and sha; `--next` names the first `todo` whose `Blocked by` tickets have landed. This file
+  carries only the claims: no state (or `todo`), `doing` while someone works it,
+  `blocked <reason>`. Take what `--next` reports, never two at once, and clear the `doing`
+  claim in the ticket's own commit; never write a done line.
 - Anything discovered while working goes in as a new ticket, not into the current one.
 
 ## Console UI
 
-### UI-01 Terminal theme: black panels, larger aligned form controls — `done 2026-09-07 UI-01: terminal theme black panels, 42/18/15 px form controls`
+### UI-01 Terminal theme: black panels, larger aligned form controls
 The terminal theme (`web/app/globals.css`, the block "sampled from Bloomberg screens") paints
 every panel navy: `--panel #0f0f3a`, `--panel-2 #181850`, lines `#2a2a6a`/`#1c1c50`, plus
 literal navy on fieldsets, code, and the config template. Studies, Data, and the strategy page
@@ -30,13 +34,13 @@ terminal-theme input/select/textarea font-size below 18 px; the browser-automati
 studies form and the strategy run form reports every control in a row within 1 px of the same
 top and bottom edge (`getBoundingClientRect`); the README screenshot is refreshed.
 
-### UI-02 Modern mode form controls match the terminal sizes — `done 2026-09-07 UI-02: form control sizing shared by both display modes`
+### UI-02 Modern mode form controls match the terminal sizes
 UI-01 sized and aligned form controls only under the terminal theme; modern mode still renders
 the base 10-14 px controls with the 40/42 px height mismatch between text and date fields.
 **Done when:** the browser alignment measurement from UI-01 passes with modern mode selected and
 `theme-check.mjs` gains a modern-mode font-size rule.
 
-### UI-03 Pages fit a 13-inch laptop; wide tables scroll inside their panel — `done 2026-09-07 UI-03: pages fit a 13-inch laptop`
+### UI-03 Pages fit a 13-inch laptop; wide tables scroll inside their panel
 On a 13-inch MacBook (1440 or 1280 px wide) the run page's monthly and annual performance
 table (`.monthly-panel`), the studies page's feature-by-horizon heat map and its ranked and
 decile tables, and other dense grids hang off the right edge of the window instead of
@@ -56,7 +60,7 @@ any grid track wider than `minmax(0, 1fr)` without `min-width: 0` on the track's
 
 ## Feature workbench (Studies page)
 
-### WB-01 Feature expression grammar — `done 2026-09-06`
+### WB-01 Feature expression grammar
 Replace the fixed feature list in `src/study.rs` with expressions: a base series followed by
 transforms, e.g. `trade_count | rate 1 | ratio_to sma 300`, `signed_volume | zscore 30`,
 `obi_l1 | diff 1`, `a | times b`. Bases: every `BookFeatures` field plus trade count, volume,
@@ -69,7 +73,7 @@ the current implementation (fixture from a 1-day SOL grid checked into `target/`
 Note: the parity fixture is a deterministic synthetic 1-second grid generated in the test rather
 than a checked-in SOL day; it exercises book gaps and all eight names.
 
-### WB-02 Costless equity curve and breakeven cost — `done 2026-09-07 WB-02: costless equity curve and breakeven cost` — Blocked by WB-01
+### WB-02 Costless equity curve and breakeven cost — Blocked by WB-01
 For each feature and horizon: position = clipped z-score of the feature (and a `sign` variant),
 P&L = position x forward return with zero costs; report cumulative P&L series, Sharpe, turnover
 (mean absolute position change per bar), and breakeven cost in bps = mean P&L per unit turnover.
@@ -78,21 +82,21 @@ Add the series to `StudyResult` and CSV output; UI shows the curve per selected 
 Sharpe within tolerance in a unit test, a pure-noise feature yields breakeven near zero, and the
 results grid in the UI sorts by breakeven cost.
 
-### WB-03 Study targets — `done 2026-09-07 WB-03: study targets` — Blocked by WB-01
+### WB-03 Study targets — Blocked by WB-01
 Add a `target` field: `return` (current), `realized_variance` (sum of squared mid returns over the
 horizon), `abs_move`, `spread_change`, `fair_value_residual` (mid minus a 60 s EMA, and mid minus
 microprice). IC, deciles, and the equity curve all run against the chosen target.
 **Done when:** unit tests compute each target on a fixture, and a study of `spread_bps` against
 `realized_variance` on the SOL fixture reports a positive IC.
 
-### WB-04 Panel loader over every bar resolution — `done 2026-09-07 WB-04: panel loader over every bar resolution` — Blocked by WB-01
+### WB-04 Panel loader over every bar resolution — Blocked by WB-01
 The study reads its panel through the SDK loader: 1-minute, 5-minute, and daily CSV bars as well
 as tick-built lake bars. Book-only bases report "unavailable on this grid" instead of failing.
 OHLCV bases: `return_n`, `range_bps`, `gap_bps`, `volume | zscore n`, `high_252_distance`.
 **Done when:** a daily study of `return_1 | zscore 20` on `examples/data` runs end to end and a
 test asserts the same IC from the CSV path and from an equivalent in-memory panel.
 
-### WB-05 Exogenous series registry with availability times — `done 2026-09-07 WB-05: exogenous series registry with availability times` — Blocked by WB-04
+### WB-05 Exogenous series registry with availability times — Blocked by WB-04
 `local.toml [[data.series]]`: name, path (CSV or parquet), kind `level` or `event`, optional
 symbol column, and an `available_at` column or a fixed publication lag. Studies join series as-of
 the bar's time using availability, never the nominal date. Funding and open interest from the
@@ -101,39 +105,39 @@ lake register automatically.
 bar before availability does not see the value and the bar after does; funding rate is usable as
 a base in a SOL study.
 
-### WB-06 Cross-sectional mode — `done 2026-09-07 WB-06: cross-sectional mode` — Blocked by WB-04
+### WB-06 Cross-sectional mode — Blocked by WB-04
 For daily panels across many symbols: rank the feature across symbols per date, IC per date,
 mean and t across dates, and a costless long-short decile portfolio with its equity curve.
 **Done when:** a synthetic panel where the feature is the next-day return gives IC near 1 and the
 long-short curve is monotone; the UI offers `time-series` and `cross-sectional` modes.
 
-### WB-07 Aggregation transforms and event studies — `done 2026-09-07 WB-07: aggregation transforms and event studies` — Blocked by WB-05
+### WB-07 Aggregation transforms and event studies — Blocked by WB-05
 `agg daily sum|mean|last|realized_var` lifts intraday series to the daily grid; slow series ride
 fast grids by forward fill. For `event` series: average forward and backward return path around
 events with counts and t per offset.
 **Done when:** a test builds a daily realized variance from 1-minute fixture bars and matches a
 direct computation; an event-study fixture with a known post-event drift reproduces it.
 
-### WB-08 Diagnostics: incremental IC, stability, regime buckets — `done 2026-09-07 WB-08: diagnostics, incremental IC, stability, regimes` — Blocked by WB-02
+### WB-08 Diagnostics: incremental IC, stability, regime buckets — Blocked by WB-02
 Incremental IC against an "accepted" feature set (regress out, score the residual); IC per day with
 sign-consistency count; IC by spread tercile, realized-vol tercile, and hour of day; feature
 autocorrelation.
 **Done when:** a feature that is a linear copy of an accepted feature reports incremental IC near
 zero in a test; the UI shows the per-day IC strip and the regime table.
 
-### WB-09 Presets and promotion — `done 2026-09-08 WB-09: feature presets, promotion, accepted-feature parquet export` — Blocked by WB-02
+### WB-09 Presets and promotion — Blocked by WB-02
 Named feature expressions saved in SQLite, a "promote to accepted" action, and a parquet export of
 accepted features plus targets for model fitting.
 **Done when:** a preset survives a service restart, promotion changes what WB-08 orthogonalizes
 against, and the export round-trips through `tessera parquet-schema`.
 
-### WB-10 Study charts — `done 2026-09-08 WB-10: study charts as inline SVG with a fixture-backed chart check` — Blocked by WB-02
+### WB-10 Study charts — Blocked by WB-02
 IC decay across horizons, decile bars, the costless equity curve, and daily IC, as inline SVG in
 the terminal style (see `EquityChart`).
 **Done when:** each chart renders from a fixture result in the browser without console errors and
 the study page opens at the top with the results grid first.
 
-### WB-11 Non-overlapping costless curve for slow features — `done 2026-09-08 WB-11: costless curve rebalanced every horizon` — Blocked by WB-02
+### WB-11 Non-overlapping costless curve for slow features — Blocked by WB-02
 The WB-02 curve pays every bar the forward return of an `h`-bar hold, so a feature whose position
 barely changes (spread_bps: turnover 0.002/bar on the SOL day) reports a breakeven of tens of bps
 that no non-overlapping execution would earn. Add a variant that rebalances every `h` bars (or
@@ -141,7 +145,7 @@ holds until the position flips) and report its Sharpe and breakeven next to the 
 **Done when:** a unit test shows the per-bar and rebalanced variants agree for `h = 1` and the
 rebalanced breakeven of a constant-position feature is finite and far below the per-bar figure.
 
-### WB-12 Studies form knows the grid's features and symbols — `done 2026-09-08 WB-12: studies form hides book features on CSV grids and picks symbols from the catalog` — Blocked by WB-04
+### WB-12 Studies form knows the grid's features and symbols — Blocked by WB-04
 On a CSV grid the form still offers the order-book feature checkboxes (they come back as
 "unavailable on this grid") and takes symbols as typed text. Hide or grey the book features when
 a CSV grid is chosen, pick CSV symbols from the catalog with the run form's instrument picker,
@@ -149,7 +153,7 @@ and pre-tick the OHLCV set (`return_1`, `range_bps`, `gap_bps`, `high_252_distan
 **Done when:** the browser check selects the daily grid and finds no order-book checkbox and a
 catalog-backed symbol picker; a submitted daily study reports nothing unavailable.
 
-### WB-13 Studies form lists the registered series — `done 2026-09-08 WB-13: studies form lists registered series as checkboxes from /api/studies/series` — Blocked by WB-05
+### WB-13 Studies form lists the registered series — Blocked by WB-05
 Series from `[[data.series]]` and the lake side feeds (funding_rate, funding_annualized,
 open_interest, open_interest_usd) are usable as bases but only appear in the expression hint;
 the form should list them as feature checkboxes with their kind and availability rule, from a
@@ -159,23 +163,23 @@ a lake study submitted from it with `funding_rate` ticked produces that cell.
 
 ## Housekeeping
 
-### HK-01 Required symbols from the manifest — `done 2026-09-06 HK-01: required symbols from the manifest`
+### HK-01 Required symbols from the manifest
 A manifest can declare symbols the runner always appends (End-of-Year Dogs needs `IWM.US` for the
 hedge even when the form lists only `universe:stocks`).
 **Done when:** a test shows the appended symbol present in the plan when omitted from the form,
 and the Dogs manifest declares it.
 
-### HK-02 Sanitation counts on the run page — `done 2026-09-08 HK-02: sanitation counts on the run page from a sanitation.json sidecar`
+### HK-02 Sanitation counts on the run page
 Show dropped off-calendar rows, dropped spikes, and skipped symbols from the run log in the
 Overview tab, with the skipped symbols listed on the Symbols tab.
 **Done when:** a run over `examples/data` with an injected holiday row shows the count in the UI.
 
-### HK-03 CI runs scripts/check.sh — `done 2026-09-08 HK-03: CI runs scripts/check.sh (--quick engine job, --web-only web job)`
+### HK-03 CI runs scripts/check.sh
 Replace the hand-written CI steps with `scripts/check.sh --quick` plus the web job.
 **Done when:** the workflow file calls the script and a deliberate parity break fails CI locally
 with `act` or in a PR.
 
-### HK-04 check.sh works from a worktree — `done 2026-09-08 HK-04: check.sh resolves the main and private checkouts from a worktree`
+### HK-04 check.sh works from a worktree
 From `.claude/worktrees/<name>` the script cannot find `../Tessera-private` (so the private checks
 silently skip), a fresh worktree has no `local.toml` (so private strategies do not compile in), and
 the private legacy crate builds against the main checkout's engine, so a private strategy that uses
@@ -185,7 +189,7 @@ working HK-01 in a worktree.
 repository's common git dir (or `TESSERA_PRIVATE_ROOT`), copies or points at the main `local.toml`,
 and a test run from a worktree reports the private checks as run, not skipped.
 
-### HK-05 Ticket state derived from git — `todo`
+### HK-05 Ticket state derived from git
 Every ticket edits this file to write `done <date> <sha>`, which is the one line two parallel
 loops always collide on, and the sha cannot be known before the commit exists. Make git the
 record: a ticket is `done` when a commit whose subject starts with its id is on `main`. This

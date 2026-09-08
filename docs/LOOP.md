@@ -10,7 +10,9 @@ How development and research run without a person in the middle of every step. T
   resolves the main and private checkouts itself (`--resolve` prints them) and never skips the
   private checks silently.
 - `BACKLOG.md`: the ticket queue. Every ticket has a **Done when** line that a test or fixture
-  proves.
+  proves. Done is derived from git, not written into the file: `scripts/backlog-status.sh`
+  reports every ticket with its state, date, and sha from the commit whose subject carries its
+  id, and `--next` names the next ticket to take.
 - `/next-ticket`: the command that takes the next ticket to done (`.claude/commands/next-ticket.md`).
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.
