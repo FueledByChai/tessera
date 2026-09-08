@@ -36,6 +36,24 @@ the base 10-14 px controls with the 40/42 px height mismatch between text and da
 **Done when:** the browser alignment measurement from UI-01 passes with modern mode selected and
 `theme-check.mjs` gains a modern-mode font-size rule.
 
+### UI-03 Pages fit a 13-inch laptop; wide tables scroll inside their panel — `todo`
+On a 13-inch MacBook (1440 or 1280 px wide) the run page's monthly and annual performance
+table (`.monthly-panel`), the studies page's feature-by-horizon heat map and its ranked and
+decile tables, and other dense grids hang off the right edge of the window instead of
+scrolling. `.table-wrap` already has `overflow-x: auto`, so the likely cause is grid and flex
+children whose minimum width defaults to their content (`minmax(0, 1fr)` and `min-width: 0` are
+missing on some panels), plus fixed column counts and the 18/15 px grid fonts at narrow widths.
+Fix so the page body never scrolls horizontally: every panel is `min-width: 0`, wide tables
+scroll within their own wrapper, multi-column layouts collapse below 1280 px, and the heat map
+keeps its cells readable by dropping the second line (breakeven) into the hover title under
+1280 px rather than shrinking the font below 15 px.
+**Done when:** a headless measurement (`web/scripts/layout-check.mjs`, run by the web step of
+`scripts/check.sh` against the built bundle with fixture data, or against the running service
+when present) at 1280 and 1440 px on the run overview, the strategy page, and the studies page
+asserts `document.documentElement.scrollWidth <= window.innerWidth` and that no element's right
+edge exceeds the viewport unless an ancestor has `overflow-x: auto`; `theme-check.mjs` fails on
+any grid track wider than `minmax(0, 1fr)` without `min-width: 0` on the track's children.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar — `done 2026-09-06`
