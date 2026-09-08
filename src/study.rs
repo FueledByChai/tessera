@@ -2614,6 +2614,55 @@ mod tests {
         assert_eq!(Grid::FiveMinute.horizon_label(3), "15m");
     }
 
+    /// WB-12: the form's default feature set on a CSV grid (`return_1`, `range_bps`, `gap_bps`,
+    /// `high_252_distance`) runs on daily bars with nothing reported unavailable.
+    #[test]
+    fn daily_study_of_the_ohlcv_set_reports_nothing_unavailable() {
+        let data = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/data/eod"));
+        let ohlcv = ["return_1", "range_bps", "gap_bps", "high_252_distance"];
+        let config = StudyConfig {
+            lake_dir: PathBuf::new(),
+            symbols: vec!["DEMO.US".to_owned()],
+            step_secs: 1,
+            resolution: Some("daily".to_owned()),
+            daily_dir: data.to_path_buf(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            calendar_symbol: Some("DEMO.US".to_owned()),
+            session: SessionKind::Regular,
+            features: ohlcv.iter().map(|f| (*f).to_owned()).collect(),
+            horizons: vec![1, 5],
+            decision_delay_bars: 1,
+            buckets: 10,
+            target: Target::Return,
+            series: Vec::new(),
+            lake_series: true,
+            mode: StudyMode::TimeSeries,
+            intraday_source: None,
+            event_window: 20,
+            accepted: Vec::new(),
+        };
+        let out = std::env::temp_dir().join(format!("tessera-wb12-{}", std::process::id()));
+        let result = run(
+            &config,
+            NaiveDate::from_ymd_opt(2019, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+            &out,
+        )
+        .unwrap();
+        assert!(result.unavailable.is_empty(), "{:?}", result.unavailable);
+        let features: BTreeSet<&str> = result.cells.iter().map(|c| c.feature.as_str()).collect();
+        assert_eq!(features, ohlcv.into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(result.cells.len(), ohlcv.len() * 2);
+        assert!(
+            result
+                .cells
+                .iter()
+                .all(|c| c.observations > 1_000 && c.ic.is_finite())
+        );
+        let _ = fs::remove_dir_all(&out);
+    }
+
     /// The done line: a daily study of `return_1 | zscore 20` on examples/data runs end to end
     /// through the CSV loader, and an in-memory panel built the same way gives the same IC.
     #[test]

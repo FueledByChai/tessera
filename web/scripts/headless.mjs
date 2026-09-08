@@ -10,9 +10,9 @@ import { extname, join } from "node:path";
 
 /**
  * Serves the built bundle on an ephemeral port. `/api`, `/artifacts`, and `/reports` go to
- * `override(pathname, req)` first when it returns `{ status, type, body }`, then proxy to
- * `apiOrigin`, and answer 503 when there is no origin. Unknown paths fall back to index.html,
- * as the console is a single page.
+ * `override(pathname, req)` first when it returns (or resolves to) `{ status, type, body }`,
+ * then proxy to `apiOrigin`, and answer 503 when there is no origin. Unknown paths fall back
+ * to index.html, as the console is a single page.
  */
 export async function serveDist(dir, apiOrigin, override = () => null) {
   const types = {
@@ -28,7 +28,7 @@ export async function serveDist(dir, apiOrigin, override = () => null) {
   const server = http.createServer(async (req, res) => {
     const requested = new URL(req.url ?? "/", "http://localhost");
     if (/^\/(api|artifacts|reports)(\/|$)/.test(requested.pathname)) {
-      const answer = override(requested.pathname, req);
+      const answer = await override(requested.pathname, req);
       if (answer) {
         res.writeHead(answer.status ?? 200, { "content-type": answer.type ?? "application/json" });
         res.end(answer.body ?? "");
@@ -96,6 +96,15 @@ export function resolveChromium() {
     }
   }
   return null;
+}
+
+/** The request body as text. */
+export function readBody(req) {
+  return new Promise((resolve) => {
+    let text = "";
+    req.on("data", (chunk) => (text += chunk));
+    req.on("end", () => resolve(text));
+  });
 }
 
 /** Whether a console answers at `target`. */

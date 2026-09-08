@@ -4085,6 +4085,10 @@ nav {
 .ranked-cells tbody tr.active { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
 .ranked-cells td.positive { color: #32c832; }
 .ranked-cells td.negative { color: #e03040; }
+/* Nine columns: long feature names and the two-word headers wrap rather than push the table
+   past its wrapper on a laptop. */
+.ranked-cells th { white-space: normal; }
+.ranked-cells td:first-child { white-space: normal; overflow-wrap: anywhere; min-width: 140px; }
 .diag-readout { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
 .ic-decay .chart-readout { flex-wrap: wrap; gap: 8px 18px; font-size: 13px; }
 .ic-decay .chart-readout .positive { color: #32c832; }

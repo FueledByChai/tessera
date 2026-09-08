@@ -1,13 +1,17 @@
 #!/usr/bin/env node
-// Study chart check (WB-10). Serves the built bundle with the studies API answered from the
-// fixture result in web/fixtures/study-result.json (a 5-minute study of the bundled DEMO.US
+// Study page check (WB-10, WB-12). Serves the built bundle with the studies API answered from
+// the fixture result in web/fixtures/study-result.json (a 5-minute study of the bundled DEMO.US
 // data with an accepted set, curves thinned to 60 points), opens the studies page in terminal
 // and modern mode, selects the study, and fails unless every chart renders (IC by horizon,
 // deciles, the costless curve, daily IC) with no console error or uncaught exception, the page
-// sits at the top, and the results grid comes before the first chart. Every other API path
-// proxies to the console at LAYOUT_CONSOLE when one answers and returns 503 otherwise (the shell
-// shows "API offline" and carries on). Needs a Playwright-compatible Chromium like the layout
-// check; without one, or without a built bundle, it reports that it skipped and exits 0.
+// sits at the top, and the results grid comes before the first chart. In terminal mode it then
+// switches the form to the daily grid and fails unless the order-book checkboxes are gone, the
+// OHLCV set is ticked, the symbols come from a catalog-backed picker (the fixture catalog
+// offers DEMO.US), and the submitted study asks for the daily grid, that symbol, and only
+// OHLCV features. Every other API path proxies to the console at LAYOUT_CONSOLE when one
+// answers and returns 503 otherwise (the shell shows "API offline" and carries on). Needs a
+// Playwright-compatible Chromium like the layout check; without one, or without a built
+// bundle, it reports that it skipped and exits 0.
 //
 //   node web/scripts/chart-check.mjs
 //   node web/scripts/chart-check.mjs --verbose        print every chart's measurement
@@ -15,7 +19,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { LAUNCH, reachable, resolveChromium, serveDist } from "./headless.mjs";
+import { LAUNCH, reachable, readBody, resolveChromium, serveDist } from "./headless.mjs";
 
 const consoleOrigin = process.env.LAYOUT_CONSOLE ?? "http://127.0.0.1:8787/";
 const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
@@ -51,11 +55,36 @@ const study = {
   error: null,
   artifact_dir: "artifacts/studies/fixture",
 };
-const json = (body) => ({ status: 200, type: "application/json", body: JSON.stringify(body) });
-const fixtureApi = (pathname) => {
+const catalog = {
+  symbol: "DEMO.US",
+  code: "DEMO",
+  suffix: "US",
+  name: "Demo Corporation",
+  exchange: "US",
+  asset_class: "Common Stock",
+  currency: "USD",
+  status: "active",
+  daily: true,
+  five_minute: true,
+  one_minute: false,
+  tick: false,
+  coverage: { daily: { first: "2018-01-02", last: "2025-12-31" }, "5m": { first: "2024-01-02", last: "2024-12-31" } },
+  missing_resolutions: [],
+};
+const BOOK_FEATURES = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "signed_volume"];
+const OHLCV_FEATURES = ["return_1", "range_bps", "gap_bps", "high_252_distance"];
+/** Studies the page submitted to the fixture server. */
+const posted = [];
+const json = (body, status = 200) => ({ status, type: "application/json", body: JSON.stringify(body) });
+const fixtureApi = async (pathname, req) => {
+  if (pathname === "/api/studies" && req.method === "POST") {
+    posted.push(JSON.parse(await readBody(req)));
+    return json({ ...study, id: "study-posted", name: "posted", status: "running" }, 202);
+  }
   if (pathname === "/api/studies") return json([study]);
   if (pathname === `/api/studies/${study.id}`) return json({ study, result });
   if (pathname === "/api/features" || pathname === "/api/lake/instruments") return json([]);
+  if (pathname === "/api/instruments") return json({ instruments: [catalog], total_matches: 1, index_size: 1, indexed_at: "" });
   return null;
 };
 
@@ -114,6 +143,48 @@ try {
         if (chart.shapes === 0) failures.push(`${mode}: ${name} chart has no shapes`);
         if (seen.gridTop != null && chart.top <= seen.gridTop) failures.push(`${mode}: ${name} chart sits above the results grid`);
       }
+      if (mode === "terminal") {
+        // The form on the daily grid: no order-book checkbox, the OHLCV set ticked, a
+        // catalog-backed symbol picker, and a submission that carries exactly that.
+        await page.getByLabel("Grid").first().selectOption("daily");
+        await page.waitForTimeout(200);
+        const form = await page.evaluate(() => {
+          const rows = [...document.querySelectorAll(".study-pick-grid .check-row")].map((row) => ({
+            id: row.querySelector("small")?.textContent?.trim() ?? "",
+            checked: Boolean(row.querySelector("input")?.checked),
+          }));
+          return {
+            rows,
+            picker: Boolean(document.querySelector(".study-pick-grid .instrument-picker .instrument-search input")),
+            textarea: Boolean(document.querySelector(".study-pick-grid textarea[placeholder*='SPY']")),
+          };
+        });
+        for (const row of form.rows) {
+          if (BOOK_FEATURES.includes(row.id)) failures.push(`${mode}: daily grid still offers the order-book feature ${row.id}`);
+        }
+        const ticked = form.rows.filter((row) => row.checked).map((row) => row.id).sort();
+        if (ticked.join(",") !== [...OHLCV_FEATURES].sort().join(",")) failures.push(`${mode}: daily grid pre-ticks ${ticked.join(", ") || "nothing"} instead of the OHLCV set`);
+        if (!form.picker) failures.push(`${mode}: daily grid has no catalog-backed symbol picker`);
+        if (form.textarea) failures.push(`${mode}: daily grid still takes symbols as typed text`);
+        if (form.picker) {
+          await page.locator(".study-pick-grid .instrument-search input").fill("DEMO");
+          await page.locator(".study-pick-grid .instrument-results li").first().waitFor({ timeout: 10000 });
+          await page.keyboard.press("Enter");
+          await page.locator(".study-pick-grid .instrument-chip strong", { hasText: "DEMO.US" }).waitFor({ timeout: 10000 });
+          await page.getByRole("button", { name: /Run study/ }).click();
+          await page.waitForFunction(() => document.querySelector(".sweep-submit button")?.textContent?.includes("Run"), null, { timeout: 10000 }).catch(() => undefined);
+          await page.waitForTimeout(400);
+          const body = posted[posted.length - 1];
+          if (!body) failures.push(`${mode}: the daily study was not submitted`);
+          else {
+            if (body.resolution !== "daily") failures.push(`${mode}: submitted resolution ${JSON.stringify(body.resolution)}, not daily`);
+            if (JSON.stringify(body.symbols) !== JSON.stringify(["DEMO.US"])) failures.push(`${mode}: submitted symbols ${JSON.stringify(body.symbols)}`);
+            const sent = [...(body.features ?? [])].sort();
+            if (sent.join(",") !== [...OHLCV_FEATURES].sort().join(",")) failures.push(`${mode}: submitted features ${sent.join(", ")}`);
+            for (const f of sent) if (BOOK_FEATURES.includes(f)) failures.push(`${mode}: submitted the order-book feature ${f} on the daily grid`);
+          }
+        }
+      }
       for (const error of errors) failures.push(`${mode}: console error: ${error.split("\n")[0]}`);
     } catch (error) {
       failures.push(`${mode}: ${String(error).split("\n")[0]}`);
@@ -131,5 +202,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `chart-check: ok (${Object.keys(CHARTS).length} charts from web/fixtures/study-result.json, terminal and modern, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `chart-check: ok (${Object.keys(CHARTS).length} charts from web/fixtures/study-result.json, terminal and modern; daily grid form submitted ${posted.length} study with ${posted[0]?.features?.length ?? 0} OHLCV features; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );

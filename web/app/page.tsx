@@ -1551,9 +1551,16 @@ const STUDY_FEATURES = [
   ["gap_bps", "Open gap vs previous close (bps)"],
   ["high_252_distance", "Close vs 252-bar high (bps)"],
 ] as const;
-/** Bases that need order-book bars: pre-ticked on the lake, reported unavailable on CSV grids. */
+/** Bases that need order-book bars: pre-ticked on the lake, hidden on CSV grids. */
 const BOOK_FEATURES = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "signed_volume"];
+/** Bases every grid has: pre-ticked on CSV grids. */
+const OHLCV_FEATURES = ["return_1", "range_bps", "gap_bps", "high_252_distance"];
 const CSV_GRIDS = ["daily", "5m", "1m"] as const;
+/** The features ticked when a grid is chosen: the book set on the lake, the OHLCV set on CSV bars. */
+function defaultStudyFeatures(grid: string): string[] {
+  if ((CSV_GRIDS as readonly string[]).includes(grid)) return [...OHLCV_FEATURES];
+  return STUDY_FEATURES.map(([id]) => id).filter((id) => BOOK_FEATURES.includes(id) || id === "return_1");
+}
 const LAKE_STEPS = [1, 2, 5, 10, 15, 30] as const;
 
 const STUDY_TARGETS = [
@@ -1802,7 +1809,7 @@ function StudiesWorkspace() {
   const [libError, setLibError] = useState("");
   const promoted = useMemo(() => library.filter((p) => p.accepted), [library]);
   const [symbols, setSymbols] = useState<string[]>([]);
-  const [features, setFeatures] = useState<string[]>(STUDY_FEATURES.map(([id]) => id).filter((id) => BOOK_FEATURES.includes(id) || id === "return_1"));
+  const [features, setFeatures] = useState<string[]>(() => defaultStudyFeatures("1"));
   // Free-form feature expressions, one per line: base series plus streaming transforms.
   const [expressions, setExpressions] = useState("");
   // The accepted set: expressions regressed out of every feature before its incremental IC.
@@ -1815,13 +1822,29 @@ function StudiesWorkspace() {
     () => expressions.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#")),
     [expressions],
   );
-  const allFeatures = useMemo(() => [...features, ...customFeatures], [features, customFeatures]);
   // The grid: lake seconds ("1".."30") or a CSV resolution ("daily", "5m", "1m").
   const [gridChoice, setGridChoice] = useState("1");
   const csvGrid = (CSV_GRIDS as readonly string[]).includes(gridChoice);
   const step = csvGrid ? 1 : Number(gridChoice);
-  const [csvSymbols, setCsvSymbols] = useState("SPY.US");
-  const csvList = useMemo(() => csvSymbols.split(/[\s,]+/).map((x) => x.trim().toUpperCase()).filter(Boolean), [csvSymbols]);
+  // Order-book bases are hidden on CSV grids, so none reaches the study to come back unavailable.
+  const allFeatures = useMemo(
+    () => [...features.filter((f) => !csvGrid || !BOOK_FEATURES.includes(f)), ...customFeatures],
+    [features, customFeatures, csvGrid],
+  );
+  // CSV symbols come from the instrument catalog, filtered to those with bars at this resolution.
+  const [csvList, setCsvList] = useState<string[]>([]);
+  const csvRequirement = useMemo<InstrumentRequirement>(
+    () => ({
+      parameter: "symbols",
+      mode: "multiple",
+      resolutions: [gridChoice],
+      suffixes: [],
+      asset_classes: [],
+      maximum: 50,
+      note: `Only instruments with ${gridChoice} bars on disk are offered; every symbol loads through the SDK loader.`,
+    }),
+    [gridChoice],
+  );
   const [horizons, setHorizons] = useState("1,5,30,60");
   const [delay, setDelay] = useState(1);
   const [target, setTarget] = useState("return");
@@ -2174,7 +2197,13 @@ function StudiesWorkspace() {
               </label>
               <label>
                 Grid
-                <select value={gridChoice} onChange={(e) => setGridChoice(e.target.value)}>
+                <select
+                  value={gridChoice}
+                  onChange={(e) => {
+                    setGridChoice(e.target.value);
+                    setFeatures(defaultStudyFeatures(e.target.value));
+                  }}
+                >
                   {LAKE_STEPS.map((s) => (
                     <option key={s} value={String(s)}>{s} second{s > 1 ? "s" : ""} · tick lake</option>
                   ))}
@@ -2214,17 +2243,12 @@ function StudiesWorkspace() {
               <fieldset>
                 <legend>Instruments</legend>
                 {csvGrid ? (
-                  <label className="expression-box">
-                    <span>Symbols</span>
-                    <textarea
-                      rows={3}
-                      spellCheck={false}
-                      placeholder={"SPY.US, QQQ.US"}
-                      value={csvSymbols}
-                      onChange={(e) => setCsvSymbols(e.target.value)}
-                    />
-                    <small>comma or newline separated; each needs a {gridChoice} CSV file in the data library. Order-book features are reported unavailable on this grid.</small>
-                  </label>
+                  <div className="instrument-field">
+                    <span className="instrument-label">
+                      Symbols<small>from the catalog · {gridChoice} bars</small>
+                    </span>
+                    <InstrumentPicker requirement={csvRequirement} value={csvList} onChange={setCsvList} disabled={busy} />
+                  </div>
                 ) : instruments.length === 0 ? (
                   <div className="empty-state">No tick lake configured. Set <code>lake_dir</code> in local.toml, or pick a CSV grid above.</div>
                 ) : null}
@@ -2245,7 +2269,10 @@ function StudiesWorkspace() {
               </fieldset>
               <fieldset>
                 <legend>Features</legend>
-                {STUDY_FEATURES.map(([id, label]) => (
+                {csvGrid && (
+                  <small className="form-footnote">Order-book bases (OBI, microprice, spread, trade imbalance, signed volume) need tick-lake bars and are hidden on this grid.</small>
+                )}
+                {STUDY_FEATURES.filter(([id]) => !csvGrid || !BOOK_FEATURES.includes(id)).map(([id, label]) => (
                   <label key={id} className="check-row">
                     <input
                       type="checkbox"

@@ -141,7 +141,7 @@ holds until the position flips) and report its Sharpe and breakeven next to the 
 **Done when:** a unit test shows the per-bar and rebalanced variants agree for `h = 1` and the
 rebalanced breakeven of a constant-position feature is finite and far below the per-bar figure.
 
-### WB-12 Studies form knows the grid's features and symbols — `todo` — Blocked by WB-04
+### WB-12 Studies form knows the grid's features and symbols — `done 2026-09-08 WB-12: studies form hides book features on CSV grids and picks symbols from the catalog` — Blocked by WB-04
 On a CSV grid the form still offers the order-book feature checkboxes (they come back as
 "unavailable on this grid") and takes symbols as typed text. Hide or grey the book features when
 a CSV grid is chosen, pick CSV symbols from the catalog with the run form's instrument picker,
