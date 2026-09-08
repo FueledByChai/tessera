@@ -149,7 +149,7 @@ and pre-tick the OHLCV set (`return_1`, `range_bps`, `gap_bps`, `high_252_distan
 **Done when:** the browser check selects the daily grid and finds no order-book checkbox and a
 catalog-backed symbol picker; a submitted daily study reports nothing unavailable.
 
-### WB-13 Studies form lists the registered series — `todo` — Blocked by WB-05
+### WB-13 Studies form lists the registered series — `done 2026-09-08 WB-13: studies form lists registered series as checkboxes from /api/studies/series` — Blocked by WB-05
 Series from `[[data.series]]` and the lake side feeds (funding_rate, funding_annualized,
 open_interest, open_interest_usd) are usable as bases but only appear in the expression hint;
 the form should list them as feature checkboxes with their kind and availability rule, from a

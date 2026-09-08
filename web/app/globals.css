@@ -4075,6 +4075,8 @@ nav {
 .study-pick-grid legend { color: var(--accent, #f89828); font-size: 15px; letter-spacing: 0.08em; }
 .check-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 15px; }
 .check-row small { color: var(--text-muted, #b8b8b8); margin-left: auto; font-size: 12px; }
+.series-row em { font-style: normal; color: var(--accent, #f89828); font-size: 12px; letter-spacing: 0.06em; margin-left: 6px; }
+.series-row.off { opacity: 0.45; }
 .sweep-heatmap td small { display: block; font-size: 11px; opacity: 0.8; }
 .sweep-heatmap td.positive { color: #32c832; }
 .sweep-heatmap td.negative { color: #e03040; }

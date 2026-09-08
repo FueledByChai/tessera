@@ -1529,6 +1529,14 @@ type StudyResult = {
   symbols: { symbol: string; bars: number; bars_with_book: number }[];
   cells: StudyCell[];
 };
+// A base beyond the bar the form lists as a checkbox: a declared series or a lake side feed.
+type StudySeries = {
+  name: string;
+  kind: string;
+  source: string;
+  availability: string;
+  lake_only: boolean;
+};
 type LakeInstrument = {
   exchange: string;
   symbol: string;
@@ -1797,6 +1805,7 @@ function StudyDiagnostics({ cell }: { cell: StudyCell }) {
 /** Feature studies on the tick lake: create, list, and read IC / decile tables. */
 function StudiesWorkspace() {
   const [instruments, setInstruments] = useState<LakeInstrument[]>([]);
+  const [seriesList, setSeriesList] = useState<StudySeries[]>([]);
   const [studies, setStudies] = useState<StudyRecord[]>([]);
   const [selected, setSelected] = useState<string>("");
   const [detail, setDetail] = useState<{ study: StudyRecord; result: StudyResult | null } | null>(null);
@@ -1826,10 +1835,12 @@ function StudiesWorkspace() {
   const [gridChoice, setGridChoice] = useState("1");
   const csvGrid = (CSV_GRIDS as readonly string[]).includes(gridChoice);
   const step = csvGrid ? 1 : Number(gridChoice);
-  // Order-book bases are hidden on CSV grids, so none reaches the study to come back unavailable.
+  // Order-book bases and lake feeds are hidden or greyed on CSV grids, so none reaches the study
+  // to come back unavailable.
+  const lakeOnly = useMemo(() => new Set(seriesList.filter((s) => s.lake_only).map((s) => s.name)), [seriesList]);
   const allFeatures = useMemo(
-    () => [...features.filter((f) => !csvGrid || !BOOK_FEATURES.includes(f)), ...customFeatures],
-    [features, customFeatures, csvGrid],
+    () => [...features.filter((f) => !csvGrid || (!BOOK_FEATURES.includes(f) && !lakeOnly.has(f))), ...customFeatures],
+    [features, customFeatures, csvGrid, lakeOnly],
   );
   // CSV symbols come from the instrument catalog, filtered to those with bars at this resolution.
   const [csvList, setCsvList] = useState<string[]>([]);
@@ -1858,14 +1869,16 @@ function StudiesWorkspace() {
     window.scrollTo({ top: 0 });
   }, []);
   const refresh = useCallback(async () => {
-    const [i, s, f] = await Promise.all([
+    const [i, s, f, x] = await Promise.all([
       fetch(`${API}/lake/instruments`, { cache: "no-store" }),
       fetch(`${API}/studies`, { cache: "no-store" }),
       fetch(`${API}/features`, { cache: "no-store" }),
+      fetch(`${API}/studies/series`, { cache: "no-store" }),
     ]);
     if (i.ok) setInstruments(await i.json());
     if (s.ok) setStudies(await s.json());
     if (f.ok) setLibrary(await f.json());
+    if (x.ok) setSeriesList(await x.json());
   }, []);
   useEffect(() => {
     const initial = window.setTimeout(() => void refresh(), 0);
@@ -2273,7 +2286,7 @@ function StudiesWorkspace() {
                   <small className="form-footnote">Order-book bases (OBI, microprice, spread, trade imbalance, signed volume) need tick-lake bars and are hidden on this grid.</small>
                 )}
                 {STUDY_FEATURES.filter(([id]) => !csvGrid || !BOOK_FEATURES.includes(id)).map(([id, label]) => (
-                  <label key={id} className="check-row">
+                  <label key={id} className="check-row" data-feature={id}>
                     <input
                       type="checkbox"
                       checked={features.includes(id)}
@@ -2283,6 +2296,28 @@ function StudiesWorkspace() {
                     <small>{id}</small>
                   </label>
                 ))}
+                {seriesList.length > 0 && (
+                  <>
+                    <small className="form-footnote">
+                      Series beyond the bar, joined as-of availability{csvGrid ? "; lake feeds need tick-lake bars" : ""}.
+                    </small>
+                    {seriesList.map((s) => {
+                      const off = csvGrid && s.lake_only;
+                      return (
+                        <label key={s.name} className={off ? "check-row series-row off" : "check-row series-row"} data-feature={s.name} title={s.source}>
+                          <input
+                            type="checkbox"
+                            disabled={off}
+                            checked={!off && features.includes(s.name)}
+                            onChange={(e) => setFeatures(e.target.checked ? [...features, s.name] : features.filter((f) => f !== s.name))}
+                          />
+                          <span>{s.name} <em>{s.kind}</em></span>
+                          <small>{off ? "lake only" : s.availability}</small>
+                        </label>
+                      );
+                    })}
+                  </>
+                )}
                 <label className="expression-box">
                   <span>Expressions</span>
                   <textarea

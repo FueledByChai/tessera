@@ -663,6 +663,7 @@ async fn main() -> Result<()> {
         .route("/api/runs/{id}/star", post(set_run_star))
         .route("/api/sweeps", get(list_sweeps).post(create_sweep))
         .route("/api/studies", get(list_studies).post(create_study))
+        .route("/api/studies/series", get(list_study_series))
         .route("/api/studies/{id}", get(study_detail))
         .route("/api/studies/{id}/export", get(study_export))
         .route(
@@ -4499,6 +4500,61 @@ fn validate_study_request(
     Ok((config, start, end))
 }
 
+/// A base beyond the bar that the studies form lists as a checkbox (WB-13): a series declared
+/// in `[[data.series]]`, or one of the lake side feeds.
+#[derive(Debug, Clone, Serialize)]
+struct StudySeriesInfo {
+    name: String,
+    /// `level`, `event`, or `lake`.
+    kind: String,
+    /// Where the values come from: the declared file, or the lake feed and column.
+    source: String,
+    /// The availability rule the join honours.
+    availability: String,
+    /// Only the tick lake carries it: greyed out on CSV grids.
+    lake_only: bool,
+}
+
+/// Every base beyond the bar: the declared series in their configured order, then the lake
+/// side feeds.
+fn study_series_catalog(declared: &[tessera::series::SeriesSpec]) -> Vec<StudySeriesInfo> {
+    let mut out: Vec<StudySeriesInfo> = declared
+        .iter()
+        .map(|spec| StudySeriesInfo {
+            name: spec.name.clone(),
+            kind: match spec.kind {
+                tessera::series::SeriesKind::Level => "level".to_owned(),
+                tessera::series::SeriesKind::Event => "event".to_owned(),
+            },
+            source: spec.path.display().to_string(),
+            availability: match (&spec.available_at_column, spec.publication_lag_secs) {
+                (Some(column), _) => format!("as-of the {column} column"),
+                (None, lag) if lag > 0 => format!("nominal time + {lag} s"),
+                (None, _) => "at the nominal time".to_owned(),
+            },
+            lake_only: false,
+        })
+        .collect();
+    out.extend(
+        tessera::study::LAKE_SERIES
+            .iter()
+            .map(|(name, feed, column)| StudySeriesInfo {
+                name: (*name).to_owned(),
+                kind: "lake".to_owned(),
+                source: format!("lake feed {feed}.{column}"),
+                availability: "as-of receipt (recvTimestampMicros)".to_owned(),
+                lake_only: true,
+            }),
+    );
+    out
+}
+
+async fn list_study_series(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<StudySeriesInfo>>, ApiError> {
+    Ok(Json(study_series_catalog(&state.local.data.series)))
+}
+
 /// The bases an expression may use beyond the bar: the declared series, plus the lake side
 /// feeds when the grid has an order book.
 fn study_base_names(data: &tessera::local_config::DataLibrary, book_grid: bool) -> Vec<String> {
@@ -6344,6 +6400,67 @@ mod tests {
     }
 
     use super::*;
+
+    /// WB-13: the studies form lists every base beyond the bar: the declared series with their
+    /// kind and availability rule, and the four lake side feeds, flagged as lake-only.
+    #[test]
+    fn study_series_catalog_lists_declared_series_and_lake_feeds() {
+        let declared: Vec<tessera::series::SeriesSpec> =
+            toml::from_str::<std::collections::BTreeMap<String, Vec<tessera::series::SeriesSpec>>>(
+                r#"
+            [[series]]
+            name = "vix"
+            path = "series/vix.csv"
+            publication_lag_secs = 3600
+
+            [[series]]
+            name = "fomc"
+            path = "series/fomc.parquet"
+            kind = "event"
+            available_at_column = "released_at"
+            "#,
+            )
+            .unwrap()
+            .remove("series")
+            .unwrap();
+        let catalog = study_series_catalog(&declared);
+        let names: Vec<&str> = catalog.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "vix",
+                "fomc",
+                "funding_rate",
+                "funding_annualized",
+                "open_interest",
+                "open_interest_usd"
+            ]
+        );
+        let vix = &catalog[0];
+        assert_eq!(vix.kind, "level");
+        assert!(!vix.lake_only);
+        assert!(vix.source.contains("vix.csv"), "{}", vix.source);
+        assert!(vix.availability.contains("3600"), "{}", vix.availability);
+        let fomc = &catalog[1];
+        assert_eq!(fomc.kind, "event");
+        assert!(
+            fomc.availability.contains("released_at"),
+            "{}",
+            fomc.availability
+        );
+        for feed in &catalog[2..] {
+            assert_eq!(feed.kind, "lake");
+            assert!(feed.lake_only);
+            assert!(
+                feed.availability.contains("receipt"),
+                "{}",
+                feed.availability
+            );
+            assert!(feed.source.contains("funding") || feed.source.contains("open_interest"));
+        }
+        // With nothing declared the feeds alone remain.
+        assert_eq!(study_series_catalog(&[]).len(), 4);
+    }
 
     /// WB-09: a feature preset lives in the catalog database, so it is still there after the
     /// service restarts (a fresh connection to the same file), and its promotion with it.

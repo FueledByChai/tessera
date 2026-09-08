@@ -178,7 +178,9 @@ change per date; a full swap of both sides is 4), and breakeven cost fill the ce
 pooled `ALL` cell exists in this mode. Meant for daily panels; the time-series mode remains the
 default.
 
-**Exogenous series.** Anything observed outside the bar stream joins a study as a base:
+**Exogenous series.** Anything observed outside the bar stream joins a study as a base (the
+studies form lists every registered series as a checkbox with its kind and availability rule,
+from `GET /api/studies/series`; lake feeds are greyed out on CSV grids):
 declare it under `[[data.series]]` in `local.toml` (name, CSV or parquet path, `kind` of
 `level` or `event`, the time and value columns, an optional `symbol_column`, and either an
 `available_at_column` or a fixed `publication_lag_secs`), and write `cpi_surprise | zscore 12`

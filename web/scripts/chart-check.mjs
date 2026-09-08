@@ -8,7 +8,10 @@
 // switches the form to the daily grid and fails unless the order-book checkboxes are gone, the
 // OHLCV set is ticked, the symbols come from a catalog-backed picker (the fixture catalog
 // offers DEMO.US), and the submitted study asks for the daily grid, that symbol, and only
-// OHLCV features. Every other API path proxies to the console at LAYOUT_CONSOLE when one
+// OHLCV features. It also expects a checkbox per registered series from /api/studies/series
+// (the fixture declares two series and the four lake feeds), the lake feeds greyed out on the
+// daily grid, and a lake study submitted with funding_rate ticked to carry that feature. Every
+// other API path proxies to the console at LAYOUT_CONSOLE when one
 // answers and returns 503 otherwise (the shell shows "API offline" and carries on). Needs a
 // Playwright-compatible Chromium like the layout check; without one, or without a built
 // bundle, it reports that it skipped and exits 0.
@@ -71,6 +74,15 @@ const catalog = {
   coverage: { daily: { first: "2018-01-02", last: "2025-12-31" }, "5m": { first: "2024-01-02", last: "2024-12-31" } },
   missing_resolutions: [],
 };
+const lakeInstrument = { exchange: "BINANCE_FUTURES", symbol: "SOLUSDT", first_date: "2026-07-01", last_date: "2026-07-16", days: 16, has_book: true };
+const series = [
+  { name: "vix", kind: "level", source: "series/vix.csv", availability: "nominal time + 3600 s", lake_only: false },
+  { name: "fomc", kind: "event", source: "series/fomc.parquet", availability: "as-of the released_at column", lake_only: false },
+  { name: "funding_rate", kind: "lake", source: "lake feed funding.fundingRate", availability: "as-of receipt (recvTimestampMicros)", lake_only: true },
+  { name: "funding_annualized", kind: "lake", source: "lake feed funding.annualizedRate", availability: "as-of receipt (recvTimestampMicros)", lake_only: true },
+  { name: "open_interest", kind: "lake", source: "lake feed open_interest.openInterest", availability: "as-of receipt (recvTimestampMicros)", lake_only: true },
+  { name: "open_interest_usd", kind: "lake", source: "lake feed open_interest.openInterestUsd", availability: "as-of receipt (recvTimestampMicros)", lake_only: true },
+];
 const BOOK_FEATURES = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "signed_volume"];
 const OHLCV_FEATURES = ["return_1", "range_bps", "gap_bps", "high_252_distance"];
 /** Studies the page submitted to the fixture server. */
@@ -83,7 +95,9 @@ const fixtureApi = async (pathname, req) => {
   }
   if (pathname === "/api/studies") return json([study]);
   if (pathname === `/api/studies/${study.id}`) return json({ study, result });
-  if (pathname === "/api/features" || pathname === "/api/lake/instruments") return json([]);
+  if (pathname === "/api/features") return json([]);
+  if (pathname === "/api/lake/instruments") return json([lakeInstrument]);
+  if (pathname === "/api/studies/series") return json(series);
   if (pathname === "/api/instruments") return json({ instruments: [catalog], total_matches: 1, index_size: 1, indexed_at: "" });
   return null;
 };
@@ -149,9 +163,11 @@ try {
         await page.getByLabel("Grid").first().selectOption("daily");
         await page.waitForTimeout(200);
         const form = await page.evaluate(() => {
-          const rows = [...document.querySelectorAll(".study-pick-grid .check-row")].map((row) => ({
-            id: row.querySelector("small")?.textContent?.trim() ?? "",
+          const rows = [...document.querySelectorAll(".study-pick-grid .check-row[data-feature]")].map((row) => ({
+            id: row.dataset.feature,
             checked: Boolean(row.querySelector("input")?.checked),
+            disabled: Boolean(row.querySelector("input")?.disabled),
+            series: row.classList.contains("series-row"),
           }));
           return {
             rows,
@@ -161,6 +177,12 @@ try {
         });
         for (const row of form.rows) {
           if (BOOK_FEATURES.includes(row.id)) failures.push(`${mode}: daily grid still offers the order-book feature ${row.id}`);
+        }
+        // A checkbox per registered series; lake feeds greyed out on a CSV grid.
+        for (const s of series) {
+          const row = form.rows.find((r) => r.series && r.id === s.name);
+          if (!row) failures.push(`${mode}: no checkbox for the registered series ${s.name}`);
+          else if (row.disabled !== s.lake_only) failures.push(`${mode}: series ${s.name} is ${row.disabled ? "" : "not "}greyed out on the daily grid`);
         }
         const ticked = form.rows.filter((row) => row.checked).map((row) => row.id).sort();
         if (ticked.join(",") !== [...OHLCV_FEATURES].sort().join(",")) failures.push(`${mode}: daily grid pre-ticks ${ticked.join(", ") || "nothing"} instead of the OHLCV set`);
@@ -184,6 +206,25 @@ try {
             for (const f of sent) if (BOOK_FEATURES.includes(f)) failures.push(`${mode}: submitted the order-book feature ${f} on the daily grid`);
           }
         }
+        // Back on the lake: the feeds are live; a study with funding_rate ticked carries it.
+        await page.getByLabel("Grid").first().selectOption("1");
+        await page.waitForTimeout(200);
+        const feed = page.locator('.study-pick-grid .check-row[data-feature="funding_rate"] input');
+        if (await feed.isDisabled().catch(() => true)) failures.push(`${mode}: funding_rate is greyed out on the lake grid`);
+        else {
+          await page.locator(".study-pick-grid .check-row", { hasText: "BINANCE_FUTURES:SOLUSDT" }).locator("input").check();
+          await feed.check();
+          const before = posted.length;
+          await page.getByRole("button", { name: /Run study/ }).click();
+          await page.waitForTimeout(500);
+          const body = posted.length > before ? posted[posted.length - 1] : null;
+          if (!body) failures.push(`${mode}: the lake study was not submitted`);
+          else {
+            if (body.resolution) failures.push(`${mode}: lake study submitted with resolution ${JSON.stringify(body.resolution)}`);
+            if (JSON.stringify(body.symbols) !== JSON.stringify(["BINANCE_FUTURES:SOLUSDT"])) failures.push(`${mode}: lake study symbols ${JSON.stringify(body.symbols)}`);
+            if (!(body.features ?? []).includes("funding_rate")) failures.push(`${mode}: lake study features ${JSON.stringify(body.features)} lack funding_rate`);
+          }
+        }
       }
       for (const error of errors) failures.push(`${mode}: console error: ${error.split("\n")[0]}`);
     } catch (error) {
@@ -202,5 +243,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `chart-check: ok (${Object.keys(CHARTS).length} charts from web/fixtures/study-result.json, terminal and modern; daily grid form submitted ${posted.length} study with ${posted[0]?.features?.length ?? 0} OHLCV features; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `chart-check: ok (${Object.keys(CHARTS).length} charts from web/fixtures/study-result.json, terminal and modern; ${series.length} series checkboxes; daily grid submitted ${posted[0]?.features?.length ?? 0} OHLCV features, lake grid submitted ${JSON.stringify(posted[1]?.features ?? [])}; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );
