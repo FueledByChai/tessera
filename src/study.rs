@@ -2,7 +2,9 @@
 //!
 //! This is the research step before a strategy. For each symbol the study builds
 //! `step_secs` bars from the tick lake, computes the requested features at each bar close,
-//! measures forward mid-price returns `h` bars ahead, then reports per feature and horizon:
+//! measures a forward target `h` bars ahead (the mid return by default; see [`Target`] for
+//! realized variance, absolute move, spread change, and fair-value residuals), then reports
+//! per feature and horizon:
 //! Spearman rank correlation (information coefficient), the mean forward return by feature
 //! decile, a t-statistic for top-minus-bottom decile, and a costless trading curve: the
 //! feature's z-score (clipped, or just its sign) as the position, times the forward return,
@@ -57,6 +59,200 @@ pub struct StudyConfig {
     pub decision_delay_bars: usize,
     #[serde(default = "default_buckets")]
     pub buckets: usize,
+    /// What every feature is scored against over the horizon (default `return`).
+    #[serde(default)]
+    pub target: Target,
+}
+
+/// The forward quantity a feature is scored against: IC, deciles, and the costless curve all
+/// run on it. Values are per acting bar `a` and horizon `h`, in the unit [`Target::unit`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Target {
+    /// Mid-price return from `a` to `a + h`, bps.
+    #[default]
+    Return,
+    /// Sum of squared bar-to-bar mid returns (bps) over `a + 1 ..= a + h`, bps squared.
+    RealizedVariance,
+    /// Absolute mid-price return from `a` to `a + h`, bps.
+    AbsMove,
+    /// Quoted spread at `a + h` minus the spread at `a`, bps.
+    SpreadChange,
+    /// Mid minus its 60-second EMA at `a + h`, in bps of mid: where the price sits against a
+    /// slow fair value once the horizon has passed.
+    FairValueResidual,
+    /// Mid minus microprice at `a + h`, in bps of mid: where the price sits against the
+    /// size-weighted touch.
+    MicropriceResidual,
+}
+
+impl Target {
+    pub const ALL: [Target; 6] = [
+        Target::Return,
+        Target::RealizedVariance,
+        Target::AbsMove,
+        Target::SpreadChange,
+        Target::FairValueResidual,
+        Target::MicropriceResidual,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::Return => "return",
+            Target::RealizedVariance => "realized_variance",
+            Target::AbsMove => "abs_move",
+            Target::SpreadChange => "spread_change",
+            Target::FairValueResidual => "fair_value_residual",
+            Target::MicropriceResidual => "microprice_residual",
+        }
+    }
+    /// The unit every target-valued figure carries (decile means, top-bottom, P&L).
+    pub fn unit(self) -> &'static str {
+        match self {
+            Target::RealizedVariance => "bps²",
+            _ => "bps",
+        }
+    }
+    pub fn parse(text: &str) -> Result<Target> {
+        let wanted = text.trim().to_ascii_lowercase();
+        Target::ALL
+            .into_iter()
+            .find(|t| t.name() == wanted)
+            .with_context(|| {
+                format!(
+                    "unknown study target {text:?}; use one of {}",
+                    Target::ALL.map(Target::name).join(", ")
+                )
+            })
+    }
+}
+
+/// Seconds of mid history the fair-value EMA averages over.
+const FAIR_VALUE_EMA_SECS: u32 = 60;
+
+/// The per-bar book series targets are computed from (`NaN` where the bar has no book).
+#[derive(Debug, Clone, Default)]
+pub struct TargetSeries {
+    pub mids: Vec<f64>,
+    pub spreads: Vec<f64>,
+    pub microprices: Vec<f64>,
+    /// EMA of the mid over [`FAIR_VALUE_EMA_SECS`], carried across bars without a book.
+    pub fair_values: Vec<f64>,
+}
+
+impl TargetSeries {
+    /// Mid, spread, and microprice per bar plus the fair-value EMA on the grid's step.
+    pub fn from_bars(bars: &[lake::LakeBar], step_secs: u32) -> Self {
+        let read = |f: fn(&crate::lake::BookFeatures) -> f64| -> Vec<f64> {
+            bars.iter()
+                .map(|bar| bar.book.as_ref().map(f).unwrap_or(f64::NAN))
+                .collect()
+        };
+        let mids = read(|b| b.mid);
+        let window = (FAIR_VALUE_EMA_SECS / step_secs.max(1)).max(1) as f64;
+        let alpha = 2.0 / (window + 1.0);
+        let mut ema = f64::NAN;
+        let fair_values = mids
+            .iter()
+            .map(|&mid| {
+                if mid.is_finite() {
+                    ema = if ema.is_finite() {
+                        ema + alpha * (mid - ema)
+                    } else {
+                        mid
+                    };
+                    ema
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
+        Self {
+            mids,
+            spreads: read(|b| b.spread_bps),
+            microprices: read(|b| b.microprice),
+            fair_values,
+        }
+    }
+}
+
+/// The target value for acting at each bar and holding `horizon` bars: `NaN` where the window
+/// runs past the data or a bar it needs has no book.
+pub fn target_series(series: &TargetSeries, target: Target, horizon: usize) -> Vec<f64> {
+    let mids = &series.mids;
+    let n = mids.len();
+    let mut out = vec![f64::NAN; n];
+    let ret = |a: usize| -> f64 {
+        let (entry, exit) = (mids[a], mids[a + horizon]);
+        if entry.is_finite() && exit.is_finite() && entry > 0.0 {
+            (exit / entry - 1.0) * 1e4
+        } else {
+            f64::NAN
+        }
+    };
+    let residual = |a: usize, reference: &[f64]| -> f64 {
+        let (mid, fair) = (mids[a + horizon], reference[a + horizon]);
+        if mid.is_finite() && fair.is_finite() && mid > 0.0 {
+            (mid - fair) / mid * 1e4
+        } else {
+            f64::NAN
+        }
+    };
+    match target {
+        Target::Return => {
+            for a in 0..n.saturating_sub(horizon) {
+                out[a] = ret(a);
+            }
+        }
+        Target::AbsMove => {
+            for a in 0..n.saturating_sub(horizon) {
+                out[a] = ret(a).abs();
+            }
+        }
+        Target::RealizedVariance => {
+            // Prefix sums of squared bar returns, with a count of unusable bars so any gap in
+            // the window makes the whole window NaN.
+            let mut sum = vec![0.0; n + 1];
+            let mut gaps = vec![0usize; n + 1];
+            for k in 0..n {
+                let r2 =
+                    if k > 0 && mids[k].is_finite() && mids[k - 1].is_finite() && mids[k - 1] > 0.0
+                    {
+                        let r = (mids[k] / mids[k - 1] - 1.0) * 1e4;
+                        r * r
+                    } else {
+                        f64::NAN
+                    };
+                sum[k + 1] = sum[k] + if r2.is_finite() { r2 } else { 0.0 };
+                gaps[k + 1] = gaps[k] + usize::from(!r2.is_finite());
+            }
+            if horizon > 0 {
+                for a in 0..n.saturating_sub(horizon) {
+                    if gaps[a + horizon + 1] == gaps[a + 1] {
+                        out[a] = sum[a + horizon + 1] - sum[a + 1];
+                    }
+                }
+            }
+        }
+        Target::SpreadChange => {
+            for a in 0..n.saturating_sub(horizon) {
+                let (s0, s1) = (series.spreads[a], series.spreads[a + horizon]);
+                if s0.is_finite() && s1.is_finite() {
+                    out[a] = s1 - s0;
+                }
+            }
+        }
+        Target::FairValueResidual => {
+            for a in 0..n.saturating_sub(horizon) {
+                out[a] = residual(a, &series.fair_values);
+            }
+        }
+        Target::MicropriceResidual => {
+            for a in 0..n.saturating_sub(horizon) {
+                out[a] = residual(a, &series.microprices);
+            }
+        }
+    }
+    out
 }
 
 fn default_step() -> u32 {
@@ -240,6 +436,9 @@ pub fn costless_curve(
 #[derive(Debug, Clone, Serialize)]
 pub struct StudyResult {
     pub config: StudyConfig,
+    /// The target every cell was scored against (also in `config`), and its unit.
+    pub target: Target,
+    pub target_unit: String,
     pub start: NaiveDate,
     pub end: NaiveDate,
     pub symbols: Vec<SymbolCoverage>,
@@ -256,7 +455,7 @@ pub struct SymbolCoverage {
 /// One symbol's aligned feature matrix and mid-price series.
 struct SymbolSeries {
     symbol: String,
-    mids: Vec<f64>,
+    book: TargetSeries,
     features: BTreeMap<String, Vec<f64>>,
     bars: usize,
     bars_with_book: usize,
@@ -271,11 +470,11 @@ fn load_symbol(
     let sym =
         LakeSymbol::parse(symbol).with_context(|| format!("{symbol} is not EXCHANGE:SYMBOL"))?;
     let bars = lake::build_bars(&config.lake_dir, &sym, config.step_secs, start, end)?;
-    let (mids, features, bars_with_book) =
+    let (_, features, bars_with_book) =
         evaluate_features(&config.features, config.step_secs, &bars)?;
     Ok(SymbolSeries {
         symbol: symbol.to_owned(),
-        mids,
+        book: TargetSeries::from_bars(&bars, config.step_secs),
         features,
         bars: bars.len(),
         bars_with_book,
@@ -384,22 +583,19 @@ fn mean_and_se(values: &[f64]) -> (f64, f64) {
     (mean, (var / n).sqrt())
 }
 
-/// Aligned (feature, forward return in bps) pairs for one horizon and delay.
-fn pairs(feature: &[f64], mids: &[f64], horizon: usize, delay: usize) -> (Vec<f64>, Vec<f64>) {
+/// Aligned (feature, target) pairs: the feature observed at bar `i`, the target from acting
+/// `delay` bars later (see [`target_series`] for the target per acting bar).
+fn pairs(feature: &[f64], targets: &[f64], delay: usize) -> (Vec<f64>, Vec<f64>) {
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    for i in 0..feature.len() {
-        let x = feature[i];
-        let act = i + delay;
-        let Some(&entry) = mids.get(act) else { break };
-        let Some(&exit) = mids.get(act + horizon) else {
+    for (i, &x) in feature.iter().enumerate() {
+        let Some(&y) = targets.get(i + delay) else {
             break;
         };
-        if !(x.is_finite() && entry.is_finite() && exit.is_finite() && entry > 0.0) {
-            continue;
+        if x.is_finite() && y.is_finite() {
+            xs.push(x);
+            ys.push(y);
         }
-        xs.push(x);
-        ys.push((exit / entry - 1.0) * 1e4);
     }
     (xs, ys)
 }
@@ -504,18 +700,28 @@ pub fn run(
         config.symbols.len(),
         started.elapsed().as_secs()
     );
+    // The target per symbol and horizon, shared by every feature.
+    let targets: Vec<Vec<Vec<f64>>> = series
+        .par_iter()
+        .map(|s| {
+            config
+                .horizons
+                .iter()
+                .map(|&h| target_series(&s.book, config.target, h))
+                .collect()
+        })
+        .collect();
     let mut cells = Vec::new();
     let total = (series.len() + 1) * config.features.len() * config.horizons.len();
     let mut done = 0usize;
     for feature in &config.features {
-        for &horizon in &config.horizons {
+        for (hi, &horizon) in config.horizons.iter().enumerate() {
             let mut pooled_x = Vec::new();
             let mut pooled_y = Vec::new();
-            for s in &series {
+            for (s, symbol_targets) in series.iter().zip(&targets) {
                 let (xs, ys) = pairs(
                     &s.features[feature],
-                    &s.mids,
-                    horizon,
+                    &symbol_targets[hi],
                     config.decision_delay_bars,
                 );
                 if xs.len() >= 100 {
@@ -553,6 +759,8 @@ pub fn run(
     }
     let result = StudyResult {
         config: config.clone(),
+        target: config.target,
+        target_unit: config.target.unit().to_owned(),
         start,
         end,
         symbols: series
@@ -621,10 +829,19 @@ pub fn summary_table(result: &StudyResult) -> String {
     } else {
         result.symbols[0].symbol.as_str()
     };
+    let unit = result.target.unit();
+    let _ = writeln!(out, "target: {} ({unit})", result.target.name());
     let _ = writeln!(
         out,
         "{:<16} {:>8} {:>10} {:>9} {:>12} {:>8} {:>8} {:>10}",
-        "feature", "horizon", "obs", "IC", "top-bot bps", "t", "sharpe", "brkeven bp"
+        "feature",
+        "horizon",
+        "obs",
+        "IC",
+        format!("top-bot {unit}"),
+        "t",
+        "sharpe",
+        "brkeven"
     );
     for c in result.cells.iter().filter(|c| c.symbol == symbol) {
         let _ = writeln!(
@@ -658,20 +875,153 @@ mod tests {
         assert_eq!(ranks(&ties), vec![1.5, 1.5, 3.5, 3.5]);
     }
 
+    /// Feature against the forward mid return, the pre-target behaviour.
+    fn return_pairs(
+        feature: &[f64],
+        mids: &[f64],
+        horizon: usize,
+        delay: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let series = TargetSeries {
+            mids: mids.to_vec(),
+            ..TargetSeries::default()
+        };
+        pairs(
+            feature,
+            &target_series(&series, Target::Return, horizon),
+            delay,
+        )
+    }
+
     #[test]
     fn forward_returns_respect_horizon_and_delay() {
         // Mid climbs 1 bp per bar; feature is the bar index.
         let mids: Vec<f64> = (0..20).map(|i| 100.0 * (1.0 + 1e-4 * i as f64)).collect();
         let feature: Vec<f64> = (0..20).map(|i| i as f64).collect();
-        let (xs, ys) = pairs(&feature, &mids, 5, 0);
+        let (xs, ys) = return_pairs(&feature, &mids, 5, 0);
         assert_eq!(xs.len(), 15);
         assert!(
             (ys[0] - 5.0).abs() < 1e-6,
             "5 bars ahead is ~5 bps, got {}",
             ys[0]
         );
-        let (xd, _) = pairs(&feature, &mids, 5, 2);
+        let (xd, _) = return_pairs(&feature, &mids, 5, 2);
         assert_eq!(xd.len(), 13, "delay consumes bars at the end");
+    }
+
+    #[test]
+    fn every_target_computes_on_a_hand_fixture() {
+        let mids = vec![100.0, 101.0, 99.0, 102.0, 102.0, f64::NAN, 103.0];
+        let series = TargetSeries {
+            spreads: (1..=7).map(|s| s as f64).collect(),
+            microprices: mids.iter().map(|m| m - 0.5).collect(),
+            fair_values: vec![100.0; 7],
+            mids,
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        let h = 2;
+        let ret = target_series(&series, Target::Return, h);
+        assert!(close(ret[0], -100.0), "99/100 is -100 bps, got {}", ret[0]);
+        assert!(close(ret[2], (102.0 / 99.0 - 1.0) * 1e4));
+        assert!(
+            ret[3].is_nan() && ret[5].is_nan() && ret[6].is_nan(),
+            "gap or end of data"
+        );
+        let abs = target_series(&series, Target::AbsMove, h);
+        assert!(close(abs[0], 100.0) && close(abs[2], ret[2]));
+        let rv = target_series(&series, Target::RealizedVariance, h);
+        let r1 = (101.0f64 / 100.0 - 1.0) * 1e4;
+        let r2 = (99.0f64 / 101.0 - 1.0) * 1e4;
+        assert!(
+            close(rv[0], r1 * r1 + r2 * r2),
+            "bars 1 and 2, got {}",
+            rv[0]
+        );
+        assert!(rv[3].is_nan(), "a gap inside the window");
+        assert!(rv[4].is_nan() && rv[5].is_nan() && rv[6].is_nan());
+        let spread = target_series(&series, Target::SpreadChange, h);
+        assert!(close(spread[0], 2.0) && close(spread[4], 2.0));
+        let fair = target_series(&series, Target::FairValueResidual, h);
+        assert!(close(fair[0], (99.0 - 100.0) / 99.0 * 1e4));
+        let micro = target_series(&series, Target::MicropriceResidual, h);
+        assert!(close(micro[0], 0.5 / 99.0 * 1e4));
+        assert!(
+            fair[3].is_nan() && micro[3].is_nan(),
+            "no book at the horizon"
+        );
+        // Zero horizon: returns are zero, variance has no bars.
+        assert!(close(target_series(&series, Target::Return, 0)[0], 0.0));
+        assert!(target_series(&series, Target::RealizedVariance, 0)[0].is_nan());
+        // Names round-trip; unknown names list the choices.
+        for target in Target::ALL {
+            assert_eq!(Target::parse(target.name()).unwrap(), target);
+        }
+        let err = Target::parse("variance").unwrap_err();
+        assert!(format!("{err:#}").contains("realized_variance"));
+        assert_eq!(Target::RealizedVariance.unit(), "bps²");
+        assert_eq!(Target::default(), Target::Return);
+        let config: StudyConfig =
+            toml::from_str("lake_dir = \"x\"\nsymbols = [\"A:B\"]\ntarget = \"spread_change\"")
+                .unwrap();
+        assert_eq!(config.target, Target::SpreadChange);
+    }
+
+    #[test]
+    fn fair_value_ema_carries_across_gaps_and_tracks_the_mid() {
+        let bars = synthetic_grid();
+        let series = TargetSeries::from_bars(&bars, 1);
+        assert_eq!(series.fair_values.len(), bars.len());
+        let with_book: Vec<usize> = (0..bars.len())
+            .filter(|&i| bars[i].book.is_some())
+            .collect();
+        assert!(
+            series.fair_values[with_book[0]] == series.mids[with_book[0]],
+            "seeded at the first mid"
+        );
+        assert!(
+            series.fair_values[97].is_nan() && series.mids[97].is_nan(),
+            "no book, no fair value"
+        );
+        // A slow average stays inside the mid's range and lags it.
+        let last = *with_book.last().unwrap();
+        let window: Vec<f64> = with_book
+            .iter()
+            .rev()
+            .take(200)
+            .map(|&i| series.mids[i])
+            .collect();
+        let lo = window.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = window.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(series.fair_values[last] >= lo && series.fair_values[last] <= hi);
+    }
+
+    /// The done line: on the SOL-like fixture (volatility regimes that widen the spread), the
+    /// spread predicts realized variance but not the signed return.
+    #[test]
+    fn spread_predicts_realized_variance_on_the_sol_fixture() {
+        let bars = synthetic_grid();
+        let series = TargetSeries::from_bars(&bars, 1);
+        let (_, features, _) = evaluate_features(&["spread_bps".to_owned()], 1, &bars).unwrap();
+        let spread = &features["spread_bps"];
+        let (xs, ys) = pairs(
+            spread,
+            &target_series(&series, Target::RealizedVariance, 30),
+            1,
+        );
+        assert!(xs.len() > 2_000);
+        let ic = spearman(&xs, &ys);
+        assert!(
+            ic > 0.3,
+            "spread vs realized variance IC should be clearly positive, got {ic}"
+        );
+        let (xr, yr) = pairs(spread, &target_series(&series, Target::Return, 30), 1);
+        assert!(
+            spearman(&xr, &yr).abs() < 0.1,
+            "the spread says nothing about direction"
+        );
+        // The cell carries the same IC and its curves run on the target.
+        let c = cell("SOL", "spread_bps", 30, 1, 10, &xs, &ys);
+        assert!((c.ic - ic).abs() < 1e-12 && c.curves[0].curve.len() > 0);
     }
 
     /// The pre-expression feature switch, kept as the parity reference for the eight names.
@@ -713,20 +1063,25 @@ mod tests {
         let mut mid = 150.0;
         (0..3_000)
             .map(|i| {
-                mid *= 1.0 + (rand() - 0.5) * 2e-4;
+                // Volatility alternates every 300 bars, and the quoted spread widens with it,
+                // as it does on the SOL perpetuals: half a bp in the quiet regime, two in the
+                // busy one.
+                let vol = if (i / 300) % 2 == 0 { 1e-4 } else { 4e-4 };
+                mid *= 1.0 + (rand() - 0.5) * 2.0 * vol;
+                let half_spread = mid * vol * 0.25;
                 let bid_size = 1.0 + rand() * 20.0;
                 let ask_size = 1.0 + rand() * 20.0;
                 let buy = rand() * 5.0;
                 let sell = rand() * 5.0;
                 let book = (i % 97 != 0).then(|| crate::lake::BookFeatures {
-                    bid: mid - 0.01,
-                    ask: mid + 0.01,
+                    bid: mid - half_spread,
+                    ask: mid + half_spread,
                     bid_size,
                     ask_size,
                     mid,
-                    microprice: (mid - 0.01) * ask_size / (bid_size + ask_size)
-                        + (mid + 0.01) * bid_size / (bid_size + ask_size),
-                    spread_bps: 0.02 / mid * 1e4,
+                    microprice: (mid - half_spread) * ask_size / (bid_size + ask_size)
+                        + (mid + half_spread) * bid_size / (bid_size + ask_size),
+                    spread_bps: 2.0 * half_spread / mid * 1e4,
                     obi_l1: (bid_size - ask_size) / (bid_size + ask_size),
                     obi_l5: rand() - 0.5,
                     obi_l10: rand() - 0.5,
@@ -774,8 +1129,8 @@ mod tests {
                 );
             }
             for horizon in [1, 5, 30] {
-                let (xf, yf) = pairs(fresh, &mids, horizon, 1);
-                let (xl, yl) = pairs(&legacy, &mids, horizon, 1);
+                let (xf, yf) = return_pairs(fresh, &mids, horizon, 1);
+                let (xl, yl) = return_pairs(&legacy, &mids, horizon, 1);
                 assert_eq!(xf, xl);
                 assert_eq!(spearman(&xf, &yf), spearman(&xl, &yl), "{name} h{horizon}");
             }

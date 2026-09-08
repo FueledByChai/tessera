@@ -78,7 +78,7 @@ Add the series to `StudyResult` and CSV output; UI shows the curve per selected 
 Sharpe within tolerance in a unit test, a pure-noise feature yields breakeven near zero, and the
 results grid in the UI sorts by breakeven cost.
 
-### WB-03 Study targets — `todo` — Blocked by WB-01
+### WB-03 Study targets — `done 2026-09-07 WB-03: study targets` — Blocked by WB-01
 Add a `target` field: `return` (current), `realized_variance` (sum of squared mid returns over the
 horizon), `abs_move`, `spread_change`, `fair_value_residual` (mid minus a 60 s EMA, and mid minus
 microprice). IC, deciles, and the equity curve all run against the chosen target.

@@ -1481,7 +1481,10 @@ type StudyCurve = {
   curve: { observation: number; cumulative_bps: number }[];
 };
 type StudyResult = {
-  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number };
+  config: { symbols: string[]; step_secs: number; features: string[]; horizons: number[]; decision_delay_bars: number; target?: string };
+  // The forward quantity every cell is scored against and its unit (absent on older results).
+  target?: string;
+  target_unit?: string;
   start: string;
   end: string;
   symbols: { symbol: string; bars: number; bars_with_book: number }[];
@@ -1507,6 +1510,15 @@ const STUDY_FEATURES = [
   ["signed_volume", "Signed volume"],
 ] as const;
 
+const STUDY_TARGETS = [
+  ["return", "Forward return (bps)"],
+  ["realized_variance", "Realized variance (bps²)"],
+  ["abs_move", "Absolute move (bps)"],
+  ["spread_change", "Spread change (bps)"],
+  ["fair_value_residual", "Mid − 60 s EMA at horizon (bps)"],
+  ["microprice_residual", "Mid − microprice at horizon (bps)"],
+] as const;
+
 function icClass(value: number) {
   if (!Number.isFinite(value)) return "";
   if (Math.abs(value) < 0.01) return "";
@@ -1524,7 +1536,7 @@ function signed(value: number | null | undefined, digits: number) {
 }
 
 /** Cumulative costless P&L of one cell's rule: clipped z-score or sign position, no costs. */
-function StudyCurveChart({ cell, variant }: { cell: StudyCell; variant: string }) {
+function StudyCurveChart({ cell, variant, unit }: { cell: StudyCell; variant: string; unit: string }) {
   const curve = cell.curves?.find((c) => c.variant === variant) ?? cell.curves?.[0];
   if (!curve || !curve.curve.length) {
     return <div className="empty-state">This study predates costless curves; run it again to see one.</div>;
@@ -1543,10 +1555,10 @@ function StudyCurveChart({ cell, variant }: { cell: StudyCell; variant: string }
         <strong>{curve.variant === "sign" ? "position = sign(z)" : "position = clip(z, ±3)"}</strong>
         <span>Sharpe {formatNumber(finite(curve.sharpe), 2)}</span>
         <span>turnover {formatNumber(finite(curve.turnover), 3)}/bar</span>
-        <span className={classFor(finite(curve.breakeven_bps) ?? undefined)}>breakeven {signed(curve.breakeven_bps, 4)} bps</span>
-        <span className={classFor(finite(curve.final_bps) ?? undefined)}>total {signed(curve.final_bps, 1)} bps</span>
+        <span className={classFor(finite(curve.breakeven_bps) ?? undefined)}>breakeven {signed(curve.breakeven_bps, 4)} {unit}</span>
+        <span className={classFor(finite(curve.final_bps) ?? undefined)}>total {signed(curve.final_bps, 1)} {unit}</span>
       </div>
-      <svg viewBox="0 0 800 240" role="img" aria-label="Cumulative costless P&L in basis points">
+      <svg viewBox="0 0 800 240" role="img" aria-label={`Cumulative costless P&L in ${unit}`}>
         {[34, 77, 120, 163, 206].map((gy) => (
           <g key={gy}>
             <line x1="32" y1={gy} x2="768" y2={gy} className="chart-grid" />
@@ -1580,6 +1592,7 @@ function StudiesWorkspace() {
   const [step, setStep] = useState(1);
   const [horizons, setHorizons] = useState("1,5,30,60");
   const [delay, setDelay] = useState(1);
+  const [target, setTarget] = useState("return");
   const [scope, setScope] = useState("ALL");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1617,6 +1630,7 @@ function StudiesWorkspace() {
   const minDate = instruments.reduce((m, i) => (m && m < i.first_date ? m : i.first_date), "");
   const maxDate = instruments.reduce((m, i) => (m > i.last_date ? m : i.last_date), "");
   const result = detail?.result ?? null;
+  const unit = result?.target_unit ?? "bps";
   const symbolsInResult = result ? Array.from(new Set(result.cells.map((c) => c.symbol))) : [];
   const scopeSymbol = symbolsInResult.includes(scope) ? scope : symbolsInResult.includes("ALL") ? "ALL" : symbolsInResult[0];
   const cells = result ? result.cells.filter((c) => c.symbol === scopeSymbol) : [];
@@ -1663,6 +1677,7 @@ function StudiesWorkspace() {
           features: allFeatures,
           horizons: horizons.split(",").map((h) => Number(h.trim())).filter((h) => h > 0),
           decision_delay_bars: delay,
+          target,
         }),
       });
       const body = await response.json();
@@ -1714,6 +1729,13 @@ function StudiesWorkspace() {
                 Decision delay (bars)
                 <input type="number" min="0" max="60" value={delay} onChange={(e) => setDelay(Math.max(0, Math.round(Number(e.target.value))))} />
                 <small>bars between seeing the book and acting</small>
+              </label>
+              <label>
+                Target
+                <select value={target} onChange={(e) => setTarget(e.target.value)}>
+                  {STUDY_TARGETS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+                </select>
+                <small>what every feature is scored against over the horizon</small>
               </label>
             </div>
             <div className="study-pick-grid">
@@ -1816,7 +1838,7 @@ function StudiesWorkspace() {
             <>
               <div className="sweep-summary-strip">
                 <strong>{detail.study.name}</strong>
-                <span>{result.start} → {result.end} · {result.config.step_secs}s grid · delay {result.config.decision_delay_bars} bar</span>
+                <span>{result.start} → {result.end} · {result.config.step_secs}s grid · delay {result.config.decision_delay_bars} bar · target {result.target ?? result.config.target ?? "return"} ({unit})</span>
                 <span>{result.symbols.map((s) => `${s.symbol} ${s.bars_with_book.toLocaleString()} bars`).join(" · ")}</span>
               </div>
               <div className="table-wrap sweep-heatmap"><table>
@@ -1840,7 +1862,7 @@ function StudiesWorkspace() {
                   </tr>
                 ))}</tbody>
               </table></div>
-              <p className="footnote">Cell: Spearman IC, then top-minus-bottom decile forward return in bps and the breakeven cost (bps per unit traded) of the clipped z-score rule. Hover for t-stat, observations, Sharpe, and turnover; click a cell to select it below.</p>
+              <p className="footnote">Cell: Spearman IC against the target, then top-minus-bottom decile target mean ({unit}) and the breakeven cost ({unit} per unit traded) of the clipped z-score rule. Hover for t-stat, observations, Sharpe, and turnover; click a cell to select it below.</p>
               <div className="terminal-panel-title">
                 <span>DEC</span> DECILES
                 <select value={bucketCell?.feature ?? ""} onChange={(e) => setBucketFeature(e.target.value)}>
@@ -1852,7 +1874,7 @@ function StudiesWorkspace() {
               </div>
               {bucketCell && (
                 <div className="table-wrap"><table>
-                  <thead><tr><th>Decile</th><th>Feature mean</th><th>Forward (bps)</th><th>Count</th></tr></thead>
+                  <thead><tr><th>Decile</th><th>Feature mean</th><th>Target ({unit})</th><th>Count</th></tr></thead>
                   <tbody>{bucketCell.buckets.map((b) => (
                     <tr key={b.bucket}>
                       <td>{b.bucket}</td>
@@ -1870,13 +1892,13 @@ function StudiesWorkspace() {
                   <option value="sign">position: sign</option>
                 </select>
               </div>
-              {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} />}
+              {bucketCell && <StudyCurveChart cell={bucketCell} variant={curveVariant} unit={unit} />}
               <p className="footnote">Position from the feature at every bar, paid the forward return over the horizon, zero costs. Breakeven is the cost per unit traded that would zero the mean P&L.</p>
               <div className="terminal-panel-title"><span>RNK</span> CELLS BY BREAKEVEN COST</div>
               {ranked.length ? (
                 <>
                   <div className="table-wrap"><table className="ranked-cells">
-                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven (bps)</th><th>Sign breakeven</th></tr></thead>
+                    <thead><tr><th>Feature</th><th>Horizon</th><th>IC</th><th>Sharpe</th><th>Turnover</th><th>Breakeven ({unit})</th><th>Sign breakeven</th></tr></thead>
                     <tbody>{(showAllRanked ? ranked : ranked.slice(0, RANK_CAP)).map((c) => (
                       <tr
                         key={`${c.feature}-${c.horizon_bars}`}

@@ -106,6 +106,7 @@ step_secs = 1                       # sampling grid; horizons and delay are in b
 features = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "return_1"]
 horizons = [1, 5, 30, 60]
 decision_delay_bars = 1             # bars between observing the book and acting
+target = "return"                   # what features are scored against (see below)
 ```
 
 Features are expressions: a base series, then any number of streaming transforms joined by `|`.
@@ -127,8 +128,18 @@ second), `ratio_to <transform>` (the value over a transform of itself), `pct_ran
 and a `NaN` inside a window propagates, so a lag is always a lag in bars. Unknown names fail with
 the list of what exists. The grammar lives in `src/feature_expr.rs`.
 
+`target` chooses what every feature is scored against over the horizon: `return` (mid return
+from acting to the horizon, bps, the default), `realized_variance` (sum of squared bar-to-bar
+mid returns over the horizon, bps²), `abs_move` (absolute return, bps), `spread_change` (quoted
+spread at the horizon minus the spread when acting, bps), `fair_value_residual` (mid minus its
+60-second EMA at the horizon, in bps of mid), and `microprice_residual` (mid minus microprice at
+the horizon, bps of mid). IC, deciles, and the costless curve all run on the chosen target, so a
+spread feature studied against `realized_variance` asks whether wide quotes precede busy
+prints, and `fair_value_residual` asks whether a feature predicts the price sitting away from a
+slow fair value once the horizon has passed.
+
 The study reports, per symbol and pooled, the Spearman rank correlation between the feature and the
-forward mid-price return (the information coefficient), decile mean forward returns in basis
+forward target (the information coefficient), decile mean forward returns in basis
 points, and a t-statistic for top-minus-bottom decile. Each cell also carries a costless curve:
 the position is the feature's z-score clipped to +-3 (and a `sign` variant), the P&L per bar is
 that position times the forward return with no costs. From it come an annualized Sharpe (one

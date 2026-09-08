@@ -4237,6 +4237,10 @@ struct CreateStudyRequest {
     horizons: Vec<usize>,
     #[serde(default)]
     decision_delay_bars: usize,
+    /// `return` (default), `realized_variance`, `abs_move`, `spread_change`,
+    /// `fair_value_residual`, or `microprice_residual`.
+    #[serde(default)]
+    target: Option<String>,
 }
 
 fn default_study_step() -> u32 {
@@ -4384,6 +4388,10 @@ fn validate_study_request(
         },
         decision_delay_bars: request.decision_delay_bars,
         buckets: 10,
+        target: match request.target.as_deref().map(str::trim) {
+            Some(text) if !text.is_empty() => tessera::study::Target::parse(text)?,
+            _ => tessera::study::Target::default(),
+        },
     };
     for feature in &config.features {
         tessera::feature_expr::parse(feature)
