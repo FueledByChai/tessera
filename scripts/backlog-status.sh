@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Ticket state derived from git (HK-05). A ticket is done when a commit whose subject starts
-# with its id (`HK-01: ...`) is reachable from the ref, main by default; BACKLOG.md carries only
-# the claims: no state (or `todo`), `doing` while someone works it, `blocked <reason>`.
+# with its id (`HK-01: ...`) is reachable from the ref, the default branch by default; the
+# backlog file carries only the claims: no state (or `todo`), `doing` while someone works it,
+# `blocked <reason>`. The default branch and the backlog path come from .loop.toml through
+# scripts/loop-config.sh (HK-14).
 #
 #   scripts/backlog-status.sh                 every ticket: id, state, date, sha, blockers, title
 #   scripts/backlog-status.sh --next          the id of the first todo whose blockers are done
 #                                             (exit 1 when there is none)
-#   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default main)
-#   scripts/backlog-status.sh --backlog <f>   another backlog file (default BACKLOG.md)
+#   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default: the
+#                                             default branch)
+#   scripts/backlog-status.sh --backlog <f>   another backlog file (default: the configured one)
 #   scripts/backlog-status.sh --local         do not ask origin for ticket/<id> claim branches
 #   scripts/backlog-status.sh --self-test     a fixture repo: a `doing` ticket with a landed
 #                                             commit reports as done, blockers gate --next, a
@@ -20,8 +23,8 @@
 # it in another checkout, and --next passes over it (HK-09).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REF=main
-BACKLOG="$ROOT/BACKLOG.md"
+REF="$("$ROOT/scripts/loop-config.sh" default_branch)"
+BACKLOG="$ROOT/$("$ROOT/scripts/loop-config.sh" backlog)"
 MODE=table
 LOCAL=0
 while [ $# -gt 0 ]; do
@@ -105,7 +108,7 @@ status() {
 }
 
 self_test() {
-  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tessera-backlog-status.XXXXXX")"
+  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/backlog-status.XXXXXX")"
   trap 'rm -rf "$SELF_TEST_DIR"' EXIT
   local dir="$SELF_TEST_DIR"
   (

@@ -51,7 +51,9 @@ hand-written CI steps to keep in sync.
   branch on origin is `ticket/<id>`: `scripts/open-ticket-pr.sh <id> --claim` pushes it as the
   claim before work starts (`backlog-status.sh --next` passes over claimed ids), and
   `scripts/open-ticket-pr.sh <id>` pushes the commit and opens the pull request the owner
-  merges. Never force-push.
+  merges. Never force-push. The loop scripts take the default branch, the backlog path, the
+  check commands, the review paths, and the trailer rule from `.loop.toml`
+  (`scripts/loop-config.sh --all`), not from their own bodies.
 - Prefer an isolated worktree per ticket. Never rewrite history on `main`. From a worktree,
   `scripts/check.sh` finds the main checkout through the shared git dir, the private checkout
   beside it (`TESSERA_PRIVATE_ROOT` overrides), writes `local.toml` from the main one with its

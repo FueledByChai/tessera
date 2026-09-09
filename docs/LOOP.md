@@ -32,6 +32,15 @@ How development and research run without a person in the middle of every step. T
   report and whose checks are the CI jobs. Merges are gated by CI (see "Merging" below), so a
   green PR lands on its own; the owner pulls `main` fast-forward and rebuilds; several agents
   can hold several tickets at once as long as their `Blocked by` lines allow it.
+- `.loop.toml`: the loop's settings, one flat `[loop]` table read through
+  `scripts/loop-config.sh <key>` (`--all` prints the effective values). `default_branch`,
+  `backlog`, `check`, `check_fast`, `review_paths`, and `trailer_required` are everything the
+  three loop scripts know about this project; a missing file or key falls back to a default
+  (`main`, `BACKLOG.md`, `scripts/check.sh`, the check itself, no review paths, trailer
+  required). Another project adopts the loop by copying the scripts and writing its own file;
+  TOML is only the format and says nothing about the project's language. Each script has a
+  `--self-test` that `scripts/check.sh` runs; `open-ticket-pr.sh --self-test` drives the claim,
+  the trailer rule, and the review-path policy against a stub `gh` in a fixture repository.
 
 ## Merging
 
@@ -47,10 +56,12 @@ that give the same guarantee are:
   one PR at a time. `scripts/open-ticket-pr.sh <id> --update` does the rebase on GitHub.
 - Repository settings: auto-merge allowed, head branches deleted after a merge, merge commits
   and squash merges off.
-- The policy in `scripts/open-ticket-pr.sh`: a PR that leaves `examples/expected` untouched is
+- The policy in `scripts/open-ticket-pr.sh`: a PR that leaves the review paths untouched is
   set to auto-merge (rebase) when it is opened, so it lands as soon as both jobs pass on an
-  up-to-date branch. A PR that refreshes the parity baseline is labelled `needs-review` and
-  waits for the owner, because it is the one kind of change the checks cannot judge.
+  up-to-date branch. A PR that touches one (`review_paths` in `.loop.toml`; here
+  `examples/expected/`, the parity baseline) is labelled `needs-review` and waits for the
+  owner, because it is the one kind of change the checks cannot judge. The script also refuses
+  to open a PR for a commit without the agent trailer while `trailer_required` is on.
 - What the parity step buys: two PRs can each pass CI and merge cleanly while together changing
   engine results; the up-to-date rule makes the second one rerun the examples on top of the
   first, where the baseline comparison catches it.

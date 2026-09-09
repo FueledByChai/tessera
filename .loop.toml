@@ -1,0 +1,14 @@
+# Settings for the ticket loop (HK-14), read by scripts/loop-config.sh for
+# scripts/backlog-status.sh, scripts/open-ticket-pr.sh, and scripts/release-notes.sh. One flat
+# table; strings double-quoted, arrays on one line. `scripts/loop-config.sh --all` shows the
+# effective values, defaults included. TOML is only the config format: nothing here depends on
+# the project's language.
+[loop]
+default_branch = "main"
+backlog = "BACKLOG.md"
+check = "scripts/check.sh"
+check_fast = "scripts/check.sh --no-web"
+# A change under these paths is a parity-baseline refresh, the one kind of change the checks
+# cannot judge: the PR is labelled needs-review and waits for the owner instead of auto-merging.
+review_paths = ["examples/expected/"]
+trailer_required = true
