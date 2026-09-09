@@ -74,8 +74,20 @@ export async function serveDist(dir, apiOrigin, override = () => null) {
   return { server, url: `http://127.0.0.1:${server.address().port}/` };
 }
 
-/** A Playwright-compatible Chromium: playwright or patchright from web/ or the repo root, or the CodeGPT VS Code extension's bundled copy. */
-export function resolveChromium() {
+/** Launch options shared by the checks: the full Chromium build in new headless mode, since the separate headless shell is often absent. */
+export const LAUNCH = {
+  headless: true,
+  channel: "chromium",
+  args: ["--no-sandbox", "--disable-dev-shm-usage"],
+};
+
+/**
+ * A Playwright-compatible Chromium that actually starts: playwright or patchright from web/ or
+ * the repo root, or the CodeGPT VS Code extension's bundled copy. Each candidate is proven with
+ * a launch, so a playwright whose browsers were never downloaded (`npm ci` without
+ * `npx playwright install chromium`) is passed over rather than failing the check.
+ */
+export async function resolveChromium() {
   const roots = [process.cwd() + "/", join(process.cwd(), "web") + "/"];
   for (const base of [join(homedir(), ".vscode/extensions"), join(homedir(), ".vscode-server/extensions")]) {
     if (!existsSync(base)) continue;
@@ -84,17 +96,27 @@ export function resolveChromium() {
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     if (dirs.length) roots.push(join(base, dirs[dirs.length - 1], "standalone") + "/");
   }
+  const tried = [];
   for (const root of roots) {
     for (const name of ["playwright", "patchright"]) {
+      let chromium;
       try {
         const mod = createRequire(root)(name);
-        const chromium = mod?.chromium ?? mod?.default?.chromium;
-        if (chromium) return { chromium, from: `${name} (${root})` };
+        chromium = mod?.chromium ?? mod?.default?.chromium;
       } catch {
-        /* try the next candidate */
+        continue; // not installed here
+      }
+      if (!chromium) continue;
+      try {
+        const probe = await chromium.launch(LAUNCH);
+        await probe.close();
+        return { chromium, from: `${name} (${root})` };
+      } catch (error) {
+        tried.push(`${name} (${root}): ${String(error).split("\n")[0]}`);
       }
     }
   }
+  if (tried.length) console.log(`headless: no candidate Chromium could start:\n  ${tried.join("\n  ")}`);
   return null;
 }
 
@@ -117,9 +139,3 @@ export async function reachable(target) {
   }
 }
 
-/** Launch options shared by the checks: the full Chromium build in new headless mode, since the separate headless shell is often absent. */
-export const LAUNCH = {
-  headless: true,
-  channel: "chromium",
-  args: ["--no-sandbox", "--disable-dev-shm-usage"],
-};

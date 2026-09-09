@@ -14,7 +14,9 @@
 // stylesheet with real runs, strategies, and studies. Needs a Playwright-compatible Chromium:
 // `playwright` or `patchright` resolvable from web/, or the CodeGPT VS Code extension's bundled
 // copy. Without one, without a built bundle, or without a reachable console, the check reports
-// that it skipped and exits 0; the theme check's static rules still apply there.
+// that it skipped and exits 0; the theme check's static rules still apply there. A page the
+// console cannot supply (no runs for the run overview, no strategies for the strategy page) is
+// listed as skipped and the remaining pages are measured (HK-08); the studies page always is.
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -68,6 +70,30 @@ function measure() {
   };
 }
 
+/** What the console has to offer, so pages it cannot supply are skipped rather than failed. */
+async function supply(origin) {
+  const count = async (path, pick) => {
+    try {
+      const response = await fetch(new URL(path, origin), { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return 0;
+      return pick(await response.json()).length;
+    } catch {
+      return 0;
+    }
+  };
+  return {
+    runs: await count("/api/runs", (body) => (Array.isArray(body) ? body : [])),
+    strategies: await count("/api/dashboard", (body) => body?.strategies ?? []),
+  };
+}
+
+/** The reason a page cannot be opened on this console, or null when it can. */
+const NEEDS = {
+  "run overview": (s) => (s.runs ? null : "the console has no runs"),
+  "strategy page": (s) => (s.strategies ? null : "the console has no strategies"),
+  studies: () => null,
+};
+
 /** The three pages, reached by clicking, since the console has no routes. */
 const PAGES = {
   "run overview": async (page) => {
@@ -97,7 +123,7 @@ const PAGES = {
   },
 };
 
-const runtime = resolveChromium();
+const runtime = await resolveChromium();
 if (!runtime) {
   console.log("layout-check: skipped (no playwright or patchright Chromium found)");
   process.exit(0);
@@ -113,9 +139,17 @@ if (!servedUrl && !existsSync(join(distDir, "index.html"))) {
 }
 if (!servedUrl) served = await serveDist(distDir, consoleOrigin);
 const url = servedUrl ?? served.url;
+const supplied = await supply(servedUrl ?? consoleOrigin);
+const skipped = new Map();
+for (const [name, needs] of Object.entries(NEEDS)) {
+  const reason = needs(supplied);
+  if (reason) skipped.set(name, reason);
+}
+for (const [name, reason] of skipped) console.log(`layout-check: ${name} skipped (${reason})`);
 
 const browser = await runtime.chromium.launch(LAUNCH);
 const failures = [];
+let measured = 0;
 try {
   for (const mode of ["terminal", "modern"]) {
     for (const width of WIDTHS) {
@@ -123,6 +157,7 @@ try {
       await context.addInitScript((m) => window.localStorage.setItem("bt-display-mode", m), mode);
       const page = await context.newPage();
       for (const [name, open] of Object.entries(PAGES)) {
+        if (skipped.has(name)) continue;
         await page.goto(url, { waitUntil: "domcontentloaded" });
         await page.locator(".app-shell").waitFor({ timeout: 15000 });
         try {
@@ -133,6 +168,7 @@ try {
         }
         await page.waitForTimeout(400);
         const result = await page.evaluate(measure);
+        measured += 1;
         const label = `${mode} ${width}px ${name}`;
         const wide = result.scrollWidth > result.innerWidth;
         const notes = [...result.offenders.map((o) => `past the viewport: ${o}`), ...result.clipped.map((c) => `cut off in its wrapper: ${c}`)];
@@ -155,6 +191,7 @@ if (failures.length) {
   for (const f of failures) console.error(`  ${f}`);
   process.exit(1);
 }
+const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${Object.keys(PAGES).length} pages, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );

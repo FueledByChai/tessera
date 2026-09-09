@@ -35,7 +35,7 @@ const CHARTS = {
   "daily IC": ".daily-ic-strip svg",
 };
 
-const runtime = resolveChromium();
+const runtime = await resolveChromium();
 if (!runtime) {
   console.log("chart-check: skipped (no playwright or patchright Chromium found)");
   process.exit(0);

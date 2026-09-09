@@ -218,7 +218,7 @@ install its Chromium in the workflow, and run the check against the built bundle
 bundled example data (a scratch `TESSERA_ROOT` with `examples/`, one run, one study fixture).
 **Done when:** the CI job logs `layout-check: ok` and a deliberate bare-`fr` regression fails it.
 
-### HK-08 Layout check skips pages the console cannot supply — `todo`
+### HK-08 Layout check skips pages the console cannot supply
 `web/scripts/layout-check.mjs` reports eight "could not open" failures when the console on 8787
 has no runs or strategies (a scratch instance on an empty catalog, seen during WB-09), so a
 check run beside a scratch service fails for reasons unrelated to the layout. Pages the console

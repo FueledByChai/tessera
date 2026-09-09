@@ -7,6 +7,10 @@
 # second port keeps it clear of the real console on 8787.
 #
 #   scripts/scratch-console.sh start [--port 8787]    build the root, start, seed, wait
+#   scripts/scratch-console.sh start --empty [--port N]
+#                                                     an empty catalog instead: no engine link, so
+#                                                     no strategies sync, and nothing seeded (the
+#                                                     layout check's skip path, HK-08)
 #   scripts/scratch-console.sh stop  [--port 8787]    stop it and remove the root
 #   scripts/scratch-console.sh url   [--port 8787]    print the console origin
 #
@@ -14,11 +18,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT=8787
+EMPTY=0
 COMMAND="${1:-}"
 shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="$2"; shift ;;
+    --empty) EMPTY=1 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
@@ -59,7 +65,9 @@ case "$COMMAND" in
     fi
     rm -rf "$SCRATCH"
     mkdir -p "$SCRATCH/data/ui" "$SCRATCH/artifacts"
-    for link in examples src target web; do ln -s "$ROOT/$link" "$SCRATCH/$link"; done
+    links="examples src target web"
+    [ "$EMPTY" = 1 ] && links="examples src web"
+    for link in $links; do ln -s "$ROOT/$link" "$SCRATCH/$link"; done
     (
       cd "$SCRATCH"
       TESSERA_ROOT="$SCRATCH" TESSERA_ADDR="127.0.0.1:$PORT" nohup "$ROOT/target/release/tessera-ui" > "$SCRATCH/api.log" 2>&1 &
@@ -68,6 +76,10 @@ case "$COMMAND" in
     for _ in $(seq 1 60); do curl -sf "$API/health" >/dev/null 2>&1 && break; sleep 1; done
     curl -sf "$API/health" >/dev/null || { echo "scratch console: did not come up; log:" >&2; cat "$SCRATCH/api.log" >&2; exit 1; }
     echo "scratch console: up on $ORIGIN (pid $(cat "$SCRATCH/api.pid"), root $SCRATCH)"
+    if [ "$EMPTY" = 1 ]; then
+      echo "scratch console: empty catalog (no strategies, no runs, no studies); LAYOUT_CONSOLE=$ORIGIN/"
+      exit 0
+    fi
     # The service syncs the compiled strategies into its catalog in the background after it
     # starts answering; a job for one is refused until that has happened.
     wait_for /dashboard "any(s['id'] == 'moving_average_cross' for s in d['strategies'])" "the strategy catalog"
