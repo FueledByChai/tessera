@@ -91,6 +91,42 @@ noreply address, so it does not bite. Commits from another identity would.
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.
 
+## What CI does not run, and why there is no self-hosted runner
+
+The public runner runs `scripts/check.sh --quick` and `--web-only`. It cannot run the private
+checks (the legacy crate built against this engine, the private strategy tests) or the layout
+check against real data, because the private checkout and the market data are not on GitHub.
+HK-12 asked whether a self-hosted runner on the Mac mini should close that gap. Decision,
+2026-09-09: **no runner**, for these reasons.
+
+- The runner would sit on the machine that holds the market data and the private checkout.
+  On a public repository a workflow can be made to run on a self-hosted runner from a fork
+  pull request, and GitHub's own guidance is not to use self-hosted runners with public
+  repositories for that reason. Gating on `pull_request.head.repo.full_name` and requiring
+  approval for outside collaborators narrows the exposure; it does not remove it, and one
+  mistake in a workflow edit (an `if:` dropped, a `pull_request_target` trigger) opens the
+  machine to whoever opens a PR.
+- The gap it would close is already covered at the point where it matters. Every ticket runs
+  the full `scripts/check.sh`, private checks included, in the worktree before its commit is
+  pushed; the ruleset then reruns the public part on the exact result that lands. The runner
+  would turn that convention into enforcement, and that is all it would add.
+- What enforcement would buy is small today: one owner, agents that run from this machine, no
+  outside contributors. It becomes worth revisiting when PRs arrive from checkouts that do not
+  have the private repo beside them, or from people who are not the owner.
+
+What covers the gap instead:
+
+- Before the PR: `scripts/check.sh` in the worktree (the `/next-ticket` prompt requires it, and
+  its report says so). A PR whose author skipped the private checks is the review question.
+- After the merge: HK-18 adds the private checks to `scripts/deploy-local.sh`, so the deploy
+  loop refuses to restart the service on a `main` whose private crate no longer builds and
+  writes the failure to `data/ui/deploy.log`. That catches the case the ruleset cannot, on the
+  machine that has the data, without exposing it to anyone.
+
+Revisit HK-12 when either condition above changes; the ticket text keeps the security settings
+a runner would need (skip fork PRs, require approval for outside collaborators, keep the private
+checkout and data out of logs).
+
 ## The development loop
 
 One ticket:
