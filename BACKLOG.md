@@ -252,7 +252,7 @@ the settings in `docs/LOOP.md`.
 parity is blocked from merging while one that passes merges through the queue, both recorded in
 LOOP.md with the commands used.
 
-### HK-11 Local deploy loop — `todo`
+### HK-11 Local deploy loop
 After a merge nobody rebuilds and restarts the console on the Mac mini. `scripts/deploy-local.sh`
 pulls `main` fast-forward, rebuilds the engine and the bundle when the tree changed, and restarts
 the service only when no job or study is `running` (the pid in `data/ui/api.pid`, verified
