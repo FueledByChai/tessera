@@ -281,3 +281,64 @@ them in a non-synced directory such as `~/Library/Caches/tessera/web-node_module
 `web/node_modules` as a symlink to it, for the main checkout and every worktree.
 **Done when:** after `npm ci`, `web/node_modules` is a symlink into a directory outside iCloud,
 `ls -lO` finds no dataless file under it, and `scripts/check.sh --resolve` reports where it lives.
+
+### HK-14 Loop settings live in `.loop.toml`, not in the scripts
+The loop scripts carry Tessera in their bodies: `scripts/open-ticket-pr.sh` hard-codes
+`origin/main` and the parity path `examples/expected/` as the one change that forces a human
+review, and the prompts name `scripts/check.sh --no-web` and Tessera's data rules. Another
+project cannot adopt the loop without editing every file. Add a flat `.loop.toml` at the repo
+root (TOML is only the config format; it says nothing about the project's language) with a
+single `[loop]` table: `default_branch`, `backlog` (path of the ticket file), `check` (the full
+check command), `check_fast` (the command to run while iterating), `review_paths` (globs whose
+change turns off auto-merge), and `trailer_required` (whether commits must carry a
+`Co-Authored-By` trailer naming the agent that did the work). A small reader,
+`scripts/loop-config.sh <key>`, prints one value with the defaults that reproduce today's
+behaviour when the file or key is missing, and `backlog-status.sh`, `open-ticket-pr.sh`, and
+`release-notes.sh` read every project-specific value through it.
+**Done when:** `scripts/loop-config.sh --self-test` covers a missing file, a missing key, and
+each key set; `open-ticket-pr.sh` labels a branch `needs-review` when a configured
+`review_paths` glob matches and not otherwise (proved in a fixture repo the self-test builds);
+`grep -n 'examples/expected\|origin/main' scripts/open-ticket-pr.sh scripts/backlog-status.sh
+scripts/release-notes.sh` finds only comments.
+
+### HK-15 Instructions and prompts any coding agent can read — Blocked by HK-14
+`CLAUDE.md` and `.claude/commands/*.md` are read by Claude Code alone; Codex, OpenCode, and the
+other harnesses read `AGENTS.md` and have no slash commands. Move the standing instructions to
+`AGENTS.md` and leave `CLAUDE.md` as one line that points at it. Move the prompt bodies to
+`loop/prompts/next-ticket.md` and `loop/prompts/grill-me.md`, written against the `.loop.toml`
+contract only (run the fast check while iterating, the full check before committing, sign with
+the trailer the config requires) and free of project names, build tools, and harness tool
+names (`AskUserQuestion` becomes "ask the owner, four questions at a time, in whatever way
+the harness offers"). The `.claude/commands/*.md` files become two-line wrappers that say to
+read and follow the prompt file with the arguments given. Project-specific rules (data, UI
+conventions, docs to keep current) stay in `AGENTS.md` under a "Project rules" heading the
+prompts refer to by name.
+**Done when:** `scripts/check.sh` gains a step that fails if `loop/` or `.loop.toml` mentions
+`tessera`, `cargo`, `npm`, `Claude`, or `examples/expected` (case-insensitive); `CLAUDE.md` is
+a single pointer line; both wrappers under `.claude/commands/` are under five lines; and a
+`/next-ticket` run from this checkout still claims, works, and opens a PR for a ticket.
+
+### HK-16 The loop kit is its own repository — Blocked by HK-15
+Once the scripts and prompts are generic they belong in one place every project pulls from.
+Create a public repository (working name `loop-kit`; the owner picks the final name) holding
+`scripts/backlog-status.sh`, `scripts/open-ticket-pr.sh`, `scripts/release-notes.sh`,
+`scripts/loop-config.sh`, `loop/prompts/*.md`, an `AGENTS.md` template with the loop section
+and an empty "Project rules" heading, a `.loop.toml` example, the CI workflow skeleton
+(one job per configured check command, job names used as the required status checks), the
+branch-ruleset JSON from `docs/LOOP.md`, and an `install.sh` that copies those files into a
+target checkout and prints what the project still has to supply: `scripts/check.sh` and,
+optionally, a deploy script. GitHub is the only hosting assumption (`gh`, rulesets,
+auto-merge); say so in its README. Tessera consumes the kit through `scripts/loop-kit-sync.sh`,
+which copies the kit's files in and diffs them, so the kit stays the source of truth.
+**Done when:** in a fresh `git init` repo containing only a stub `scripts/check.sh`, `install.sh`
+followed by `scripts/backlog-status.sh --self-test`, `scripts/release-notes.sh --self-test`,
+and `scripts/loop-config.sh --self-test` all pass; and in this checkout
+`scripts/loop-kit-sync.sh --check` reports no difference from the kit's tagged release.
+
+### HK-17 CI installs Playwright's browser without depending on the apt mirror
+PR #6's web job failed in 24 s with `Failed to install browsers` after an apt index hash
+mismatch inside `npx playwright install --with-deps chromium`; the change was docs only, and a
+rerun is the only remedy. Cache the browser under `~/.cache/ms-playwright` keyed on the
+Playwright version in `web/package-lock.json`, and retry the install once before failing.
+**Done when:** the workflow shows a cache step for the browser and a retry around the install,
+and two consecutive CI runs on the same lock file show the second restoring the cache.
