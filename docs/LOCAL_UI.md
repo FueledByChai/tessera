@@ -92,6 +92,6 @@ npm run dev
 `npm run build` writes the production bundle to `web/dist` (git-ignored), which the Rust service
 serves; the launcher runs it when the bundle is missing or older than the source.
 
-If the checkout lives in an iCloud-synced folder (Documents, Desktop), keep `web/node_modules` outside it: macOS evicts large files and Node tools stall for minutes while they re-download. The launcher creates `web/node_modules` as a symlink to `~/Library/Caches/Tessera/web-node_modules` for that reason; do the same by hand if you install with `npm ci` directly.
+Keep the checkout out of iCloud-synced and macOS-guarded folders (Documents, Desktop); on the Mac mini it lives at `~/Code/Tessera`. If a checkout must live in such a folder, keep `web/node_modules` outside it: macOS evicts large files and Node tools stall for minutes while they re-download. The launcher creates `web/node_modules` as a symlink to `~/Library/Caches/Tessera/web-node_modules` for that reason; do the same by hand if you install with `npm ci` directly.
 
 The service health check is `http://127.0.0.1:8787/api/health`. Runtime logs for the double-click launcher are written under `data/ui/logs/`.
