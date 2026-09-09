@@ -22,9 +22,65 @@ How development and research run without a person in the middle of every step. T
 - `scripts/open-ticket-pr.sh`: the hand-off. `--claim` pushes `ticket/<id>` to origin before
   work starts, so a second agent's `backlog-status.sh --next` passes over the ticket; after the
   commit the plain form pushes the branch and opens the pull request whose body is the ticket
-  report and whose checks are the CI jobs. The owner merges pull requests (HK-10 gates that on
-  CI through the merge queue), pulls `main` fast-forward, and rebuilds; several agents can hold
-  several tickets at once as long as their `Blocked by` lines allow it.
+  report and whose checks are the CI jobs. Merges are gated by CI (see "Merging" below), so a
+  green PR lands on its own; the owner pulls `main` fast-forward and rebuilds; several agents
+  can hold several tickets at once as long as their `Blocked by` lines allow it.
+
+## Merging
+
+`main` accepts nothing but rebased pull requests whose CI is green on the exact result that
+lands (HK-10). GitHub's merge queue is not offered on a user-owned repository, so the rules
+that give the same guarantee are:
+
+- One ruleset on `main` (repository Settings → Rules, created with the commands below): pull
+  requests only, rebase merges only, no force-pushes, no deletion, and both CI jobs (`Engine
+  (scripts/check.sh --quick)` and `Web (scripts/check.sh --web-only with a scratch console)`)
+  required and **up to date with `main`**. After another PR merges, a branch is behind and
+  cannot merge until it is rebased and CI runs again on the rebased commit; that is the queue,
+  one PR at a time. `scripts/open-ticket-pr.sh <id> --update` does the rebase on GitHub.
+- Repository settings: auto-merge allowed, head branches deleted after a merge, merge commits
+  and squash merges off.
+- The policy in `scripts/open-ticket-pr.sh`: a PR that leaves `examples/expected` untouched is
+  set to auto-merge (rebase) when it is opened, so it lands as soon as both jobs pass on an
+  up-to-date branch. A PR that refreshes the parity baseline is labelled `needs-review` and
+  waits for the owner, because it is the one kind of change the checks cannot judge.
+- What the parity step buys: two PRs can each pass CI and merge cleanly while together changing
+  engine results; the up-to-date rule makes the second one rerun the examples on top of the
+  first, where the baseline comparison catches it.
+
+The settings, as applied:
+
+```bash
+gh api -X PATCH repos/FueledByChai/tessera -F allow_auto_merge=true -F delete_branch_on_merge=true \
+  -F allow_merge_commit=false -F allow_squash_merge=false -F allow_rebase_merge=true
+gh api -X POST repos/FueledByChai/tessera/rulesets --input ruleset.json   # the ruleset below
+gh api repos/FueledByChai/tessera/rules/branches/main                      # what is in force
+```
+
+`ruleset.json` targets `~DEFAULT_BRANCH` with `enforcement: active`, no bypass actors, and the
+rules `deletion`, `non_fast_forward`, `pull_request` (`required_approving_review_count: 0`,
+`allowed_merge_methods: ["rebase"]`), and `required_status_checks`
+(`strict_required_status_checks_policy: true`, the two job names above with `integration_id`
+15368, GitHub Actions). A `merge_queue` rule was rejected with "Invalid rule 'merge_queue'":
+the queue needs an organization-owned repository.
+
+Proof, recorded when the rules went live (ruleset 22655615, 2026-09-09):
+
+- [PR #2](https://github.com/FueledByChai/tessera/pull/2), `probe/parity-break`: `origin/main`
+  plus one trade appended to `examples/expected/rsi_mean_reversion/trades.csv`, opened with
+  `gh pr create` and `gh pr merge 2 --auto --rebase`. The engine job failed on
+  `PARITY BROKEN: rsi_mean_reversion/trades.csv differs from examples/expected`, the web job
+  passed, and `gh pr view 2 --json mergeStateStatus` stayed `BLOCKED` with auto-merge
+  requested. Closed with `gh pr close 2 --delete-branch`.
+- [PR #3](https://github.com/FueledByChai/tessera/pull/3), `probe/up-to-date-merge`:
+  `origin/main` plus an empty commit, opened the same way. Both jobs passed,
+  `mergeStateStatus` went `CLEAN`, and auto-merge landed it at 15:43:28Z (`merged_by`
+  FueledByChai, the account that requested auto-merge) with no one touching it. A manual
+  `gh pr merge 3 --rebase` a moment later was refused as already merged.
+
+One rule GitHub adds by default, `require_extra_approval_for_unattributed_changes`, asks for a
+review when a commit's author is not a GitHub account; the loop's commits use the owner's
+noreply address, so it does not bite. Commits from another identity would.
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.
 

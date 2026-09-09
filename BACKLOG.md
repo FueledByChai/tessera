@@ -240,7 +240,7 @@ installed and authenticated on this machine.
 skipped by `--next`, and a ticket worked from a worktree ends with an open PR whose body carries
 the report and whose checks are the CI jobs.
 
-### HK-10 Merges gated by CI: branch protection and the merge queue — `todo` — Blocked by HK-09
+### HK-10 Merges gated by CI: branch protection and the merge queue — Blocked by HK-09
 With several PRs open at once a merge must be tested as the result it produces, not as the
 branch on its own. Turn on branch protection for `main` (the engine and web CI jobs as required
 status checks, no direct pushes) and the GitHub merge queue, so each PR merges only after CI
