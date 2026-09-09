@@ -3,7 +3,8 @@
 # with a ticket id (`WB-02: ...`) is that ticket shipping; the notes are those commits between
 # two refs, grouped by ticket prefix under the BACKLOG.md section the ticket sits in.
 #
-#   scripts/release-notes.sh <from-ref> [<to-ref>]     Markdown notes for from..to (to: main)
+#   scripts/release-notes.sh <from-ref> [<to-ref>]     Markdown notes for from..to (to: the
+#                                                      default branch from .loop.toml)
 #   scripts/release-notes.sh --archive <tag> <from> [<to>]
 #                                                      the notes, plus: every listed ticket
 #                                                      still in BACKLOG.md moves, body and all,
@@ -16,7 +17,7 @@
 # Tag releases; the notes for a release are the diff between its tag and the previous one.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BACKLOG="$ROOT/BACKLOG.md"
+BACKLOG="$ROOT/$("$ROOT/scripts/loop-config.sh" backlog)"
 CHANGELOG="$ROOT/CHANGELOG.md"
 ARCHIVE=""
 MODE=notes
@@ -121,7 +122,7 @@ render() {
 }
 
 self_test() {
-  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tessera-release-notes.XXXXXX")"
+  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/release-notes.XXXXXX")"
   trap 'rm -rf "$SELF_TEST_DIR"' EXIT
   local dir="$SELF_TEST_DIR"
   (
@@ -194,7 +195,7 @@ case "$MODE" in
   *)
     [ "${#REFS[@]}" -ge 1 ] || { echo "usage: scripts/release-notes.sh [--archive <tag>] <from-ref> [<to-ref>]" >&2; exit 2; }
     FROM="${REFS[0]}"
-    TO="${REFS[1]:-main}"
+    TO="${REFS[1]:-$("$ROOT/scripts/loop-config.sh" default_branch)}"
     # The backlog's own repository answers; a copy outside any repository (a scratch archive)
     # is judged by this repository's history.
     REPO="$(dirname "$BACKLOG")"

@@ -321,8 +321,9 @@ the harness offers"). The `.claude/commands/*.md` files become two-line wrappers
 read and follow the prompt file with the arguments given. Project-specific rules (data, UI
 conventions, docs to keep current) stay in `AGENTS.md` under a "Project rules" heading the
 prompts refer to by name.
-**Done when:** `scripts/check.sh` gains a step that fails if `loop/` or `.loop.toml` mentions
-`tessera`, `cargo`, `npm`, `Claude`, or `examples/expected` (case-insensitive); `CLAUDE.md` is
+**Done when:** `scripts/check.sh` gains a step that fails if `loop/` mentions `tessera`,
+`cargo`, `npm`, `Claude`, or `examples/expected` (case-insensitive; `.loop.toml` is exempt,
+being this project's own values, as HK-14 found); `CLAUDE.md` is
 a single pointer line; both wrappers under `.claude/commands/` are under five lines; and a
 `/next-ticket` run from this checkout still claims, works, and opens a PR for a ticket.
 
