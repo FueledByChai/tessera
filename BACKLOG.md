@@ -225,3 +225,49 @@ check run beside a scratch service fails for reasons unrelated to the layout. Pa
 cannot supply should be listed as skipped, like a missing console, while the rest are measured.
 **Done when:** the check run against an empty catalog exits 0 with the run and strategy pages
 listed as skipped and the studies page measured.
+
+### HK-09 The loop hands off through pull requests — `todo`
+Today a ticket ends in a fast-forward merge and a service restart only the owner can do, so
+tickets run one at a time even when nothing blocks them. An agent should push a `ticket/<id>`
+branch (never `main`) and open a pull request whose body is the ticket report (id, what changed,
+how the done line is proven, what the owner should look at), and the claim on a ticket should
+be that remote branch rather than a `doing` line that only exists in a worktree:
+`scripts/backlog-status.sh --next` skips ids with a `ticket/<id>` branch on `origin`, and
+`scripts/open-ticket-pr.sh <id>` pushes the branch and opens the PR with `gh`. `CLAUDE.md` and
+`.claude/commands/next-ticket.md` change from "never push" to "never push `main`". Needs `gh`
+installed and authenticated on this machine.
+**Done when:** the status script's self-test shows a ticket with a remote `ticket/<id>` branch
+skipped by `--next`, and a ticket worked from a worktree ends with an open PR whose body carries
+the report and whose checks are the CI jobs.
+
+### HK-10 Merges gated by CI: branch protection and the merge queue — `todo` — Blocked by HK-09
+With several PRs open at once a merge must be tested as the result it produces, not as the
+branch on its own. Turn on branch protection for `main` (the engine and web CI jobs as required
+status checks, no direct pushes) and the GitHub merge queue, so each PR merges only after CI
+passes on `main` plus the PRs ahead of it; the parity step is what catches two clean merges that
+change engine results together. Auto-merge on green for PRs that leave `examples/expected`
+untouched; a PR that refreshes the parity baseline requires a review. Document the policy and
+the settings in `docs/LOOP.md`.
+**Done when:** `gh api` shows the protection and queue settings on `main`; a PR that breaks
+parity is blocked from merging while one that passes merges through the queue, both recorded in
+LOOP.md with the commands used.
+
+### HK-11 Local deploy loop — `todo`
+After a merge nobody rebuilds and restarts the console on the Mac mini. `scripts/deploy-local.sh`
+pulls `main` fast-forward, rebuilds the engine and the bundle when the tree changed, and restarts
+the service only when no job or study is `running` (the pid in `data/ui/api.pid`, verified
+against the listener), writing the new pid; a schedule (launchd, or the app's scheduled tasks)
+runs it every few minutes.
+**Done when:** with a new commit on `origin/main` the script rebuilds, restarts, and prints the
+new pid; with a running job it refuses and says why; with nothing new it exits quickly without
+touching the service; a self-test covers those decisions against a stubbed service.
+
+### HK-12 Self-hosted runner for the full check — `todo` — Blocked by HK-10
+The public runner cannot run the private checks or the layout check against real data. A
+self-hosted runner on the Mac mini could run the full `scripts/check.sh` (private checks, the
+real console) on PRs. A public repository lets fork PRs run code on the runner, so the job must
+skip fork PRs, the repository must require approval for outside collaborators, and neither market
+data nor the private checkout may reach CI logs. Decide first whether the trade-off is worth it.
+**Done when:** a `full-check` job on the self-hosted runner logs `private checks passed` on a PR
+from this repository and is skipped on a fork PR; the runner's setup and security settings are
+in `docs/LOOP.md`.
