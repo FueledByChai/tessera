@@ -7,7 +7,10 @@ name: CI
 # `scripts/check.sh --web-only`: typecheck, lint, theme check, build, and the headless layout and
 # chart checks, which need a Chromium (playwright's, a web devDependency) and a console to open
 # pages from: scripts/scratch-console.sh serves one on the bundled example data with a seeded
-# run and study, which is why the web job also builds the engine.
+# run and study, which is why the web job also builds the engine. Both jobs are required
+# status checks on main, and a pull request must be up to date with main when they pass: after
+# another PR merges, a branch is rebased (scripts/open-ticket-pr.sh <id> --update) and both jobs
+# run again on the exact result that would land (HK-10).
 
 on:
   push:

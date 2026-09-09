@@ -12,7 +12,15 @@
 #                                                   from HEAD's subject (which must start with
 #                                                   `<id>:`), body from the file or HEAD's message
 #                                                   body, plus a footer naming the checks
-#   scripts/open-ticket-pr.sh <id> --status         the PR's url, state, and checks
+#                                                   Then the merge policy (HK-10): the PR is set
+#                                                   to auto-merge (rebase) once CI is green on a
+#                                                   branch up to date with main, unless it touches
+#                                                   examples/expected (a parity baseline
+#                                                   refresh), which waits for the owner's review
+#   scripts/open-ticket-pr.sh <id> --update         rebase the PR onto main after main moved
+#                                                   (the rules want checks on the exact result),
+#                                                   so CI reruns and auto-merge can fire
+#   scripts/open-ticket-pr.sh <id> --status         the PR's url, state, merge state, and checks
 #   scripts/open-ticket-pr.sh <id> --release        delete origin/ticket/<id> after the PR merged
 #                                                   or the claim is abandoned
 #
@@ -29,6 +37,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --claim) MODE=claim ;;
     --status) MODE=status ;;
+    --update) MODE=update ;;
     --release) MODE=release ;;
     --body-file) BODY_FILE="$2"; shift ;;
     --draft) DRAFT=1 ;;
@@ -40,6 +49,23 @@ BRANCH="ticket/$ID"
 cd "$ROOT"
 
 remote_has_branch() { git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; }
+
+# The merge policy (HK-10): a green PR that is up to date with main merges on its own; a PR
+# that changes the parity baseline (examples/expected) is the one kind that waits for the
+# owner's review.
+apply_merge_policy() {
+  local url="$1"
+  if git diff --name-only "origin/main...HEAD" 2>/dev/null | grep -q '^examples/expected/'; then
+    gh pr edit "$url" --add-label "needs-review" >/dev/null 2>&1 || true
+    echo "merge policy: examples/expected changed, so this PR waits for the owner's review (no auto-merge)"
+  else
+    if gh pr merge "$url" --auto --rebase >/dev/null 2>&1; then
+      echo "merge policy: auto-merge on; it merges once CI is green on a branch up to date with main (--update after main moves)"
+    else
+      echo "merge policy: could not enable auto-merge (no rules on main?); merge it by hand when green"
+    fi
+  fi
+}
 need_gh() { command -v gh >/dev/null || { echo "gh is not installed (brew install gh && gh auth login)" >&2; exit 1; }; }
 
 case "$MODE" in
@@ -79,11 +105,17 @@ case "$MODE" in
     } >> "$body"
     args=(--base main --head "$BRANCH" --title "$subject" --body-file "$body")
     [ "$DRAFT" = 1 ] && args+=(--draft)
-    gh pr create "${args[@]}"
+    url="$(gh pr create "${args[@]}")"
+    echo "$url"
+    apply_merge_policy "$url"
+    ;;
+  update)
+    need_gh
+    gh pr update-branch "$BRANCH" --rebase && echo "rebased origin/$BRANCH onto main; CI reruns and auto-merge fires when green"
     ;;
   status)
     need_gh
-    gh pr list --head "$BRANCH" --base main --state all --json url,state,title --jq '.[] | "\(.state)\t\(.url)\t\(.title)"' | head -3
+    gh pr list --head "$BRANCH" --base main --state all --json url,state,title,mergeStateStatus,autoMergeRequest --jq '.[] | "\(.state)\t\(.mergeStateStatus)\tauto-merge \(if .autoMergeRequest then "on" else "off" end)\t\(.url)\t\(.title)"' | head -3
     gh pr checks "$BRANCH" 2>/dev/null || true
     ;;
   release)
