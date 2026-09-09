@@ -262,7 +262,7 @@ runs it every few minutes.
 new pid; with a running job it refuses and says why; with nothing new it exits quickly without
 touching the service; a self-test covers those decisions against a stubbed service.
 
-### HK-12 Self-hosted runner for the full check — `todo` — Blocked by HK-10
+### HK-12 Self-hosted runner for the full check — Blocked by HK-10
 The public runner cannot run the private checks or the layout check against real data. A
 self-hosted runner on the Mac mini could run the full `scripts/check.sh` (private checks, the
 real console) on PRs. A public repository lets fork PRs run code on the runner, so the job must
@@ -271,8 +271,13 @@ data nor the private checkout may reach CI logs. Decide first whether the trade-
 **Done when:** a `full-check` job on the self-hosted runner logs `private checks passed` on a PR
 from this repository and is skipped on a fork PR; the runner's setup and security settings are
 in `docs/LOOP.md`.
+Resolved differently: decided against a runner (docs/LOOP.md, "What CI does not run, and why
+there is no self-hosted runner"). A public repository's self-hosted runner on the machine that
+holds the data and the private checkout is more exposure than the enforcement is worth while
+every PR comes from a checkout that runs the full check first; HK-18 covers the post-merge
+case in the deploy loop instead. Revisit when PRs come from elsewhere.
 
-### HK-13 web/node_modules lives outside iCloud — `todo`
+### HK-13 web/node_modules lives outside iCloud
 The checkout sits in iCloud Drive, which evicts `web/node_modules` under disk pressure: during
 HK-09, 2,869 of its 3,697 files were dataless placeholders and `npm run lint` sat in file stats
 for ten minutes fetching them one by one, stalling `scripts/check.sh`. Keep the dependencies out
@@ -284,3 +289,14 @@ them in a non-synced directory such as `~/Library/Caches/tessera/web-node_module
 Resolved differently: the whole checkout moved to `~/Code/Tessera` (with the private repo beside
 it), outside iCloud, after launchd also proved unable to read a script under Documents; nothing
 under the checkout is evicted any more, so no symlink is needed.
+
+### HK-18 Deploy loop runs the private checks before it restarts the service
+Public CI cannot run the private checks (HK-12 decided against a self-hosted runner), so a
+merge that breaks the private legacy crate or a private strategy test reaches `main` unseen
+until someone runs `scripts/check.sh` here. `scripts/deploy-local.sh` should run the private
+checks (`scripts/check.sh --no-web`, or the private step alone when `check.sh` grows a flag for
+it) after pulling and before restarting the service, refuse the restart when they fail, and
+write the failure to `data/ui/deploy.log` so the owner sees it the next morning.
+**Done when:** the deploy script's self-test shows a fixture where the private check fails
+leaving the service untouched with `private checks failed` in the log, and one where it passes
+and the restart proceeds; `docs/LOOP.md` names it as the post-merge guard.
