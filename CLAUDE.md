@@ -26,6 +26,9 @@ have to be repeated in chat.
   `data/ui/api.pid` (verify with `lsof -nP -iTCP:8787 -sTCP:LISTEN`), then
   `TESSERA_ROOT=$PWD nohup ./target/release/tessera-ui > data/ui/api.log 2>&1 &` and write the new
   pid to `data/ui/api.pid`. Do not restart while a job is `running` in the catalog.
+  `scripts/deploy-local.sh` does all of this from `origin/main` on a schedule (pull, build what
+  changed, restart only for engine changes and only when idle; `--dry-run` shows the plan,
+  `--launchd` prints the LaunchAgent that runs it every five minutes).
 - CLI runs: `./target/release/tessera run-strategy --config <toml> --start <date> --end <date>
   --output-dir <dir>`. Scratch outputs go under `target/` or the session scratchpad, never `artifacts/`.
 

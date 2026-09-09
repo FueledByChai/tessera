@@ -19,6 +19,13 @@ How development and research run without a person in the middle of every step. T
   and all, out of `BACKLOG.md` into `CHANGELOG.md` under the tag, so the queue holds only open
   work and the changelog is the record of what shipped when.
 - `/next-ticket`: the command that takes the next ticket to done (`.claude/commands/next-ticket.md`).
+- `scripts/deploy-local.sh`: the deploy loop. Every few minutes (a LaunchAgent from
+  `--launchd`, or a scheduled task) it pulls `main` fast-forward when `origin/main` moved,
+  builds the engine if `src/`, Cargo, `build.rs`, or the strategies changed and the bundle if
+  `web/` did, and restarts the console only for an engine change and only when no job or
+  study is running; a busy console makes it refuse and wait for the next run. Each run is one
+  line in `data/ui/deploy.log`. So a merged pull request reaches the console on the Mac mini
+  without anyone touching it.
 - `scripts/open-ticket-pr.sh`: the hand-off. `--claim` pushes `ticket/<id>` to origin before
   work starts, so a second agent's `backlog-status.sh --next` passes over the ticket; after the
   commit the plain form pushes the branch and opens the pull request whose body is the ticket
