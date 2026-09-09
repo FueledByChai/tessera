@@ -211,7 +211,7 @@ when. Tag releases; the notes are the diff between tags.
 dates; `--archive` on a scratch copy produces a `CHANGELOG.md` containing them and a
 `BACKLOG.md` without them; `scripts/check.sh --quick` runs the script's self-test.
 
-### HK-07 Layout check runs in CI — `todo` — Blocked by HK-03
+### HK-07 Layout check runs in CI — Blocked by HK-03
 `web/scripts/layout-check.mjs` (UI-03) skips when no Chromium is resolvable and when no console
 answers on 8787, so on CI it currently proves nothing. Add `playwright` as a web devDependency,
 install its Chromium in the workflow, and run the check against the built bundle with the

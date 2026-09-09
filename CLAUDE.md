@@ -73,7 +73,8 @@ hand-written CI steps to keep in sync.
   sizing block stays last in `globals.css`. `web/scripts/theme-check.mjs` (run by
   `scripts/check.sh`) fails on blue backgrounds or borders, on smaller control fonts, and on
   bare `fr` grid tracks. Pages must fit a 13-inch laptop: wide tables go dense under 1500 px
-  rather than scrolling; `web/scripts/layout-check.mjs` measures 1280 and 1440 px.
+  rather than scrolling; `web/scripts/layout-check.mjs` measures 1280 and 1440 px, on CI against
+  a scratch console seeded by `scripts/scratch-console.sh` (`TESSERA_ADDR` picks its port).
 - Long tables go behind tabs or caps with a "show all"; a page must open at the top.
 - Charts are inline SVG in the terminal style (`EquityChart`, the study charts). The studies
   page must keep rendering every chart from `web/fixtures/study-result.json`:

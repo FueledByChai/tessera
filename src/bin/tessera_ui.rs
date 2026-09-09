@@ -702,8 +702,9 @@ async fn main() -> Result<()> {
         .layer(cors)
         .with_state(state);
 
-    let address = "127.0.0.1:8787";
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    // TESSERA_ADDR moves a scratch instance off the real console's port (scripts/scratch-console.sh).
+    let address = std::env::var("TESSERA_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_owned());
+    let listener = tokio::net::TcpListener::bind(&address).await?;
     if web_ready {
         println!("Tessera console at http://{address}/ (API under /api)");
     } else {

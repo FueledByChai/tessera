@@ -4,8 +4,10 @@ name: CI
 # so CI and the checkout agree on what "passing" means. The engine job is
 # `scripts/check.sh --quick`: fmt, tests, build, and parity of the bundled examples against
 # examples/expected (the private checks skip, since that checkout is not here). The web job is
-# `scripts/check.sh --web-only`: typecheck, lint, theme check, build; the headless layout and
-# chart checks report that they skipped until a Chromium is installed on the runner (HK-07).
+# `scripts/check.sh --web-only`: typecheck, lint, theme check, build, and the headless layout and
+# chart checks, which need a Chromium (playwright's, a web devDependency) and a console to open
+# pages from: scripts/scratch-console.sh serves one on the bundled example data with a seeded
+# run and study, which is why the web job also builds the engine.
 
 on:
   push:
@@ -28,7 +30,7 @@ jobs:
       - run: scripts/check.sh --quick
 
   web:
-    name: Web (scripts/check.sh --web-only)
+    name: Web (scripts/check.sh --web-only with a scratch console)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,4 +41,16 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
         working-directory: web
+      - name: Install playwright's Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: web
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the engine for the scratch console
+        run: cargo build --release --bin tessera --bin tessera-ui
+      - name: Start a scratch console on the bundled example data
+        run: scripts/scratch-console.sh start
       - run: scripts/check.sh --web-only
+      - name: Stop the scratch console
+        if: always()
+        run: scripts/scratch-console.sh stop
