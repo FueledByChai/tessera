@@ -226,7 +226,7 @@ cannot supply should be listed as skipped, like a missing console, while the res
 **Done when:** the check run against an empty catalog exits 0 with the run and strategy pages
 listed as skipped and the studies page measured.
 
-### HK-09 The loop hands off through pull requests — `todo`
+### HK-09 The loop hands off through pull requests
 Today a ticket ends in a fast-forward merge and a service restart only the owner can do, so
 tickets run one at a time even when nothing blocks them. An agent should push a `ticket/<id>`
 branch (never `main`) and open a pull request whose body is the ticket report (id, what changed,
@@ -271,3 +271,13 @@ data nor the private checkout may reach CI logs. Decide first whether the trade-
 **Done when:** a `full-check` job on the self-hosted runner logs `private checks passed` on a PR
 from this repository and is skipped on a fork PR; the runner's setup and security settings are
 in `docs/LOOP.md`.
+
+### HK-13 web/node_modules lives outside iCloud — `todo`
+The checkout sits in iCloud Drive, which evicts `web/node_modules` under disk pressure: during
+HK-09, 2,869 of its 3,697 files were dataless placeholders and `npm run lint` sat in file stats
+for ten minutes fetching them one by one, stalling `scripts/check.sh`. Keep the dependencies out
+of the synced tree: `scripts/check.sh` (and `npm ci`, through a documented step) should place
+them in a non-synced directory such as `~/Library/Caches/tessera/web-node_modules` and leave
+`web/node_modules` as a symlink to it, for the main checkout and every worktree.
+**Done when:** after `npm ci`, `web/node_modules` is a symlink into a directory outside iCloud,
+`ls -lO` finds no dataless file under it, and `scripts/check.sh --resolve` reports where it lives.

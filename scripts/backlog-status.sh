@@ -8,20 +8,26 @@
 #                                             (exit 1 when there is none)
 #   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default main)
 #   scripts/backlog-status.sh --backlog <f>   another backlog file (default BACKLOG.md)
+#   scripts/backlog-status.sh --local         do not ask origin for ticket/<id> claim branches
 #   scripts/backlog-status.sh --self-test     a fixture repo: a `doing` ticket with a landed
-#                                             commit reports as done, blockers gate --next
+#                                             commit reports as done, blockers gate --next, a
+#                                             ticket/<id> branch on origin is a claim
 #
 # A heading reads `### <ID> <title>`, optionally followed by ` — \`<state>\`` and
 # ` — Blocked by <ID>, <ID>`. The first commit (oldest) whose subject starts with the id gives
-# the date and sha. `done` beats a `doing` or `blocked` claim left behind.
+# the date and sha. `done` beats a `doing` or `blocked` claim left behind. A `ticket/<id>`
+# branch on origin (scripts/open-ticket-pr.sh --claim) marks the ticket `claimed`: someone is on
+# it in another checkout, and --next passes over it (HK-09).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REF=main
 BACKLOG="$ROOT/BACKLOG.md"
 MODE=table
+LOCAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --next) MODE=next ;;
+    --local) LOCAL=1 ;;
     --self-test) MODE=selftest ;;
     --ref) REF="$2"; shift ;;
     --backlog) BACKLOG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift ;;
@@ -34,9 +40,15 @@ done
 # ref, from the current directory's repository.
 status() {
   local backlog="$1" ref="$2" mode="$3"
+  local claimed=""
+  if [ "$LOCAL" = 0 ]; then
+    # No origin, or one that does not answer, means no claims (and no failure).
+    claimed="$( (git ls-remote --heads origin 'refs/heads/ticket/*' 2>/dev/null || true) | sed 's#.*refs/heads/ticket/##' | tr '\n' ',')"
+  fi
   git log --reverse --date=short --format='%h %ad %s' "$ref" -- 2>/dev/null \
     | perl -e '
-      my ($backlog, $mode) = @ARGV;
+      my ($backlog, $mode, $claimed) = @ARGV;
+      my %claimed = map { $_ => 1 } grep { length } split /,/, $claimed;
       my %done;
       while (my $line = <STDIN>) {
         chomp $line;
@@ -60,6 +72,7 @@ status() {
         my $state = $done{$id} ? "done"
                   : $claim =~ /^blocked/ ? "blocked"
                   : $claim eq "doing" ? "doing"
+                  : $claimed{$id} ? "claimed"
                   : "todo";
         push @tickets, { id => $id, title => $title, state => $state, claim => $claim, blockers => \@blockers };
       }
@@ -88,7 +101,7 @@ status() {
         $state = $t->{claim} if $state eq "blocked";
         printf "%-6s %-8s %-10s %-8s %-6s %-22s %s\n", $t->{id}, $state, $date, $sha, ($ready->($t) ? "yes" : ""), $blockers, $t->{title};
       }
-    ' "$backlog" "$mode"
+    ' "$backlog" "$mode" "$claimed"
 }
 
 self_test() {
@@ -119,6 +132,18 @@ EOF
     git commit -q --allow-empty -m "ZZ-09: archived long ago"
     "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD | grep -q "^AA-06  todo .* yes .*ZZ-09 " \
       || { echo "self-test: AA-06 should be ready on the archived blocker ZZ-09"; "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD; exit 1; }
+    # A ticket/<id> branch on origin is a claim: --next passes over it while it exists, and
+    # --local ignores origin altogether.
+    git init -q --bare origin.git
+    git remote add origin origin.git
+    git push -q origin "HEAD:refs/heads/ticket/AA-04"
+    "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD | grep -q "^AA-04  claimed" \
+      || { echo "self-test: AA-04 should show as claimed by its origin branch"; "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD; exit 1; }
+    next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next)"
+    [ "$next" = "AA-06" ] || { echo "self-test: expected AA-06 next while AA-04 is claimed, got $next"; exit 1; }
+    next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --local --next)"
+    [ "$next" = "AA-04" ] || { echo "self-test: --local should ignore the claim and name AA-04, got $next"; exit 1; }
+    git push -q origin --delete "ticket/AA-04"
     # Nothing else landed yet: AA-01 is still the doing claim; AA-04 is the first ready todo.
     next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next)"
     [ "$next" = "AA-04" ] || { echo "self-test: expected AA-04 next before anything landed, got $next"; exit 1; }

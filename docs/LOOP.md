@@ -19,6 +19,12 @@ How development and research run without a person in the middle of every step. T
   and all, out of `BACKLOG.md` into `CHANGELOG.md` under the tag, so the queue holds only open
   work and the changelog is the record of what shipped when.
 - `/next-ticket`: the command that takes the next ticket to done (`.claude/commands/next-ticket.md`).
+- `scripts/open-ticket-pr.sh`: the hand-off. `--claim` pushes `ticket/<id>` to origin before
+  work starts, so a second agent's `backlog-status.sh --next` passes over the ticket; after the
+  commit the plain form pushes the branch and opens the pull request whose body is the ticket
+  report and whose checks are the CI jobs. The owner merges pull requests (HK-10 gates that on
+  CI through the merge queue), pulls `main` fast-forward, and rebuilds; several agents can hold
+  several tickets at once as long as their `Blocked by` lines allow it.
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.
 
@@ -41,7 +47,7 @@ window, with a cap on iterations. Each run ends with a report; read those in the
 with `git log` and the changed states in `BACKLOG.md`.
 
 Guardrails that make this safe: every ticket is one commit on a branch or worktree, the loop
-never pushes, never touches data, and stops itself when the check fails three times or when the
+never pushes `main`, hands its commit off through a pull request, never touches data, and stops itself when the check fails three times or when the
 queue is empty. A ticket that comes back `blocked` is the loop asking for a decision.
 
 ## Your part
