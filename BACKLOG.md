@@ -281,3 +281,6 @@ them in a non-synced directory such as `~/Library/Caches/tessera/web-node_module
 `web/node_modules` as a symlink to it, for the main checkout and every worktree.
 **Done when:** after `npm ci`, `web/node_modules` is a symlink into a directory outside iCloud,
 `ls -lO` finds no dataless file under it, and `scripts/check.sh --resolve` reports where it lives.
+Resolved differently: the whole checkout moved to `~/Code/Tessera` (with the private repo beside
+it), outside iCloud, after launchd also proved unable to read a script under Documents; nothing
+under the checkout is evicted any more, so no symlink is needed.

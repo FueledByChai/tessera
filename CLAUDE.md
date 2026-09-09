@@ -14,9 +14,11 @@ have to be repeated in chat.
   `local.toml [strategies] dirs`), frozen configs, research scripts, the legacy crate, and the
   research log. Never copy private strategies, configs, or data paths into this repo.
 - Market data lives outside both repos (see `local.toml`). Never modify, delete, or commit data.
-- The checkout sits in an iCloud folder. Paths contain a curly apostrophe: in shell use
-  `~/Documents/Documents*/Tessera`. `web/node_modules` may stall on evicted files; if Node tools
-  hang, that is why.
+- On the Mac mini the checkout lives at `~/Code/Tessera` with the private repo beside it at
+  `~/Code/Tessera-private`, outside iCloud Drive and outside the folders macOS guards
+  (Documents, Desktop): iCloud evicted dependencies and artifacts into placeholders that
+  stalled Node tools for minutes, and launchd could not read a script under Documents at all.
+  Keep it there; never move it back into a synced or guarded folder.
 
 ## Build, run, restart
 
