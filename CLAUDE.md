@@ -51,7 +51,8 @@ hand-written CI steps to keep in sync.
 - Git is the record of done: `scripts/backlog-status.sh` derives each ticket's state from the
   commit whose subject carries its id (`--next` names the next ticket). `BACKLOG.md` holds only
   `todo`, `doing`, and `blocked` claims; clear the `doing` claim in the ticket's commit and never
-  write a done line.
+  write a done line. Tag releases: `scripts/release-notes.sh <from> <to>` lists what shipped, and
+  `--archive <tag>` moves the shipped tickets out of `BACKLOG.md` into `CHANGELOG.md`.
 
 ## Engine and data rules
 

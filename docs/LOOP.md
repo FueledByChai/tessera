@@ -13,6 +13,11 @@ How development and research run without a person in the middle of every step. T
   proves. Done is derived from git, not written into the file: `scripts/backlog-status.sh`
   reports every ticket with its state, date, and sha from the commit whose subject carries its
   id, and `--next` names the next ticket to take.
+- `scripts/release-notes.sh <from> [<to>]`: what shipped between two refs as Markdown, the
+  commits with a ticket id grouped under their backlog section. Tag releases; then
+  `scripts/release-notes.sh --archive <tag> <previous-tag> <tag>` moves the shipped tickets, text
+  and all, out of `BACKLOG.md` into `CHANGELOG.md` under the tag, so the queue holds only open
+  work and the changelog is the record of what shipped when.
 - `/next-ticket`: the command that takes the next ticket to done (`.claude/commands/next-ticket.md`).
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.

@@ -64,11 +64,14 @@ status() {
         push @tickets, { id => $id, title => $title, state => $state, claim => $claim, blockers => \@blockers };
       }
       close $fh;
+      # A blocker is done when its ticket is, or when it has landed and left the file (archived
+      # into CHANGELOG.md by scripts/release-notes.sh).
       my %state = map { $_->{id} => $_->{state} } @tickets;
+      my $landed = sub { my $b = shift; return ($state{$b} // "") eq "done" || exists $done{$b}; };
       my $ready = sub {
         my $t = shift;
         return 0 unless $t->{state} eq "todo";
-        for my $b (@{ $t->{blockers} }) { return 0 unless ($state{$b} // "") eq "done"; }
+        for my $b (@{ $t->{blockers} }) { return 0 unless $landed->($b); }
         return 1;
       };
       if ($mode eq "next") {
@@ -79,7 +82,7 @@ status() {
       printf "%-6s %-8s %-10s %-8s %-6s %-22s %s\n", "id", "state", "date", "sha", "ready", "blocked by", "title";
       for my $t (@tickets) {
         my ($date, $sha) = $done{ $t->{id} } ? @{ $done{ $t->{id} } } : ("-", "-");
-        my $blockers = join ",", map { $_ . (($state{$_} // "") eq "done" ? "" : "!") } @{ $t->{blockers} };
+        my $blockers = join ",", map { $_ . ($landed->($_) ? "" : "!") } @{ $t->{blockers} };
         my $state = $t->{state};
         $state .= " (was $t->{claim})" if $state eq "done" && $t->{claim} ne "" && $t->{claim} ne "todo";
         $state = $t->{claim} if $state eq "blocked";
@@ -108,10 +111,15 @@ Body.
 ### AA-03 Third — `blocked waiting on data`
 ### AA-04 Fourth
 ### AA-05 Fifth — `todo` — Blocked by AA-03, AA-04
+### AA-06 Sixth — `todo` — Blocked by ZZ-09
 EOF
     git add BACKLOG.md
     git commit -q -m "Scaffold the fixture queue"
-    # Nothing landed yet: AA-01 is still the doing claim; AA-04 is the first ready todo.
+    # A blocker that has landed but is no longer in the file (archived) still counts as done.
+    git commit -q --allow-empty -m "ZZ-09: archived long ago"
+    "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD | grep -q "^AA-06  todo .* yes .*ZZ-09 " \
+      || { echo "self-test: AA-06 should be ready on the archived blocker ZZ-09"; "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD; exit 1; }
+    # Nothing else landed yet: AA-01 is still the doing claim; AA-04 is the first ready todo.
     next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next)"
     [ "$next" = "AA-04" ] || { echo "self-test: expected AA-04 next before anything landed, got $next"; exit 1; }
     # AA-01 lands while its line still says doing: git wins, with the commit's date and sha.
@@ -136,6 +144,7 @@ EOF
     # Everything ready landed: --next says so and exits 1.
     git commit -q --allow-empty -m "AA-02: second"
     git commit -q --allow-empty -m "AA-04: fourth"
+    git commit -q --allow-empty -m "AA-06: sixth"
     if "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next 2>/dev/null; then
       echo "self-test: --next should fail with nothing ready (AA-03 is blocked, AA-05 waits on it)"; exit 1
     fi

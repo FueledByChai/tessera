@@ -201,7 +201,7 @@ loop stops writing `done` lines and picks the first `todo` whose blockers have a
 their lines here carry no state, and a test fixture repo in the script's tests shows a `doing`
 ticket with a landed commit reported as done.
 
-### HK-06 Release notes from commits and a changelog archive — `todo` — Blocked by HK-05
+### HK-06 Release notes from commits and a changelog archive — Blocked by HK-05
 `scripts/release-notes.sh <from-ref> [<to-ref>]` lists commits whose subject starts with a
 ticket id, grouped by prefix (WB, HK) with date and short sha, as Markdown. `--archive <tag>`
 moves the completed tickets' entries out of this file into `CHANGELOG.md` under the tag's
