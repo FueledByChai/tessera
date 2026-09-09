@@ -42,7 +42,11 @@ hand-written CI steps to keep in sync.
 ## Git
 
 - Commit per ticket, message starts with the ticket id (`WB-03: ...`), ends with the
-  `Co-Authored-By: Claude ... <noreply@anthropic.com>` trailer. Never push; the owner pushes.
+  `Co-Authored-By: Claude ... <noreply@anthropic.com>` trailer. Never push `main`. A ticket's
+  branch on origin is `ticket/<id>`: `scripts/open-ticket-pr.sh <id> --claim` pushes it as the
+  claim before work starts (`backlog-status.sh --next` passes over claimed ids), and
+  `scripts/open-ticket-pr.sh <id>` pushes the commit and opens the pull request the owner
+  merges. Never force-push.
 - Prefer an isolated worktree per ticket. Never rewrite history on `main`. From a worktree,
   `scripts/check.sh` finds the main checkout through the shared git dir, the private checkout
   beside it (`TESSERA_PRIVATE_ROOT` overrides), writes `local.toml` from the main one with its
