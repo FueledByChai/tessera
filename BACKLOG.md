@@ -161,6 +161,41 @@ the form should list them as feature checkboxes with their kind and availability
 **Done when:** the browser check on the studies form finds a checkbox per registered series and
 a lake study submitted from it with `funding_rate` ticked produces that cell.
 
+### WB-14 Realized vol and rolling std transforms, with second windows on the lake grid
+`src/feature_expr.rs` has no volatility transform: `rv` for the regime buckets lives in
+`study.rs` (`trailing_realized_variance`) and is not an expression. Add two transforms with
+streaming state per symbol like the others: `rv n`, the square root of the sum of squared
+bar-to-bar returns (bps) of the incoming series over the last n bars, gaps (NaN or
+non-positive prices) skipped the way `trailing_realized_variance` skips them, NaN until n
+returns are seen; and `std n`, the sample standard deviation of the last n values of any
+series, NaN until the window is full. Windows become `Window::Bars(n) | Window::Seconds(n)`
+(`30` or `30s`) for every windowed transform (`ema`, `sma`, `zscore`, `diff`, `lag`, `rate`,
+`pct_rank`, `rv`, `std`), resolved against the grid's step when the study evaluates them; a
+seconds window on a non-lake grid fails with a message naming the lake grid and the step.
+Bars without a trade on the lake grid repeat the last close, so their zero returns count.
+`docs/ADDING_A_STRATEGY.md`'s grammar section lists both transforms and the suffix. Serves
+BT-1001.
+**Done when:** unit tests in `src/feature_expr.rs` check `rv` and `std` against hand-computed
+values on a fixture with a gap; show `rv 30s` at step 5 equal to `rv 6` and at step 1 equal to
+`rv 30`; show `ema 60s` on the daily grid failing with text that names the lake grid; and a
+synthetic 1-second grid with two vol regimes gives a mean `mid | rv 30` in the high regime
+more than twice the low regime's. WB-01's parity test still passes unchanged.
+
+### WB-15 realized_vol target and a seeded vol feature set — Blocked by WB-14
+Add `Target::RealizedVol` in `src/study.rs`: the square root of `Target::RealizedVariance`,
+name `realized_vol`, unit bps, in `Target::ALL` and `parse`; `STUDY_TARGETS` in
+`web/app/page.tsx` lists it as "Realized vol (bps)". Add `seed_feature_presets` beside the
+other seeders in `src/bin/tessera_ui.rs`: on start, insert into `feature_presets` by name
+when absent: "rv 5s" (`mid | rv 5s`), "rv 30s", "rv 60s", "vol ratio 5s/60s" (`mid | rv 5s |
+ratio_to rv 60s`), and "vol of vol 60s" (`mid | rv 5s | std 60s`). `docs/LOCAL_UI.md` and
+`docs/ADDING_A_STRATEGY.md` name the target and the seeded set. Serves BT-1002.
+**Done when:** a unit test computes `realized_vol` on a fixture as the root of
+`realized_variance`; a synthetic 1-second panel with persistent vol regimes, studied with
+`mid | rv 30` at horizon 30, gives IC above 0.5 against `realized_vol` and below 0.1 against
+`return`; a service test shows the five presets after a fresh catalog and no duplicates after
+a second start; `web/scripts/chart-check.mjs` finds the `realized_vol` option in the form's
+target select.
+
 ## Housekeeping
 
 ### HK-01 Required symbols from the manifest

@@ -808,6 +808,43 @@ only thing between an agent's commit and main.
 - The ruleset requires the status; auto-merge waits for it.
 - The owner can override a red status with one documented command that records a reason.
 
+## Epic J: Feature workbench
+
+### BT-1001 — Realized volatility at any lookback as a study feature
+
+**Status:** Proposed
+**User story:** As a researcher, I want realized vol over 5-second, 30-second, 60-second, or
+any other lookback as a feature expression, so that I can test whether recent vol predicts
+future price moves and future vol without leaving the studies page.
+
+**Acceptance criteria:**
+
+- `rv n` (root of the summed squared bar-to-bar returns over the last n bars, in bps) and
+  `std n` (rolling standard deviation of any series) are transforms in the feature grammar,
+  composable with the existing ones (`mid | rv 5s | std 60s` is vol-of-vol).
+- A window written with an `s` suffix on the lake grid is converted from the study's step
+  (`rv 30s` is 30 bars at step 1 and 6 bars at step 5); on daily and minute grids a seconds
+  window is refused with a message naming the lake grid.
+- Every windowed transform accepts the suffix, not only the new ones.
+- Seconds without a trade count as zero returns, so `rv` measures vol per unit of time.
+- The grammar documentation lists both transforms and the suffix.
+
+### BT-1002 — Future vol as a target in bps, with ready-made vol features
+
+**Status:** Proposed
+**User story:** As a researcher, I want to pick "realized vol" as a study target and add the
+standard vol features with one click, so that the heat table's numbers for a future-vol study
+read in bps and a vol study takes seconds to set up.
+
+**Acceptance criteria:**
+
+- `realized_vol` is a study target: the square root of `realized_variance`, unit bps,
+  selectable in the form and on the CLI.
+- The feature library holds a seeded vol set on first start: rv 5s, rv 30s, rv 60s, the
+  5s/60s vol ratio, and vol-of-vol; they are ordinary library entries afterwards.
+- A synthetic panel with persistent vol regimes gives a high IC for trailing vol against
+  future vol and an IC near zero against future return.
+
 ## Recommended delivery milestones
 
 ### Completed foundation — Event-driven SDK steps 1–6
