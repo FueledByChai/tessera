@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
 # The local deploy loop (HK-11): brings the console on this machine up to origin/main. Pulls
 # main fast-forward, rebuilds what the new commits touched (the engine for src/, Cargo, build.rs,
-# or strategy changes; the bundle for web/ changes), and restarts the service only when an
-# engine change needs it and nothing is running in the catalog. Meant to run every few minutes
-# from a schedule; every run is one line in data/ui/deploy.log.
+# or strategy changes; the bundle for web/ changes), runs the private checks against the new
+# engine (HK-18: public CI cannot, so this is the post-merge guard), and restarts the service
+# only when an engine change needs it, the private checks pass, and nothing is running in the
+# catalog. Meant to run every few minutes from a schedule; every run is one line in
+# data/ui/deploy.log.
 #
-#   scripts/deploy-local.sh                 deploy if origin/main moved (exit 0; 3 when refused)
+#   scripts/deploy-local.sh                 deploy if origin/main moved (exit 0; 3 when refused;
+#                                           4 when the private checks failed and the service
+#                                           keeps its previous build)
 #   scripts/deploy-local.sh --dry-run       say what a run would do, change nothing
 #   scripts/deploy-local.sh --launchd       print a LaunchAgent plist that runs it every 5 min
 #   scripts/deploy-local.sh --self-test     a fixture origin and a stubbed service prove the
 #                                           decisions: nothing new, engine change, web change,
-#                                           docs change, and a running job
+#                                           docs change, a running job, and the private checks
+#                                           failing (no restart) and passing (restart)
 #
 # Decisions, in order: not on a clean main → refuse. origin/main not ahead → nothing new, exit
-# at once. A job or study running → refuse before pulling, so the checkout stays what the
-# service runs. Otherwise pull, build what changed, restart when the engine changed (the pid in
-# data/ui/api.pid, checked against the port's listener), wait for /api/health, print the pid.
+# at once (saying so if the last engine build failed its private checks and the service is
+# still on the build before). A job or study running → refuse before pulling, so the checkout
+# stays what the service runs. Otherwise pull, build what changed; for an engine change run
+# `scripts/check.sh --private-only` (output in data/ui/private-check.log) and, only when it
+# passes, restart (the pid in data/ui/api.pid, checked against the port's listener), wait for
+# /api/health, print the pid. A failed private check leaves the service on its previous build
+# and marks data/ui/private-check.failed with the sha until a later build passes.
 set -euo pipefail
 # TESSERA_DEPLOY_ROOT deploys another checkout (the self-test's fixture); default: this one.
 ROOT="${TESSERA_DEPLOY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -30,8 +39,8 @@ for arg in "$@"; do
 done
 
 # The service, as the loop sees it. TESSERA_DEPLOY_STUB=<dir> replaces every call with files
-# in that directory (busy, pid, built, restarted), which is how the self-test runs without a
-# console or a compiler.
+# in that directory (busy, pid, built, restarted, private), which is how the self-test runs
+# without a console or a compiler.
 ADDR="${TESSERA_ADDR:-127.0.0.1:8787}"
 PORT="${ADDR##*:}"
 STUB="${TESSERA_DEPLOY_STUB:-}"
@@ -62,6 +71,18 @@ build_engine() {
 build_web() {
   if [ -n "$STUB" ]; then echo web >> "$STUB/built"; return 0; fi
   (cd "$ROOT/web" && npm run --silent build >/dev/null)
+}
+
+# The private checks against the engine just built. Public CI cannot run them (no private
+# checkout there), so this is where a merge that breaks the private crate or a private
+# strategy test is caught: before the service restarts on it.
+private_checks() {
+  if [ -n "$STUB" ]; then
+    echo private >> "$STUB/checked"
+    [ "$(cat "$STUB/private" 2>/dev/null || echo 0)" = 0 ]
+    return $?
+  fi
+  (cd "$ROOT" && scripts/check.sh --private-only > data/ui/private-check.log 2>&1)
 }
 
 restart_service() {  # prints the new pid
@@ -113,13 +134,20 @@ deploy() {  # $1: dry (1) or real (0)
   git fetch -q origin main
   local old new
   old="$(git rev-parse HEAD)"; new="$(git rev-parse origin/main)"
-  if [ "$old" = "$new" ]; then log "nothing new: main is at $(git rev-parse --short "$old")"; return 0; fi
+  if [ "$old" = "$new" ]; then
+    if [ "$(cat data/ui/private-check.failed 2>/dev/null || true)" = "$old" ]; then
+      log "nothing new: main is at $(git rev-parse --short "$old"); private checks failed on it, the service is still on the build before (data/ui/private-check.log)"
+    else
+      log "nothing new: main is at $(git rev-parse --short "$old")"
+    fi
+    return 0
+  fi
   if ! git merge-base --is-ancestor "$old" "$new"; then log "refusing: origin/main ($(git rev-parse --short "$new")) is not a fast-forward of main ($(git rev-parse --short "$old"))"; return 3; fi
   local busy; busy="$(running_work)"
   if [ -n "$busy" ]; then log "refusing: $busy running; $(git rev-list --count "$old..$new") new commit(s) wait for the next run"; return 3; fi
   read -r engine web other <<< "$(touched "$old" "$new")"
   local plan="pull $(git rev-parse --short "$old")..$(git rev-parse --short "$new")"
-  [ "$engine" = 1 ] && plan="$plan, build engine, restart"
+  [ "$engine" = 1 ] && plan="$plan, build engine, private checks, restart"
   [ "$web" = 1 ] && plan="$plan, build web"
   [ "$engine" = 0 ] && [ "$web" = 0 ] && plan="$plan, nothing to build (docs or scripts only)"
   if [ "$dry" = 1 ]; then log "dry run: would $plan"; return 0; fi
@@ -128,6 +156,13 @@ deploy() {  # $1: dry (1) or real (0)
   [ "$engine" = 1 ] && { build_engine; log "built the engine"; }
   [ "$web" = 1 ] && { build_web; log "built the web bundle"; }
   if [ "$engine" = 1 ]; then
+    if ! private_checks; then
+      git rev-parse HEAD > data/ui/private-check.failed
+      log "private checks failed on $(git rev-parse --short "$new"): the service keeps its previous build; see data/ui/private-check.log"
+      return 4
+    fi
+    rm -f data/ui/private-check.failed
+    log "private checks passed"
     local pid; pid="$(restart_service)"
     log "restarted the service: pid $pid"
     echo "$pid"
@@ -196,6 +231,7 @@ self_test() {
     rc=0; pid="$(run)" || rc=$?
     [ "$rc" = 0 ] && [ "$pid" = 4243 ] || { echo "self-test: engine change: rc $rc pid '$pid'"; cat "$dir/last.err"; exit 1; }
     grep -q '^engine$' stub/built && grep -q 'restarted from 4242' stub/restarted || { echo "self-test: engine change did not build and restart"; exit 1; }
+    grep -q '^private$' stub/checked && grep -q 'private checks passed' "$dir/last.err" || { echo "self-test: engine change did not run the private checks before restarting"; cat "$dir/last.err"; exit 1; }
     [ "$(git -C deploy rev-parse HEAD)" = "$(git -C upstream rev-parse HEAD)" ] || { echo "self-test: deploy checkout did not pull"; exit 1; }
     rm -f stub/built stub/restarted
     # 3. A web-only change: pull, build the bundle, no restart.
@@ -222,7 +258,25 @@ self_test() {
     (cd upstream && echo "fn main() { println!(\"dry\"); }" > src/main.rs && git commit -q -am "WB-97: dry" && git push -q origin main)
     rm -f stub/built stub/restarted
     rc=0; run --dry-run || rc=$?
-    [ "$rc" = 0 ] && grep -q 'dry run: would pull .*build engine, restart' "$dir/last.err" && [ ! -e stub/built ] || { echo "self-test: dry run: rc $rc"; cat "$dir/last.err"; exit 1; }
+    [ "$rc" = 0 ] && grep -q 'dry run: would pull .*build engine, private checks, restart' "$dir/last.err" && [ ! -e stub/built ] || { echo "self-test: dry run: rc $rc"; cat "$dir/last.err"; exit 1; }
+    # 8. The private checks fail on an engine change: pulled and built, but no restart, exit 4,
+    #    the failure in the log and marked; the next idle run says the service is behind.
+    echo 1 > stub/private
+    rm -f stub/checked
+    rc=0; run || rc=$?
+    [ "$rc" = 4 ] && grep -q 'private checks failed on .*: the service keeps its previous build' "$dir/last.err" || { echo "self-test: failing private checks: rc $rc"; cat "$dir/last.err"; exit 1; }
+    grep -q '^engine$' stub/built && grep -q '^private$' stub/checked && [ ! -e stub/restarted ] || { echo "self-test: failing private checks must build, check, and not restart"; ls stub; exit 1; }
+    [ "$(git -C deploy rev-parse HEAD)" = "$(git -C upstream rev-parse HEAD)" ] || { echo "self-test: failing private checks should still have pulled"; exit 1; }
+    [ "$(cat deploy/data/ui/private-check.failed)" = "$(git -C deploy rev-parse HEAD)" ] || { echo "self-test: the failure marker should carry the sha"; exit 1; }
+    rc=0; run || rc=$?
+    [ "$rc" = 0 ] && grep -q 'nothing new: .*private checks failed on it, the service is still on the build before' "$dir/last.err" || { echo "self-test: the idle run after a failure should say the service is behind: rc $rc"; cat "$dir/last.err"; exit 1; }
+    # 9. The private checks pass on the next engine change: restart proceeds, marker cleared.
+    echo 0 > stub/private
+    rm -f stub/built stub/restarted stub/checked
+    (cd upstream && echo "fn main() { println!(\"fixed\"); }" > src/main.rs && git commit -q -am "WB-96: fix" && git push -q origin main)
+    rc=0; pid="$(run)" || rc=$?
+    [ "$rc" = 0 ] && [ "$pid" = 4245 ] && grep -q 'private checks passed' "$dir/last.err" && grep -q 'restarted from 4244' stub/restarted || { echo "self-test: passing private checks: rc $rc pid '$pid'"; cat "$dir/last.err"; ls stub; exit 1; }
+    [ ! -e deploy/data/ui/private-check.failed ] || { echo "self-test: the failure marker should be cleared after a passing build"; exit 1; }
     # 7. Not on main, or dirty: refuse.
     (cd deploy && git checkout -q -b elsewhere) ; rc=0; run || rc=$?
     [ "$rc" = 3 ] && grep -q 'not main' "$dir/last.err" || { echo "self-test: off-main run: rc $rc"; cat "$dir/last.err"; exit 1; }

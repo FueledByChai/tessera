@@ -379,3 +379,14 @@ then on a change to a loop script is made in the kit, tagged, and pulled in by m
 **Done when:** `scripts/loop-config.sh kit` prints a `https://github.com/` URL and `kit_ref`
 a tag; `scripts/loop-kit-sync.sh --check` passes against them from a clean clone; `loop/`
 holds only `prompts/`; and `docs/LOOP.md` names the kit repository.
+
+### HK-20 backlog-status --next judges done against origin, not a lagging local main
+Right after HK-17 merged, `scripts/backlog-status.sh --next` in the main checkout named HK-17
+again: it reads the local `main`, which the deploy loop had not yet pulled, while the claim
+branch was already gone. The script should fetch and judge done against `origin/<default
+branch>` when that ref exists (falling back to the local branch without a remote), so a
+lagging checkout never re-offers a merged ticket. This is a kit script: change it in
+`coding-agent-loop`, tag a release, move `kit_ref`, and sync.
+**Done when:** the backlog-status self-test shows a ticket landed on `origin/main` but not on
+the local `main` reported `done` and skipped by `--next`; `.loop.toml` points at the kit tag
+that carries it.
