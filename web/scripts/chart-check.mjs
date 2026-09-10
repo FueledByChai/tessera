@@ -187,6 +187,12 @@ try {
         const ticked = form.rows.filter((row) => row.checked).map((row) => row.id).sort();
         if (ticked.join(",") !== [...OHLCV_FEATURES].sort().join(",")) failures.push(`${mode}: daily grid pre-ticks ${ticked.join(", ") || "nothing"} instead of the OHLCV set`);
         if (!form.picker) failures.push(`${mode}: daily grid has no catalog-backed symbol picker`);
+        // WB-15: the target select offers realized vol in bps beside realized variance.
+        const targets = await page.evaluate(() =>
+          [...document.querySelectorAll("select option")]
+            .map((o) => o.value)
+            .filter((v) => v.startsWith("realized_")));
+        if (!targets.includes("realized_vol")) failures.push(`${mode}: the target select has no realized_vol option (found ${targets.join(", ") || "none"})`);
         if (form.textarea) failures.push(`${mode}: daily grid still takes symbols as typed text`);
         if (form.picker) {
           await page.locator(".study-pick-grid .instrument-search input").fill("DEMO");

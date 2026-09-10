@@ -233,7 +233,8 @@ of what exists. The grammar lives in `src/feature_expr.rs`.
 
 `target` chooses what every feature is scored against over the horizon: `return` (mid return
 from acting to the horizon, bps, the default), `realized_variance` (sum of squared bar-to-bar
-mid returns over the horizon, bps²), `abs_move` (absolute return, bps), `spread_change` (quoted
+mid returns over the horizon, bps²), `realized_vol` (its square root, bps: the same ranks, with
+decile means and breakeven that read in bps), `abs_move` (absolute return, bps), `spread_change` (quoted
 spread at the horizon minus the spread when acting, bps), `fair_value_residual` (mid minus its
 60-second EMA at the horizon, in bps of mid), and `microprice_residual` (mid minus microprice at
 the horizon, bps of mid). IC, deciles, and the costless curve all run on the chosen target, so a

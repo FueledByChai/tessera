@@ -238,6 +238,10 @@ pub enum Target {
     Return,
     /// Sum of squared bar-to-bar mid returns (bps) over `a + 1 ..= a + h`, bps squared.
     RealizedVariance,
+    /// The square root of [`Target::RealizedVariance`]: realized vol over the horizon, bps.
+    /// Rank statistics match the variance's; the decile means, top-minus-bottom, and
+    /// breakeven read in bps.
+    RealizedVol,
     /// Absolute mid-price return from `a` to `a + h`, bps.
     AbsMove,
     /// Quoted spread at `a + h` minus the spread at `a`, bps.
@@ -251,9 +255,10 @@ pub enum Target {
 }
 
 impl Target {
-    pub const ALL: [Target; 6] = [
+    pub const ALL: [Target; 7] = [
         Target::Return,
         Target::RealizedVariance,
+        Target::RealizedVol,
         Target::AbsMove,
         Target::SpreadChange,
         Target::FairValueResidual,
@@ -263,6 +268,7 @@ impl Target {
         match self {
             Target::Return => "return",
             Target::RealizedVariance => "realized_variance",
+            Target::RealizedVol => "realized_vol",
             Target::AbsMove => "abs_move",
             Target::SpreadChange => "spread_change",
             Target::FairValueResidual => "fair_value_residual",
@@ -377,9 +383,9 @@ pub fn target_series(series: &TargetSeries, target: Target, horizon: usize) -> V
                 out[a] = ret(a).abs();
             }
         }
-        Target::RealizedVariance => {
+        Target::RealizedVariance | Target::RealizedVol => {
             // Prefix sums of squared bar returns, with a count of unusable bars so any gap in
-            // the window makes the whole window NaN.
+            // the window makes the whole window NaN. Realized vol is the root of the variance.
             let mut sum = vec![0.0; n + 1];
             let mut gaps = vec![0usize; n + 1];
             for k in 0..n {
@@ -397,7 +403,12 @@ pub fn target_series(series: &TargetSeries, target: Target, horizon: usize) -> V
             if horizon > 0 {
                 for a in 0..n.saturating_sub(horizon) {
                     if gaps[a + horizon + 1] == gaps[a + 1] {
-                        out[a] = sum[a + horizon + 1] - sum[a + 1];
+                        let variance = sum[a + horizon + 1] - sum[a + 1];
+                        out[a] = if target == Target::RealizedVol {
+                            variance.sqrt()
+                        } else {
+                            variance
+                        };
                     }
                 }
             }
@@ -2535,6 +2546,53 @@ mod tests {
             &ys,
         );
         assert!((c.ic - ic).abs() < 1e-12 && c.curves[0].curve.len() > 0);
+    }
+
+    /// WB-15: `realized_vol` is the root of `realized_variance`, bar for bar, in bps.
+    #[test]
+    fn realized_vol_is_the_root_of_realized_variance() {
+        let bars = synthetic_grid();
+        let series = TargetSeries::from_bars(&bars, Grid::Lake { step_secs: 1 });
+        let variance = target_series(&series, Target::RealizedVariance, 30);
+        let vol = target_series(&series, Target::RealizedVol, 30);
+        assert_eq!(variance.len(), vol.len());
+        let mut finite = 0;
+        for (v, s) in variance.iter().zip(&vol) {
+            if v.is_nan() {
+                assert!(s.is_nan());
+            } else {
+                assert!((v.sqrt() - s).abs() < 1e-9, "{v} vs {s}");
+                finite += 1;
+            }
+        }
+        assert!(finite > 1_000);
+        assert_eq!(Target::RealizedVol.unit(), "bps");
+        assert_eq!(Target::parse("realized_vol").unwrap(), Target::RealizedVol);
+        assert!(Target::ALL.contains(&Target::RealizedVol));
+    }
+
+    /// WB-15: on a panel whose vol regimes persist (300 bars each), trailing realized vol
+    /// predicts future realized vol and says nothing about direction.
+    #[test]
+    fn trailing_rv_predicts_realized_vol_but_not_return() {
+        let bars = synthetic_grid();
+        let series = TargetSeries::from_bars(&bars, Grid::Lake { step_secs: 1 });
+        let (_, features, _) =
+            evaluate_features(&["mid | rv 30".to_owned()], 1, &bars, true).unwrap();
+        let rv = &features["mid | rv 30"];
+        let (xs, ys) = pairs(rv, &target_series(&series, Target::RealizedVol, 30), 1);
+        assert!(xs.len() > 1_000, "{} pairs", xs.len());
+        let ic = spearman(&xs, &ys);
+        assert!(
+            ic > 0.5,
+            "trailing rv vs future realized vol IC should be high, got {ic}"
+        );
+        let (xr, yr) = pairs(rv, &target_series(&series, Target::Return, 30), 1);
+        let ic_return = spearman(&xr, &yr).abs();
+        assert!(
+            ic_return < 0.1,
+            "trailing rv says nothing about direction, got {ic_return}"
+        );
     }
 
     /// Daily OHLCV bars with no book, as the CSV loaders produce them.
