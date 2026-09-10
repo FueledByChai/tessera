@@ -9,7 +9,10 @@
 #   scripts/backlog-status.sh --next          the id of the first todo whose blockers are done
 #                                             (exit 1 when there is none)
 #   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default: the
-#                                             default branch)
+#                                             default branch as origin has it, after a fetch,
+#                                             so a checkout that has not pulled yet never
+#                                             re-offers a merged ticket; the local branch
+#                                             when there is no origin or with --local)
 #   scripts/backlog-status.sh --backlog <f>   another backlog file (default: the configured one)
 #   scripts/backlog-status.sh --local         do not ask origin for ticket/<id> claim branches
 #   scripts/backlog-status.sh --self-test     a fixture repo: a `doing` ticket with a landed
@@ -24,6 +27,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REF="$("$ROOT/scripts/loop-config.sh" default_branch)"
+REF_GIVEN=0
 BACKLOG="$ROOT/$("$ROOT/scripts/loop-config.sh" backlog)"
 MODE=table
 LOCAL=0
@@ -32,17 +36,31 @@ while [ $# -gt 0 ]; do
     --next) MODE=next ;;
     --local) LOCAL=1 ;;
     --self-test) MODE=selftest ;;
-    --ref) REF="$2"; shift ;;
+    --ref) REF="$2"; REF_GIVEN=1; shift ;;
     --backlog) BACKLOG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
 done
 
+# The ref done is judged against, from the current directory's repository: the default branch
+# as origin has it (fetched first) unless --ref named one, --local asked for no origin, or
+# there is no such remote branch.
+judged_ref() {
+  local ref="$1"
+  if [ "$REF_GIVEN" = 0 ] && [ "$LOCAL" = 0 ] && git rev-parse -q --verify "refs/remotes/origin/$ref" >/dev/null 2>&1; then
+    git fetch -q origin "$ref" 2>/dev/null || true
+    echo "origin/$ref"
+  else
+    echo "$ref"
+  fi
+}
+
 # Prints the table (mode table) or the next ticket id (mode next) for a backlog file against a
 # ref, from the current directory's repository.
 status() {
-  local backlog="$1" ref="$2" mode="$3"
+  local backlog="$1" ref mode="$3"
+  ref="$(judged_ref "$2")"
   local claimed=""
   if [ "$LOCAL" = 0 ]; then
     # No origin, or one that does not answer, means no claims (and no failure).
@@ -176,6 +194,22 @@ EOF
     if "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next 2>/dev/null; then
       echo "self-test: --next should fail with nothing ready (AA-03 is blocked, AA-05 waits on it)"; exit 1
     fi
+    # A lagging checkout: AA-03 lands on origin's main through another clone while the local
+    # main stays behind. Without --ref the script judges against origin/main after a fetch,
+    # so AA-03 is done and AA-05 (blocked by AA-03 and AA-04) is the next ticket; --local
+    # keeps judging the local branch, where nothing is ready.
+    git branch -q -M main
+    git push -q origin main
+    git clone -q -b main origin.git peer 2>/dev/null
+    (cd peer && git config user.email "peer@example.com" && git config user.name "peer" && git commit -q --allow-empty -m "AA-03: third landed elsewhere" && git push -q origin main)
+    "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md | grep -q "^AA-03  done" \
+      || { echo "self-test: AA-03 landed on origin/main and should be done though the local main lags"; "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md; exit 1; }
+    next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --next)"
+    [ "$next" = "AA-05" ] || { echo "self-test: expected AA-05 next once AA-03 landed on origin, got $next"; exit 1; }
+    if "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --local --next 2>/dev/null; then
+      echo "self-test: --local should judge the local main, where AA-03 has not landed"; exit 1
+    fi
+    [ "$(git rev-parse main)" != "$(git rev-parse origin/main)" ] || { echo "self-test: the local main must not have moved"; exit 1; }
   )
   echo "backlog-status self-test passed"
 }
