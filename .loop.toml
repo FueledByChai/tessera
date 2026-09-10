@@ -16,4 +16,4 @@ trailer_required = true
 # --check` fails when scripts/ or loop/prompts/ drift from the tag; move kit_ref to take a
 # newer release, then run the sync.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.2.0"
+kit_ref = "v0.3.0"

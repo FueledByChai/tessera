@@ -22,6 +22,10 @@
 #                                            the root) or a git URL; scripts/loop-kit-sync.sh
 #                                            copies its scripts and prompts in and diffs them
 #   kit_ref           ""                     the kit's tag or branch when kit is a URL
+#   code_paths        []                     globs whose change needs a proof (the proof gate,
+#                                            scripts/proof-gate.sh); empty: gate off
+#   proof_paths       []                     globs that count as proof when changed
+#   proof_pattern     ""                     a regex; an added line matching it counts as proof
 #
 # LOOP_ROOT overrides the root (the fixture repos of the self-tests); LOOP_CONFIG names another
 # file outright. TOML is only the config format: it says nothing about the project's language.
@@ -37,17 +41,19 @@ case "$KEY" in
   "") echo "usage: scripts/loop-config.sh <key> | --all | --self-test" >&2; exit 2 ;;
 esac
 
-# Reads the [loop] table of a TOML file (strings, booleans, one-line string arrays; # comments)
-# and prints the requested key, or every key, with the defaults above filled in.
+# Reads the [loop] table of a TOML file (strings, booleans, one-line string arrays; # comments;
+# the escapes \" and \\ inside strings) and prints the requested key, or every key, with the
+# defaults above filled in.
 read_config() {
   local file="$1" mode="$2" key="$3"
   perl -e '
     use strict; use warnings;
     my ($file, $mode, $key) = @ARGV;
-    my @order = qw(default_branch backlog check check_fast review_paths trailer_required kit kit_ref);
+    my @order = qw(default_branch backlog check check_fast review_paths trailer_required kit kit_ref
+                   code_paths proof_paths proof_pattern);
     my %default = (default_branch => "main", backlog => "BACKLOG.md", check => "scripts/check.sh",
                    check_fast => undef, review_paths => [], trailer_required => "true",
-                   kit => "", kit_ref => "");
+                   kit => "", kit_ref => "", code_paths => [], proof_paths => [], proof_pattern => "");
     my %value;
     if (open my $fh, "<", $file) {
       my $table = "";
@@ -61,10 +67,10 @@ read_config() {
         unless (exists $default{$k}) { warn "$file: unknown key $k in [loop]\n"; next; }
         if ($raw =~ /^\[(.*)\]\s*(?:#.*)?$/) {
           my @items = $1 =~ /"((?:[^"\\]|\\.)*)"/g;
-          s/\\"/"/g for @items;
+          s/\\(["\\])/$1/g for @items;
           $value{$k} = \@items;
         } elsif ($raw =~ /^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/) {
-          (my $s = $1) =~ s/\\"/"/g; $value{$k} = $s;
+          (my $s = $1) =~ s/\\(["\\])/$1/g; $value{$k} = $s;
         } elsif ($raw =~ /^(true|false)\s*(?:#.*)?$/) {
           $value{$k} = $1;
         } else { die "cannot parse $file: $line (strings are double-quoted; arrays are one line)\n"; }
@@ -133,12 +139,18 @@ review_paths = ["schema/\"quoted\".json"]
 trailer_required = true
 kit = "https://example.invalid/loop-kit"
 kit_ref = "v1.2.3"
+code_paths = ["src/", "lib/"]
+proof_paths = ["tests/"]
+proof_pattern = "#\\[test\\]|@Test"
 EOF
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" backlog)"; [ "$got" = "docs/QUEUE.md" ] || { echo "self-test: backlog should be docs/QUEUE.md, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" check_fast)"; [ "$got" = "make lint" ] || { echo "self-test: check_fast should be set, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" review_paths)"; [ "$got" = 'schema/"quoted".json' ] || { echo "self-test: escaped quote lost: '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" kit_ref)"; [ "$got" = "v1.2.3" ] || { echo "self-test: kit_ref should be v1.2.3, got '$got'"; exit 1; }
-  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 8 ] || { echo "self-test: --all should print eight keys, got $got"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" code_paths)"; [ "$got" = $'src/\nlib/' ] || { echo "self-test: code_paths should list two globs, got '$got'"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" proof_pattern)"; [ "$got" = '#\[test\]|@Test' ] || { echo "self-test: an escaped backslash should come through single: '$got'"; exit 1; }
+  got="$(LOOP_ROOT="$dir" "$me" proof_pattern)"; [ -z "$got" ] || { echo "self-test: proof_pattern should default to nothing, got '$got'"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 11 ] || { echo "self-test: --all should print eleven keys, got $got"; exit 1; }
   # An unknown key is an error; an unknown key in the file is a warning, not a failure.
   if LOOP_ROOT="$dir" "$me" colour >/dev/null 2>&1; then echo "self-test: an unknown key must fail"; exit 1; fi
   printf '[loop]\nfoo = "bar"\n' > "$dir/.loop.toml"
