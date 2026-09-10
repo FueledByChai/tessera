@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Line coverage of the crate as one percentage on stdout (HK-23), the `coverage` command the
 # loop's ratchet reads (.loop.toml, scripts/coverage-ratchet.sh). cargo-llvm-cov runs the test
-# suite instrumented in its own target directory (target/llvm-cov-target), so it does not
+# suite instrumented in its own target directory (llvm-cov-target under the cargo target
+# directory, the worktrees' shared one when run from a worktree, HK-27), so it does not
 # disturb the release build the rest of the check uses. Files outside this checkout (the
 # private strategies compiled in through local.toml, the registry, the toolchain) are left out
 # of the measurement; everything under src/, the service binary included, is in.
@@ -11,6 +12,11 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# From a worktree, build into the directory every worktree shares (see scripts/check.sh).
+MAIN_ROOT="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+if [ "$ROOT" != "$MAIN_ROOT" ] && [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  export CARGO_TARGET_DIR="${TESSERA_TARGET_DIR:-$MAIN_ROOT/target-worktrees}"
+fi
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   cat >&2 <<'EOF'
 coverage: cargo-llvm-cov is not installed. Install it once (about two minutes):

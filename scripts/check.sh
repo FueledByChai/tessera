@@ -23,9 +23,14 @@
 #
 # Worktrees: from .claude/worktrees/<name> the script finds the main checkout through the shared
 # git dir, takes the private checkout beside it (or TESSERA_PRIVATE_ROOT), writes a local.toml
-# from the main one with its relative paths made absolute when the worktree has none, and links
-# web/node_modules to the main checkout's when missing. The private checks build the private
-# legacy crate against this checkout's engine (TESSERA_ENGINE_ROOT), not the main one.
+# from the main one with its relative paths made absolute when the worktree has none, links
+# web/node_modules to the main checkout's when missing, and builds into one cargo target
+# directory shared by every worktree, <main checkout>/target-worktrees (HK-27), so the
+# dependency crates compile once for all of them instead of from cold per ticket. It is kept
+# apart from the main checkout's own target/, whose release binaries the deploy loop and the
+# console run: a worktree build must never overwrite those. TESSERA_TARGET_DIR overrides it.
+# The private checks build the private legacy crate against this checkout's engine
+# (TESSERA_ENGINE_ROOT), not the main one.
 #
 # Parity: the two bundled examples run against the synthetic data and their trades and daily
 # equity must match examples/expected byte for byte. A behaviour change in the engine, the SDK,
@@ -68,7 +73,12 @@ PRIVATE_ROOT="${TESSERA_PRIVATE_ROOT:-$MAIN_ROOT/../Tessera-private}"
 if [ -d "$PRIVATE_ROOT" ]; then PRIVATE_ROOT="$(cd "$PRIVATE_ROOT" && pwd)"; fi
 LOCAL_TOML_SOURCE="local.toml"
 NODE_MODULES_SOURCE="web/node_modules"
+TARGET_DIR="$ROOT/target"
+TARGET_SOURCE="target (this checkout's own)"
 if [ "$ROOT" != "$MAIN_ROOT" ]; then
+  TARGET_DIR="${TESSERA_TARGET_DIR:-$MAIN_ROOT/target-worktrees}"
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  TARGET_SOURCE="$TARGET_DIR (shared by every worktree; the main checkout keeps its own target/)"
   if [ ! -e local.toml ] && [ -f "$MAIN_ROOT/local.toml" ]; then
     # Relative paths in the main local.toml (`../Tessera-private/strategies`) mean nothing from
     # a worktree; every relative path that exists beside the main checkout becomes absolute.
@@ -100,6 +110,7 @@ if [ "$RESOLVE" = 1 ]; then
   fi
   echo "local.toml:    $LOCAL_TOML_SOURCE"
   echo "node_modules:  $NODE_MODULES_SOURCE"
+  echo "target dir:    $TARGET_SOURCE"
   exit 0
 fi
 
@@ -150,9 +161,9 @@ cargo build --release --quiet --bin tessera --bin tessera-ui
 
 step "parity against examples/expected"
 for strategy in rsi_mean_reversion moving_average_cross; do
-  out="target/check_$strategy"
+  out="$TARGET_DIR/check_$strategy"
   rm -rf "$out"
-  ./target/release/tessera run-strategy \
+  "$TARGET_DIR/release/tessera" run-strategy \
     --config "examples/configs/$strategy.toml" \
     --start 2019-01-01 --end 2025-12-31 --output-dir "$out" >/dev/null 2>&1
   if [ "$REFRESH" = 1 ]; then

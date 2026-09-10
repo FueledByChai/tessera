@@ -110,8 +110,11 @@ the full check and `--quick`. cargo-llvm-cov is installed once by hand (`rustup 
 llvm-tools-preview`, `cargo install cargo-llvm-cov`); CI installs it itself. From a worktree the script finds the main checkout through the
 shared git dir, the private checkout beside it (`TESSERA_PRIVATE_ROOT` overrides), writes
 `local.toml` from the main one with its relative paths made absolute, links
-`web/node_modules`, and builds the private legacy crate against the worktree's engine;
-`scripts/check.sh --resolve` shows what a run would use.
+`web/node_modules`, builds into `target-worktrees/` beside the main checkout's `target/`
+(one cargo target directory shared by every worktree, so the dependency crates compile once;
+`TESSERA_TARGET_DIR` overrides it; the main checkout's own `target/` holds the binaries the
+console runs and no worktree writes there), and builds the private legacy crate against the
+worktree's engine; `scripts/check.sh --resolve` shows what a run would use.
 
 ### Engine and data rules
 

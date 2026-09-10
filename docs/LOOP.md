@@ -15,8 +15,11 @@ How development and research run without a person in the middle of every step. T
   `scripts/coverage-ratchet.sh --set`. CI (`.github/workflows/ci.yml`)
   runs the same script: `--quick` in the engine job and `--web-only` in the web job, so a
   parity break fails the pull request the way it fails the checkout. Run from a worktree it
-  resolves the main and private checkouts itself (`--resolve` prints them) and never skips the
-  private checks silently. The web job caches playwright's Chromium keyed on the lock file
+  resolves the main and private checkouts itself (`--resolve` prints them), builds into the
+  cargo target directory every worktree shares (`target-worktrees/` beside the main
+  checkout's `target/`, so the 397 dependency crates compile once rather than from cold per
+  ticket, and no worktree ever overwrites the binaries the console runs; HK-27), and never
+  skips the private checks silently. The web job caches playwright's Chromium keyed on the lock file
   and retries the install once when apt's mirror fails (HK-17), the one flake CI has shown.
 - `BACKLOG.md`: the ticket queue. Every ticket has a **Done when** line that a test or fixture
   proves. Done is derived from git, not written into the file: `scripts/backlog-status.sh`

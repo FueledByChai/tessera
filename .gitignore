@@ -1,5 +1,6 @@
-# Build output
+# Build output (target-worktrees is the cargo target directory every agent worktree shares)
 /target/
+/target-worktrees/
 /web/node_modules/
 /web/dist/
 

@@ -29,7 +29,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-SCRATCH="$ROOT/target/scratch-console-$PORT"
+# The binaries and the scratch root: the checkout's own target/, or the shared worktree one
+# when scripts/check.sh set CARGO_TARGET_DIR (HK-27).
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+SCRATCH="$TARGET_DIR/scratch-console-$PORT"
 ORIGIN="http://127.0.0.1:$PORT"
 API="$ORIGIN/api"
 
@@ -57,7 +60,7 @@ case "$COMMAND" in
   url) echo "$ORIGIN/" ;;
   start)
     for binary in tessera tessera-ui; do
-      [ -x "$ROOT/target/release/$binary" ] || { echo "scratch console: build target/release/$binary first" >&2; exit 1; }
+      [ -x "$TARGET_DIR/release/$binary" ] || { echo "scratch console: build $TARGET_DIR/release/$binary first" >&2; exit 1; }
     done
     if curl -sf "$API/health" >/dev/null 2>&1; then
       echo "scratch console: something already answers on $ORIGIN" >&2
@@ -70,7 +73,7 @@ case "$COMMAND" in
     for link in $links; do ln -s "$ROOT/$link" "$SCRATCH/$link"; done
     (
       cd "$SCRATCH"
-      TESSERA_ROOT="$SCRATCH" TESSERA_ADDR="127.0.0.1:$PORT" nohup "$ROOT/target/release/tessera-ui" > "$SCRATCH/api.log" 2>&1 &
+      TESSERA_ROOT="$SCRATCH" TESSERA_ADDR="127.0.0.1:$PORT" nohup "$TARGET_DIR/release/tessera-ui" > "$SCRATCH/api.log" 2>&1 &
       echo $! > "$SCRATCH/api.pid"
     )
     for _ in $(seq 1 60); do curl -sf "$API/health" >/dev/null 2>&1 && break; sleep 1; done
