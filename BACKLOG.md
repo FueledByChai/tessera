@@ -528,3 +528,15 @@ in CI's push run, the ratchet still runs.
 **Done when:** a docs-only branch's full check prints the skip line and finishes without an
 instrumented build; a branch touching `src/` still prints the coverage line; the kit's
 proof-gate self-test covers the query if one is added.
+
+### HK-29 The proof gate sees the working tree, not only commits
+Run locally before the commit, `scripts/proof-gate.sh` reported "no code change" on WB-14's
+worktree, whose src/ changes were still uncommitted: it diffs `origin/<default>...HEAD`, so
+a full check run before committing (the normal order) never exercises the gate, and only CI
+does. The kit script should diff the working tree against the base (`git diff --name-only
+origin/<default>` and the same for added lines), so the gate judges what is about to be
+committed; the override line is still read from the commits in the range. Kit change, tag,
+sync.
+**Done when:** the kit's proof-gate self-test adds an uncommitted code change with no proof
+and sees the gate fail before any commit, and pass once a proof file is added, still
+uncommitted; `kit_ref` here moves to the tag.

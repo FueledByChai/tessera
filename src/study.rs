@@ -1371,7 +1371,9 @@ fn evaluate_features_with(
 ) -> Result<(Vec<f64>, BTreeMap<String, Vec<f64>>, usize)> {
     let mut evaluators = Vec::with_capacity(expressions.len());
     for text in expressions {
+        // Seconds windows convert with the lake step; the OHLCV grids refuse them.
         let expr = feature_expr::parse_with(text, series_names)
+            .and_then(|e| e.resolve(book_grid.then_some(step_secs)))
             .with_context(|| format!("feature expression {text:?}"))?;
         evaluators.push((
             text.clone(),
@@ -1764,7 +1766,13 @@ pub fn run(
     let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
     for feature in config.features.iter().chain(&config.accepted) {
         feature_expr::parse_with(feature, &names)
-            .with_context(|| format!("feature expression {feature:?}"))?;
+            .and_then(|e| e.resolve(grid.has_book().then_some(grid.step_secs())))
+            .with_context(|| {
+                format!(
+                    "feature expression {feature:?} on the {} grid",
+                    grid.label()
+                )
+            })?;
     }
     eprintln!(
         "progress: load 0/{} symbols elapsed=0s",
@@ -1901,7 +1909,8 @@ fn run_study(
     let mut unavailable = Vec::new();
     for text in &config.features {
         let expr = feature_expr::parse_with(text, &series_names)
-            .with_context(|| format!("feature expression {text:?}"))?;
+            .and_then(|e| e.resolve(has_book.then_some(grid.step_secs())))
+            .with_context(|| format!("feature expression {text:?} on the {} grid", grid.label()))?;
         if !has_book && feature_expr::needs_book(&expr) {
             unavailable.push(UnavailableFeature {
                 feature: text.clone(),

@@ -216,12 +216,20 @@ horizons = [1, 5, 20]
 decision_delay_bars = 1
 ```
 Transforms: `ema n`, `sma n`, `zscore n`, `diff n`, `lag n`, `rate n` (sum over `n` bars per
-second), `ratio_to <transform>` (the value over a transform of itself), `pct_rank n`, `abs`,
-`sign`, `clip lo hi`, `times <base | (expr)>`, `agg daily sum|mean|last|realized_var` (the
-day's fold so far, resetting when the bar's date changes; `return_1 | agg daily realized_var`
-is the session's realized variance in bps²). Windows count bars; a bar without a book is `NaN`
-and a `NaN` inside a window propagates, so a lag is always a lag in bars. Unknown names fail with
-the list of what exists. The grammar lives in `src/feature_expr.rs`.
+second), `rv n` (realized vol of the series over its last `n` bar-to-bar returns: the square
+root of the summed squared returns, bps; `mid | rv 30`), `std n` (sample standard deviation of
+the last `n` values of any series; `mid | rv 5 | std 60` is vol-of-vol), `ratio_to <transform>`
+(the value over a transform of itself; `mid | rv 5 | ratio_to rv 60` is short vol over long),
+`pct_rank n`, `abs`, `sign`, `clip lo hi`, `times <base | (expr)>`, `agg daily
+sum|mean|last|realized_var` (the day's fold so far, resetting when the bar's date changes;
+`return_1 | agg daily realized_var` is the session's realized variance in bps²). Windows count
+bars, or seconds with an `s` suffix on the lake grid, converted from the study's step and
+rounded up to whole bars (`rv 30s` is 30 bars at step 1 and 6 bars at step 5; `ema 60s`,
+`zscore 300s` likewise); the daily and minute grids have no step to convert with and refuse a
+seconds window. A bar without a book is `NaN` and a `NaN` inside a window propagates, so a lag is
+always a lag in bars; on the lake grid a second without a trade repeats the last mid, and `rv`
+counts that zero return, so it measures vol per unit of time. Unknown names fail with the list
+of what exists. The grammar lives in `src/feature_expr.rs`.
 
 `target` chooses what every feature is scored against over the horizon: `return` (mid return
 from acting to the horizon, bps, the default), `realized_variance` (sum of squared bar-to-bar
