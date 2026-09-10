@@ -468,3 +468,28 @@ floor still only moves up. Kit change, then a tag and a sync here.
 **Done when:** the kit's coverage-ratchet self-test proves a measurement inside the slack
 passes without suggesting a raise, one below floor minus slack fails, and one above floor
 plus slack suggests the raise; `.loop.toml` here sets the slack and `kit_ref` the tag.
+
+### HK-27 One cargo target directory for the main checkout and every worktree
+Every ticket starts in a fresh worktree with an empty `target/`, so the full check compiles
+the 397 dependency crates from cold twice (release, then instrumented for coverage) before
+touching Tessera's own 24,000 lines: a docs-only ticket takes six minutes to check, and
+Polars gets compiled again though nothing in it changed. Cargo keys artifacts by source
+hash, features, and flags, so one shared target directory serves them all. `scripts/check.sh`
+(and `scripts/coverage.sh`) should set `CARGO_TARGET_DIR` to the main checkout's `target/`
+when run from a worktree (`--resolve` reports it), and the deploy loop and the scratch console
+keep using the main checkout's binaries as they do now.
+**Done when:** `scripts/check.sh --resolve` from a worktree names the shared target
+directory; a docs-only change checked from a fresh worktree right after a full check in the
+main checkout finishes the full check in under three minutes, the time recorded in the
+commit body; the engine job on CI is unaffected.
+
+### HK-28 The coverage ratchet skips itself when no code changed
+Coverage cannot move when nothing under `src/` changed, yet the ratchet runs its instrumented
+build on every docs-only and scripts-only ticket. `scripts/check.sh` should run the ratchet
+only when the diff against `origin/main` touches a `code_paths` entry (the proof gate already
+computes this; a `scripts/proof-gate.sh --code-changed` query, or the same test inline, tells
+it), printing "coverage ratchet: skipped, no code change" otherwise. On `main` itself, and
+in CI's push run, the ratchet still runs.
+**Done when:** a docs-only branch's full check prints the skip line and finishes without an
+instrumented build; a branch touching `src/` still prints the coverage line; the kit's
+proof-gate self-test covers the query if one is added.

@@ -30,6 +30,9 @@
 #                                            coverage ratchet, scripts/coverage-ratchet.sh);
 #                                            empty: ratchet off
 #   coverage_floor    "coverage-floor.txt"   the committed floor the measurement must reach
+#   coverage_slack    "0"                    points of run-to-run jitter the ratchet tolerates:
+#                                            it fails below floor minus slack and suggests a
+#                                            raise only above floor plus slack
 #   review_context    "Agent review"         the commit status the agent review posts
 #                                            (scripts/review-status.sh); the ruleset requires it
 #
@@ -56,11 +59,12 @@ read_config() {
     use strict; use warnings;
     my ($file, $mode, $key) = @ARGV;
     my @order = qw(default_branch backlog check check_fast review_paths trailer_required kit kit_ref
-                   code_paths proof_paths proof_pattern coverage coverage_floor review_context);
+                   code_paths proof_paths proof_pattern coverage coverage_floor coverage_slack review_context);
     my %default = (default_branch => "main", backlog => "BACKLOG.md", check => "scripts/check.sh",
                    check_fast => undef, review_paths => [], trailer_required => "true",
                    kit => "", kit_ref => "", code_paths => [], proof_paths => [], proof_pattern => "",
-                   coverage => "", coverage_floor => "coverage-floor.txt", review_context => "Agent review");
+                   coverage => "", coverage_floor => "coverage-floor.txt", coverage_slack => "0",
+                   review_context => "Agent review");
     my %value;
     if (open my $fh, "<", $file) {
       my $table = "";
@@ -151,6 +155,7 @@ proof_paths = ["tests/"]
 proof_pattern = "#\\[test\\]|@Test"
 coverage = "scripts/coverage.sh"
 coverage_floor = "ci/floor.txt"
+coverage_slack = "0.3"
 review_context = "Robot review"
 EOF
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" backlog)"; [ "$got" = "docs/QUEUE.md" ] || { echo "self-test: backlog should be docs/QUEUE.md, got '$got'"; exit 1; }
@@ -164,7 +169,9 @@ EOF
   got="$(LOOP_ROOT="$dir" "$me" coverage_floor)"; [ "$got" = "coverage-floor.txt" ] || { echo "self-test: coverage_floor should default, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" review_context)"; [ "$got" = "Robot review" ] || { echo "self-test: review_context should be set, got '$got'"; exit 1; }
   got="$(LOOP_ROOT="$dir" "$me" review_context)"; [ "$got" = "Agent review" ] || { echo "self-test: review_context should default, got '$got'"; exit 1; }
-  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 14 ] || { echo "self-test: --all should print fourteen keys, got $got"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" coverage_slack)"; [ "$got" = "0.3" ] || { echo "self-test: coverage_slack should be set, got '$got'"; exit 1; }
+  got="$(LOOP_ROOT="$dir" "$me" coverage_slack)"; [ "$got" = "0" ] || { echo "self-test: coverage_slack should default to 0, got '$got'"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 15 ] || { echo "self-test: --all should print fifteen keys, got $got"; exit 1; }
   # An unknown key is an error; an unknown key in the file is a warning, not a failure.
   if LOOP_ROOT="$dir" "$me" colour >/dev/null 2>&1; then echo "self-test: an unknown key must fail"; exit 1; fi
   printf '[loop]\nfoo = "bar"\n' > "$dir/.loop.toml"

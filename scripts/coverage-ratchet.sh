@@ -13,10 +13,14 @@
 #                   project's tool wrapped so that it prints the figure: cargo-llvm-cov,
 #                   JaCoCo, coverage.py, whichever); empty: the ratchet is off
 #   coverage_floor  the floor file (default coverage-floor.txt), one number, committed
+#   coverage_slack  points of run-to-run jitter to tolerate (default 0): an instrumented test
+#                   suite does not cover exactly the same lines every run, so a measurement
+#                   within the slack below the floor passes, and a raise is suggested only
+#                   when the measurement clears the floor by more than the slack
 #
 # The last number in the command's output is the measurement, a `%` after it is ignored, and
-# the comparison is exact: a ticket that raises coverage raises the floor in the same commit
-# (`--set`), so the floor only ever moves up.
+# a ticket that raises coverage raises the floor in the same commit (`--set`), so the floor
+# only ever moves up.
 set -euo pipefail
 SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="${LOOP_ROOT:-$SCRIPT_ROOT}"
@@ -52,12 +56,15 @@ ratchet() {
     return 1
   fi
   floor="$(tr -d '% \n' < "$floor_file")"
-  case "$(awk -v m="$measured" -v f="$floor" 'BEGIN { if (m < f) print "below"; else if (m > f) print "above"; else print "equal" }')" in
+  local slack; slack="$("$CONFIG" coverage_slack)"
+  case "$(awk -v m="$measured" -v f="$floor" -v s="$slack" 'BEGIN { if (m < f - s) print "below"; else if (m > f + s) print "above"; else if (m < f) print "within"; else print "equal" }')" in
     below)
-      echo "coverage ratchet: FAILED: coverage $measured% < floor $floor% (${floor_file#"$ROOT"/}). Add tests for what this change touched; the floor only moves up." >&2
+      echo "coverage ratchet: FAILED: coverage $measured% < floor $floor% minus slack $slack (${floor_file#"$ROOT"/}). Add tests for what this change touched; the floor only moves up." >&2
       return 1 ;;
     above)
       echo "coverage $measured% >= floor $floor%; raise the floor to $measured: scripts/coverage-ratchet.sh --set" ;;
+    within)
+      echo "coverage $measured% within slack $slack of floor $floor%" ;;
     equal)
       echo "coverage $measured% >= floor $floor%" ;;
   esac
@@ -85,6 +92,20 @@ self_test() {
   printf 'TOTAL 70.9%%\n' > "$dir/report.txt"
   rc=0; out="$("$me" 2>&1)" || rc=$?
   [ "$rc" = 1 ] && echo "$out" | grep -q 'FAILED: coverage 70.9% < floor 71.2%' || { echo "self-test: below should fail naming both (rc $rc):"; echo "$out"; exit 1; }
+  # With slack 0.5: a tenth below passes without a raise; 0.6 below fails; 0.3 above passes
+  # without a raise; 0.6 above suggests the raise.
+  printf '[loop]\ncoverage = "cat report.txt"\ncoverage_slack = "0.5"\n' > "$dir/.loop.toml"
+  printf 'TOTAL 71.1%%\n' > "$dir/report.txt"
+  out="$("$me")" && echo "$out" | grep -q 'coverage 71.1% within slack 0.5 of floor 71.2%' && ! echo "$out" | grep -q 'raise' || { echo "self-test: a tenth below with slack 0.5 should pass without a raise:"; echo "$out"; exit 1; }
+  printf 'TOTAL 70.6%%\n' > "$dir/report.txt"
+  rc=0; out="$("$me" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q 'FAILED: coverage 70.6% < floor 71.2% minus slack 0.5' || { echo "self-test: 0.6 below with slack 0.5 should fail (rc $rc):"; echo "$out"; exit 1; }
+  printf 'TOTAL 71.5%%\n' > "$dir/report.txt"
+  out="$("$me")" && echo "$out" | grep -q 'coverage 71.5% >= floor 71.2%' && ! echo "$out" | grep -q 'raise' || { echo "self-test: 0.3 above with slack 0.5 should pass without a raise:"; echo "$out"; exit 1; }
+  printf 'TOTAL 71.8%%\n' > "$dir/report.txt"
+  out="$("$me")" && echo "$out" | grep -q 'raise the floor to 71.8' || { echo "self-test: 0.6 above with slack 0.5 should suggest the raise:"; echo "$out"; exit 1; }
+  printf '[loop]\ncoverage = "cat report.txt"\n' > "$dir/.loop.toml"
+  printf 'TOTAL 70.9%%\n' > "$dir/report.txt"
   # A floor file with a percent sign and a newline still reads.
   printf '70.5%%\n' > "$dir/coverage-floor.txt"
   out="$("$me")" && echo "$out" | grep -q 'coverage 70.9% >= floor 70.5%' || { echo "self-test: a floor written with a percent sign should read:"; echo "$out"; exit 1; }
