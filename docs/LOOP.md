@@ -6,8 +6,13 @@ How development and research run without a person in the middle of every step. T
   it: the loop section first (the same in every project that uses the loop), then the
   **Project rules**. `CLAUDE.md` is one line that imports it, so Claude Code reads the same
   file Codex, OpenCode, and the rest read.
-- `scripts/check.sh`: the definition of done as a command (fmt, tests, build, example parity,
-  web, private checks). Green means a ticket may be committed. CI (`.github/workflows/ci.yml`)
+- `scripts/check.sh`: the definition of done as a command (the proof gate and the coverage
+  ratchet from the kit, fmt, tests, build, example parity, web, private checks). Green means
+  a ticket may be committed. The gate (HK-23) fails a change under `src/` that brings no
+  test, fixture, or check and no `No new test: <reason>` line; the ratchet fails line
+  coverage below `coverage-floor.txt`, measured by `scripts/coverage.sh` with cargo-llvm-cov
+  in the full check and `--quick`, and a ticket that raises coverage raises the floor with
+  `scripts/coverage-ratchet.sh --set`. CI (`.github/workflows/ci.yml`)
   runs the same script: `--quick` in the engine job and `--web-only` in the web job, so a
   parity break fails the pull request the way it fails the checkout. Run from a worktree it
   resolves the main and private checkouts itself (`--resolve` prints them) and never skips the

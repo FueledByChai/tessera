@@ -2,8 +2,10 @@
 # The definition of done, as a command. Exits non-zero on the first failure.
 #
 #   scripts/check.sh                  everything: fmt, tests, build, parity, web, private checks
-#   scripts/check.sh --no-web         skip the web typecheck/lint/build (slow on iCloud checkouts)
-#   scripts/check.sh --quick          skip web and the private checks (the CI engine job)
+#   scripts/check.sh --no-web         skip the web typecheck/lint/build and the coverage
+#                                     ratchet (the fast check while iterating)
+#   scripts/check.sh --quick          skip web and the private checks (the CI engine job);
+#                                     the coverage ratchet still runs
 #   scripts/check.sh --web-only       only the web step (the CI web job); the headless layout
 #                                     and chart checks skip themselves without a Chromium
 #   scripts/check.sh --private-only   only the private checks (the deploy loop's post-merge
@@ -13,6 +15,11 @@
 #                                     an intentional results change, and say so in the commit
 #   scripts/check.sh --resolve        print what a run here would use (main checkout, private
 #                                     checkout, local.toml, node_modules) and exit
+#
+# The proof gate (scripts/proof-gate.sh) runs in every mode but --web-only and
+# --private-only: a change under src/ must bring a test, fixture, or check, or say why. The
+# coverage ratchet (scripts/coverage-ratchet.sh over scripts/coverage.sh) runs in the full
+# check and --quick: line coverage must not drop below coverage-floor.txt (HK-23).
 #
 # Worktrees: from .claude/worktrees/<name> the script finds the main checkout through the shared
 # git dir, takes the private checkout beside it (or TESSERA_PRIVATE_ROOT), writes a local.toml
@@ -31,14 +38,15 @@ NO_WEB=0
 QUICK=0
 WEB_ONLY=0
 PRIVATE_ONLY=0
+RATCHET=1
 REFRESH=0
 RESOLVE=0
 for arg in "$@"; do
   case "$arg" in
-    --no-web) NO_WEB=1 ;;
+    --no-web) NO_WEB=1; RATCHET=0 ;;
     --quick) QUICK=1; NO_WEB=1 ;;
-    --web-only) WEB_ONLY=1; QUICK=1 ;;
-    --private-only) PRIVATE_ONLY=1; NO_WEB=1 ;;
+    --web-only) WEB_ONLY=1; QUICK=1; RATCHET=0 ;;
+    --private-only) PRIVATE_ONLY=1; NO_WEB=1; RATCHET=0 ;;
     --refresh-baseline) REFRESH=1 ;;
     --resolve) RESOLVE=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
@@ -124,6 +132,11 @@ if grep -rniE 'tessera|cargo|npm|claude|examples/expected' loop/; then
 fi
 echo "loop/ is generic"
 
+# A change under src/ must bring a test, fixture, or check (HK-23; the paths and the pattern
+# are in .loop.toml). Judged against origin/main, so CI fetches the history it needs.
+step "proof gate: code changes bring a proof"
+scripts/proof-gate.sh
+
 step "cargo fmt --check"
 cargo fmt --all --check
 
@@ -157,6 +170,11 @@ for strategy in rsi_mean_reversion moving_average_cross; do
   done
   echo "parity ok: $strategy"
 done
+fi
+
+if [ "$RATCHET" = 1 ]; then
+  step "coverage ratchet: line coverage against coverage-floor.txt"
+  scripts/coverage-ratchet.sh
 fi
 
 if [ "$NO_WEB" = 0 ]; then
