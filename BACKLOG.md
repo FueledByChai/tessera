@@ -456,3 +456,15 @@ with the `gh` command the ticket carries. Serves BT-903.
 run; `gh api repos/FueledByChai/tessera/rules/branches/main` lists the context as required;
 auto-merge on a green PR waits for it and fires after it; `docs/LOOP.md` has the override
 command.
+
+### HK-26 Coverage ratchet tolerates measurement jitter
+Two runs of `scripts/coverage.sh` on the same HK-23 commit measured 55.5% and then 55.6%:
+the instrumented test suite does not cover exactly the same lines every run (timing and
+ordering in a few tests). With an exact comparison a run that lands a tenth below the floor
+fails a PR that changed nothing. Add a `coverage_slack` key to the kit's ratchet (default 0,
+this checkout 0.2): the check fails only when the measurement is below floor minus slack, and
+"raise the floor" is suggested only when it exceeds the floor by more than the slack, so the
+floor still only moves up. Kit change, then a tag and a sync here.
+**Done when:** the kit's coverage-ratchet self-test proves a measurement inside the slack
+passes without suggesting a raise, one below floor minus slack fails, and one above floor
+plus slack suggests the raise; `.loop.toml` here sets the slack and `kit_ref` the tag.

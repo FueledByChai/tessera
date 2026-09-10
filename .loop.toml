@@ -16,4 +16,15 @@ trailer_required = true
 # --check` fails when scripts/ or loop/prompts/ drift from the tag; move kit_ref to take a
 # newer release, then run the sync.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.4.0"
+kit_ref = "v0.4.1"
+# The proof gate (scripts/proof-gate.sh, HK-23): a change under src/ must come with a change
+# under a proof path, or add a #[test] or #[cfg(test)] line, or say why in the commit body
+# (`No new test: <reason>`).
+code_paths = ["src/"]
+proof_paths = ["tests/", "examples/expected/", "web/fixtures/", "web/scripts/*-check.mjs"]
+proof_pattern = "#\\[test\\]|#\\[cfg\\(test\\)\\]"
+# The coverage ratchet (scripts/coverage-ratchet.sh): scripts/coverage.sh prints the crate's
+# line coverage from cargo-llvm-cov; the check fails below coverage-floor.txt, and a ticket
+# that raises coverage raises the floor with `scripts/coverage-ratchet.sh --set`.
+coverage = "scripts/coverage.sh"
+coverage_floor = "coverage-floor.txt"

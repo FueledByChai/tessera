@@ -95,7 +95,15 @@ and chart checks, and the private checks when that checkout exists. `--no-web` i
 check. If an engine change intentionally alters results, refresh the baseline with
 `scripts/check.sh --refresh-baseline` and say why in the commit; `examples/expected/` is the
 review path, so that PR waits for the owner. CI runs `--quick` in the engine job and
-`--web-only` in the web job; the deploy loop runs `--private-only` after a merge. From a worktree the script finds the main checkout through the
+`--web-only` in the web job; the deploy loop runs `--private-only` after a merge. Two gates
+from the kit run inside it: the proof gate (a change under `src/` must bring a change under
+`tests/`, `examples/expected/`, `web/fixtures/`, or a check script, or add a `#[test]` or
+`#[cfg(test)]` line, or say `No new test: <reason>` in the commit body) in every mode but
+`--web-only` and `--private-only`, and the coverage ratchet (`scripts/coverage.sh`, line
+coverage of the crate from cargo-llvm-cov, must not drop below `coverage-floor.txt`; raise
+the floor with `scripts/coverage-ratchet.sh --set` in the commit that raised coverage) in the
+full check and `--quick`. cargo-llvm-cov is installed once by hand (`rustup component add
+llvm-tools-preview`, `cargo install cargo-llvm-cov`); CI installs it itself. From a worktree the script finds the main checkout through the
 shared git dir, the private checkout beside it (`TESSERA_PRIVATE_ROOT` overrides), writes
 `local.toml` from the main one with its relative paths made absolute, links
 `web/node_modules`, and builds the private legacy crate against the worktree's engine;

@@ -12,6 +12,9 @@ name: CI
 # another PR merges, a branch is rebased (scripts/open-ticket-pr.sh <id> --update) and both jobs
 # run again on the exact result that would land (HK-10).
 #
+# The engine job also installs cargo-llvm-cov (the coverage ratchet, HK-23) and checks out the
+# full history so the proof gate can diff the branch against origin/main.
+#
 # The browser (HK-17): playwright's Chromium is cached under ~/.cache/ms-playwright, keyed on
 # the lock file, so a run on the same dependencies restores it instead of downloading it. The
 # system libraries it needs come from apt on every run, and apt's mirrors have failed with
@@ -32,9 +35,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - run: scripts/check.sh --quick
 
@@ -43,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20

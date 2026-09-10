@@ -10,8 +10,9 @@
 # Settings, from .loop.toml through scripts/loop-config.sh:
 #   code_paths     globs (a file, a prefix, or a shell pattern) whose change needs a proof
 #   proof_paths    globs that count as proof when changed
-#   proof_pattern  a regex (grep -E); an added line matching it in any changed file counts as
-#                  proof, so a new test function beside the code it tests qualifies
+#   proof_pattern  a regex (grep -E); an added line matching it in a changed code file counts
+#                  as proof, so a new test function beside the code it tests qualifies (a
+#                  docs or config file quoting the pattern does not)
 # With code_paths empty, or both proof_paths and proof_pattern empty, the gate is off.
 #
 # A commit body line `No new test: <reason>` anywhere in the range lets the change through;
@@ -55,11 +56,14 @@ gate() {
   local -a code=() proof=()
   local file
   # A file can be both: code that gains a test function beside it counts as its own proof.
+  # The pattern is looked for in code files only; a docs or config file quoting it is not proof.
+  local is_code
   while IFS= read -r file; do
     [ -n "$file" ] || continue
-    if matches_any "$file" "${code_globs[@]}"; then code+=("$file"); fi
+    is_code=0
+    if matches_any "$file" "${code_globs[@]}"; then code+=("$file"); is_code=1; fi
     if [ "${#proof_globs[@]}" -gt 0 ] && matches_any "$file" "${proof_globs[@]}"; then proof+=("$file (path)"); continue; fi
-    if [ -n "$pattern" ] && git diff "$base...HEAD" -- "$file" | grep -v '^+++' | grep '^+' | grep -qE -- "$pattern"; then proof+=("$file (adds a line matching the pattern)"); fi
+    if [ "$is_code" = 1 ] && [ -n "$pattern" ] && git diff "$base...HEAD" -- "$file" | grep -v '^+++' | grep '^+' | grep -qE -- "$pattern"; then proof+=("$file (adds a line matching the pattern)"); fi
   done < <(git diff --name-only "$base...HEAD" 2>/dev/null || true)
   if [ "${#code[@]}" = 0 ]; then echo "proof gate: ok (no code change against $base)"; return 0; fi
   if [ "${#proof[@]}" -gt 0 ]; then
@@ -107,6 +111,10 @@ self_test() {
   fresh; (cd "$dir/work" && printf 'fn c() {}\n#[test]\nfn c_works() {}\n' >> src/lib.rs && git commit -q -am "AA-02: c with its test")
   out="$("$me")" || { echo "self-test: an added #[test] line should count as proof:"; echo "$out"; exit 1; }
   echo "$out" | grep -q 'src/lib.rs (adds a line matching the pattern)' || { echo "self-test: pass line should name the pattern match:"; echo "$out"; exit 1; }
+  # 3b. A docs file that quotes the pattern is not proof for a code change.
+  fresh; (cd "$dir/work" && echo "fn e() {}" >> src/lib.rs && printf 'Write tests with #[test].\n' >> docs/README.md && git commit -q -am "AA-05: e, docs mention tests")
+  rc=0; out="$("$me" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q 'FAILED' || { echo "self-test: a docs file quoting the pattern must not count as proof (rc $rc):"; echo "$out"; exit 1; }
   # 4. Code with the override line in the body: passes and prints the reason.
   fresh; (cd "$dir/work" && echo "// comment" >> src/lib.rs && git commit -q -am "AA-03: comment" -m "No new test: a comment only")
   out="$("$me")" || { echo "self-test: the override line should let it through:"; echo "$out"; exit 1; }
