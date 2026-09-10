@@ -14,6 +14,11 @@
 //! a hand-written feature. A missing input (no book on the bar) is `NaN`; windowed transforms
 //! return `NaN` until their window is full of finite values, and a `NaN` inside the window
 //! propagates rather than being skipped, so a lag is always a lag in bars.
+//!
+//! A window is a count of bars (`zscore 30`) or, with an `s` suffix, a number of seconds
+//! (`rv 30s`) that [`Expr::resolve`] turns into bars from the study's step on the lake grid;
+//! the other grids have no step to convert with and refuse a seconds window. `mid | rv 30s`
+//! is the last 30 seconds of realized vol at any step, `mid | rv 5s | std 60s` is vol-of-vol.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -122,6 +127,8 @@ pub const TRANSFORMS: &[&str] = &[
     "diff n",
     "lag n",
     "rate n",
+    "rv n",
+    "std n",
     "ratio_to <transform>",
     "pct_rank n",
     "abs",
@@ -161,19 +168,52 @@ impl AggOp {
     }
 }
 
+/// A transform's window: a count of bars, or seconds to be converted from the grid's step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    Bars(usize),
+    Seconds(u32),
+}
+
+impl Span {
+    /// The window in bars on a grid of `step_secs`-second bars: seconds round up to whole bars
+    /// and never fall below one.
+    pub fn bars(self, step_secs: u32) -> usize {
+        match self {
+            Span::Bars(n) => n,
+            Span::Seconds(s) => (s.div_ceil(step_secs.max(1)) as usize).max(1),
+        }
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Span::Bars(n) => write!(f, "{n}"),
+            Span::Seconds(s) => write!(f, "{s}s"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transform {
-    Ema(usize),
-    Sma(usize),
-    Zscore(usize),
-    Diff(usize),
-    Lag(usize),
+    Ema(Span),
+    Sma(Span),
+    Zscore(Span),
+    Diff(Span),
+    Lag(Span),
     /// Sum over the last `n` bars divided by the seconds those bars span: a per-second rate.
-    Rate(usize),
+    Rate(Span),
+    /// Realized vol of the incoming series over the last `n` bar-to-bar returns: the square
+    /// root of the sum of squared returns (bps). A gap (`NaN` or a non-positive price) in the
+    /// window gives `NaN`, as `trailing_realized_variance` does for the regime buckets.
+    Rv(Span),
+    /// Sample standard deviation of the last `n` values of any series.
+    Std(Span),
     /// The value divided by a transform of the same series (e.g. `ratio_to sma 300`).
     RatioTo(Box<Transform>),
     /// Fraction of the last `n` values at or below the current one, in (0, 1].
-    PctRank(usize),
+    PctRank(Span),
     Abs,
     Sign,
     Clip(f64, f64),
@@ -199,6 +239,8 @@ impl fmt::Display for Transform {
             Transform::Diff(n) => write!(f, "diff {n}"),
             Transform::Lag(n) => write!(f, "lag {n}"),
             Transform::Rate(n) => write!(f, "rate {n}"),
+            Transform::Rv(n) => write!(f, "rv {n}"),
+            Transform::Std(n) => write!(f, "std {n}"),
             Transform::RatioTo(inner) => write!(f, "ratio_to {inner}"),
             Transform::PctRank(n) => write!(f, "pct_rank {n}"),
             Transform::Abs => write!(f, "abs"),
@@ -236,10 +278,59 @@ impl fmt::Display for Expr {
     }
 }
 
+impl Transform {
+    fn resolve(&self, lake_step: Option<u32>) -> Result<Transform> {
+        let bars = |span: &Span| -> Result<Span> {
+            match (*span, lake_step) {
+                (Span::Bars(n), _) => Ok(Span::Bars(n)),
+                (Span::Seconds(_), Some(step)) => Ok(Span::Bars(span.bars(step))),
+                (Span::Seconds(_), None) => bail!(
+                    "`{self}`: seconds windows need the lake grid, whose step says how many \
+                     bars a second is; on this grid write the window in bars"
+                ),
+            }
+        };
+        Ok(match self {
+            Transform::Ema(s) => Transform::Ema(bars(s)?),
+            Transform::Sma(s) => Transform::Sma(bars(s)?),
+            Transform::Zscore(s) => Transform::Zscore(bars(s)?),
+            Transform::Diff(s) => Transform::Diff(bars(s)?),
+            Transform::Lag(s) => Transform::Lag(bars(s)?),
+            Transform::Rate(s) => Transform::Rate(bars(s)?),
+            Transform::Rv(s) => Transform::Rv(bars(s)?),
+            Transform::Std(s) => Transform::Std(bars(s)?),
+            Transform::PctRank(s) => Transform::PctRank(bars(s)?),
+            Transform::RatioTo(inner) => Transform::RatioTo(Box::new(inner.resolve(lake_step)?)),
+            Transform::Times(inner) => Transform::Times(Box::new(inner.resolve(lake_step)?)),
+            Transform::Abs | Transform::Sign | Transform::Clip(..) | Transform::Agg(_) => {
+                self.clone()
+            }
+        })
+    }
+}
+
+impl Expr {
+    /// The expression with every seconds window turned into bars: `lake_step` is the lake
+    /// grid's step in seconds, or `None` on a grid whose bars are not seconds (daily, 5m, 1m),
+    /// where a seconds window is an error. An expression written in bars is unchanged.
+    pub fn resolve(&self, lake_step: Option<u32>) -> Result<Expr> {
+        Ok(Expr {
+            base: self.base.clone(),
+            transforms: self
+                .transforms
+                .iter()
+                .map(|t| t.resolve(lake_step))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     Ident(String),
     Number(f64),
+    /// A number with an `s` suffix: a window in seconds.
+    Seconds(f64),
     Pipe,
     Open,
     Close,
@@ -287,7 +378,17 @@ fn tokenize(text: &str) -> Result<Vec<Token>> {
                 let value: f64 = text
                     .parse()
                     .map_err(|_| anyhow::anyhow!("{text:?} is not a number"))?;
-                tokens.push(Token::Number(value));
+                // `30s`: the suffix must end the token, so `30sma` stays an error.
+                let suffixed = chars.get(i) == Some(&'s')
+                    && !chars
+                        .get(i + 1)
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_');
+                if suffixed {
+                    i += 1;
+                    tokens.push(Token::Seconds(value));
+                } else {
+                    tokens.push(Token::Number(value));
+                }
             }
             other => bail!("unexpected character {other:?} in feature expression"),
         }
@@ -324,10 +425,13 @@ impl Parser<'_> {
         }
         Ok(Expr { base, transforms })
     }
-    fn window(&mut self, name: &str) -> Result<usize> {
+    fn window(&mut self, name: &str) -> Result<Span> {
         match self.next() {
-            Some(Token::Number(n)) if n >= 1.0 && n.fract() == 0.0 => Ok(n as usize),
-            other => bail!("{name} needs a positive whole-number window, found {other:?}"),
+            Some(Token::Number(n)) if n >= 1.0 && n.fract() == 0.0 => Ok(Span::Bars(n as usize)),
+            Some(Token::Seconds(n)) if n >= 1.0 && n.fract() == 0.0 => Ok(Span::Seconds(n as u32)),
+            other => bail!(
+                "{name} needs a positive whole-number window (bars, or seconds with an s suffix), found {other:?}"
+            ),
         }
     }
     fn number(&mut self, name: &str) -> Result<f64> {
@@ -348,6 +452,8 @@ impl Parser<'_> {
             "diff" => Transform::Diff(self.window("diff")?),
             "lag" => Transform::Lag(self.window("lag")?),
             "rate" => Transform::Rate(self.window("rate")?),
+            "rv" => Transform::Rv(self.window("rv")?),
+            "std" => Transform::Std(self.window("std")?),
             "pct_rank" => Transform::PctRank(self.window("pct_rank")?),
             "agg" => {
                 match self.next() {
@@ -523,6 +629,13 @@ enum State {
     },
     RatioTo(Box<State>),
     PctRank(Window),
+    /// Window of the last `n` bar-to-bar returns (bps) of the incoming series, and the
+    /// previous value the next return is taken against.
+    Rv {
+        returns: Window,
+        previous: Option<f64>,
+    },
+    Std(Window),
     Abs,
     Sign,
     Clip(f64, f64),
@@ -539,24 +652,32 @@ enum State {
 }
 
 impl State {
+    /// Windows in seconds are converted with `step_secs` here as a last resort; a study
+    /// resolves them first ([`Expr::resolve`]) so a non-lake grid refuses them instead.
     fn new(transform: &Transform, step_secs: u32, book_grid: bool, series: &[String]) -> Self {
+        let bars = |span: &Span| span.bars(step_secs);
         match transform {
             Transform::Ema(n) => State::Ema {
-                alpha: 2.0 / (*n as f64 + 1.0),
+                alpha: 2.0 / (bars(n) as f64 + 1.0),
                 value: None,
             },
-            Transform::Sma(n) => State::Sma(Window::new(*n)),
-            Transform::Zscore(n) => State::Zscore(Window::new(*n)),
-            Transform::Diff(n) => State::Diff(Window::new(*n + 1)),
-            Transform::Lag(n) => State::Lag(Window::new(*n + 1)),
+            Transform::Sma(n) => State::Sma(Window::new(bars(n))),
+            Transform::Zscore(n) => State::Zscore(Window::new(bars(n))),
+            Transform::Diff(n) => State::Diff(Window::new(bars(n) + 1)),
+            Transform::Lag(n) => State::Lag(Window::new(bars(n) + 1)),
             Transform::Rate(n) => State::Rate {
-                window: Window::new(*n),
-                seconds: (*n as f64) * f64::from(step_secs.max(1)),
+                window: Window::new(bars(n)),
+                seconds: (bars(n) as f64) * f64::from(step_secs.max(1)),
             },
+            Transform::Rv(n) => State::Rv {
+                returns: Window::new(bars(n)),
+                previous: None,
+            },
+            Transform::Std(n) => State::Std(Window::new(bars(n))),
             Transform::RatioTo(inner) => {
                 State::RatioTo(Box::new(State::new(inner, step_secs, book_grid, series)))
             }
-            Transform::PctRank(n) => State::PctRank(Window::new(*n)),
+            Transform::PctRank(n) => State::PctRank(Window::new(bars(n))),
             Transform::Abs => State::Abs,
             Transform::Sign => State::Sign,
             Transform::Clip(lo, hi) => State::Clip(*lo, *hi),
@@ -655,6 +776,34 @@ impl State {
                 } else {
                     f64::NAN
                 }
+            }
+            State::Rv { returns, previous } => {
+                let r = match *previous {
+                    Some(p) if x.is_finite() && p.is_finite() && p > 0.0 => (x / p - 1.0) * 1e4,
+                    _ => f64::NAN,
+                };
+                *previous = Some(x);
+                returns.push(r);
+                if returns.full() {
+                    returns.values.iter().map(|r| r * r).sum::<f64>().sqrt()
+                } else {
+                    f64::NAN
+                }
+            }
+            State::Std(window) => {
+                window.push(x);
+                if !window.full() || window.size < 2 {
+                    return f64::NAN;
+                }
+                let n = window.size as f64;
+                let mean = window.values.iter().sum::<f64>() / n;
+                (window
+                    .values
+                    .iter()
+                    .map(|v| (v - mean) * (v - mean))
+                    .sum::<f64>()
+                    / (n - 1.0))
+                    .sqrt()
             }
             State::Agg {
                 op,
@@ -891,8 +1040,8 @@ mod tests {
         assert_eq!(
             e.transforms,
             vec![
-                Transform::Rate(1),
-                Transform::RatioTo(Box::new(Transform::Sma(300)))
+                Transform::Rate(Span::Bars(1)),
+                Transform::RatioTo(Box::new(Transform::Sma(Span::Bars(300))))
             ]
         );
         assert_eq!(e.to_string(), "trade_count | rate 1 | ratio_to sma 300");
@@ -901,7 +1050,7 @@ mod tests {
         match &nested.transforms[0] {
             Transform::Times(inner) => {
                 assert_eq!(inner.base, "spread_bps");
-                assert_eq!(inner.transforms, vec![Transform::Zscore(60)]);
+                assert_eq!(inner.transforms, vec![Transform::Zscore(Span::Bars(60))]);
             }
             other => panic!("expected times, got {other:?}"),
         }
@@ -1002,6 +1151,149 @@ mod tests {
             nested[0].is_nan() && close(nested[1], 2.0) && close(nested[5], 15.0),
             "{nested:?}"
         );
+    }
+
+    /// Runs an expression over a series of mids, one bar per value; `None` is a bar without a
+    /// book (a gap).
+    fn run_mids(expr: &str, mids: &[Option<f64>], step: u32) -> Vec<f64> {
+        let expr = parse(expr).unwrap().resolve(Some(step)).unwrap();
+        let mut eval = Evaluator::new(&expr, step);
+        let bars: Vec<LakeBar> = mids
+            .iter()
+            .map(|m| {
+                let mut b = bar(m.unwrap_or(100.0), 1, 1.0, 0.0);
+                if m.is_none() {
+                    b.book = None;
+                }
+                b
+            })
+            .collect();
+        bars.iter()
+            .map(|b| {
+                eval.next(BarInput {
+                    bar: b,
+                    previous_mid: None,
+                    exogenous: &[],
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rv_and_std_match_hand_computed_values_and_gaps_give_nan() {
+        // Mids 100, 101, 100, 102: returns 100, -99.0099, 200 bps.
+        let mids = [Some(100.0), Some(101.0), Some(100.0), Some(102.0)];
+        let rv = run_mids("mid | rv 2", &mids, 1);
+        let r1 = (101.0_f64 / 100.0 - 1.0) * 1e4;
+        let r2 = (100.0_f64 / 101.0 - 1.0) * 1e4;
+        let r3 = (102.0_f64 / 100.0 - 1.0) * 1e4;
+        assert!(rv[0].is_nan() && rv[1].is_nan(), "{rv:?}");
+        assert!(close(rv[2], (r1 * r1 + r2 * r2).sqrt()), "{rv:?}");
+        assert!(close(rv[3], (r2 * r2 + r3 * r3).sqrt()), "{rv:?}");
+        // std 3 of the mids themselves: sample sd of 101, 100, 102 is 1.
+        let sd = run_mids("mid | std 3", &mids, 1);
+        assert!(sd[2].is_nan() == false && close(sd[3], 1.0), "{sd:?}");
+        assert!(sd[1].is_nan(), "{sd:?}");
+        // A gap: the return into and out of the missing bar is NaN, so any rv window that
+        // covers either is NaN, and the first full clean window recovers.
+        let gapped = [
+            Some(100.0),
+            Some(101.0),
+            None,
+            Some(101.0),
+            Some(102.0),
+            Some(101.0),
+        ];
+        let rv = run_mids("mid | rv 2", &gapped, 1);
+        assert!(rv[2].is_nan() && rv[3].is_nan() && rv[4].is_nan(), "{rv:?}");
+        let r4 = (102.0_f64 / 101.0 - 1.0) * 1e4;
+        let r5 = (101.0_f64 / 102.0 - 1.0) * 1e4;
+        assert!(close(rv[5], (r4 * r4 + r5 * r5).sqrt()), "{rv:?}");
+        // rv counts a flat bar as a zero return: vol per unit of time, not per trade.
+        let flat = [Some(100.0), Some(101.0), Some(101.0), Some(101.0)];
+        let rv = run_mids("mid | rv 2", &flat, 1);
+        assert!(close(rv[3], 0.0), "{rv:?}");
+    }
+
+    #[test]
+    fn seconds_windows_resolve_from_the_step_and_need_the_lake_grid() {
+        let e = parse("mid | rv 30s | ema 60s").unwrap();
+        assert_eq!(e.to_string(), "mid | rv 30s | ema 60s");
+        assert_eq!(
+            e.resolve(Some(5)).unwrap().transforms,
+            vec![Transform::Rv(Span::Bars(6)), Transform::Ema(Span::Bars(12))]
+        );
+        assert_eq!(
+            e.resolve(Some(1)).unwrap().transforms,
+            vec![
+                Transform::Rv(Span::Bars(30)),
+                Transform::Ema(Span::Bars(60))
+            ]
+        );
+        // Seconds round up to whole bars and never fall below one.
+        assert_eq!(Span::Seconds(30).bars(7), 5);
+        assert_eq!(Span::Seconds(3).bars(5), 1);
+        // The same expression evaluates identically written either way.
+        let mids: Vec<Option<f64>> = (0..40)
+            .map(|i| Some(100.0 + (i as f64 * 0.7).sin()))
+            .collect();
+        let by_seconds = run_mids("mid | rv 30s", &mids, 5);
+        let by_bars = run_mids("mid | rv 6", &mids, 5);
+        assert!(
+            by_seconds
+                .iter()
+                .zip(&by_bars)
+                .all(|(a, b)| (a.is_nan() && b.is_nan()) || close(*a, *b)),
+            "{by_seconds:?} vs {by_bars:?}"
+        );
+        // Nested windows resolve too, and bars-only expressions are untouched.
+        let nested = parse("obi_l1 | times (spread_bps | zscore 60s) | ratio_to sma 300s").unwrap();
+        assert_eq!(
+            nested.resolve(Some(10)).unwrap().to_string(),
+            "obi_l1 | times (spread_bps | zscore 6) | ratio_to sma 30"
+        );
+        let plain = parse("trade_count | rate 1 | ratio_to sma 300").unwrap();
+        assert_eq!(plain.resolve(None).unwrap(), plain);
+        // A seconds window on a grid without a step is refused, naming the lake grid.
+        let err = parse("close | ema 60s")
+            .unwrap()
+            .resolve(None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ema 60s") && err.contains("lake grid"),
+            "{err}"
+        );
+        // The suffix must end the token.
+        assert!(parse("mid | rv 30sma").is_err());
+        assert!(parse("mid | rv 0s").is_err());
+    }
+
+    #[test]
+    fn rv_separates_a_high_vol_regime_from_a_low_one() {
+        // A deterministic 1-second grid: 300 bars of small alternating moves, then 300 bars
+        // of moves four times as large.
+        let mut mids = Vec::new();
+        let mut price: f64 = 100.0;
+        for i in 0..600 {
+            let bps = if i < 300 { 2.0 } else { 8.0 };
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            price *= 1.0 + sign * bps / 1e4;
+            mids.push(Some(price));
+        }
+        let rv = run_mids("mid | rv 30", &mids, 1);
+        let mean = |range: std::ops::Range<usize>| {
+            let v: Vec<f64> = rv[range]
+                .iter()
+                .copied()
+                .filter(|x| x.is_finite())
+                .collect();
+            v.iter().sum::<f64>() / v.len() as f64
+        };
+        let low = mean(60..300);
+        let high = mean(360..600);
+        assert!(high > 2.0 * low, "low {low} high {high}");
+        assert!(low > 0.0);
     }
 
     #[test]
