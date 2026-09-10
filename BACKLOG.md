@@ -367,7 +367,7 @@ write the failure to `data/ui/deploy.log` so the owner sees it the next morning.
 leaving the service untouched with `private checks failed` in the log, and one where it passes
 and the restart proceeds; `docs/LOOP.md` names it as the post-merge guard.
 
-### HK-19 The loop kit is published and this checkout consumes it by tag — `blocked needs the owner to pick the name and create the repository`
+### HK-19 The loop kit is published and this checkout consumes it by tag
 HK-16 built the kit as `loop/` and proved it; the repository itself needs the owner: pick the
 name (working name `loop-kit`), create it under `FueledByChai` as public, push the contents of
 `loop/` to it (`git subtree split --prefix=loop` keeps the history, or a plain copy), tag
