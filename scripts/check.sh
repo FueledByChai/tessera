@@ -98,6 +98,16 @@ scripts/open-ticket-pr.sh --self-test
 scripts/release-notes.sh --self-test
 scripts/deploy-local.sh --self-test
 
+# The loop prompts belong to every project that adopts the loop (HK-15): nothing in loop/
+# may name this project, its build tools, a harness, or its review path. (.loop.toml is
+# exempt: it holds this project's own values.)
+step "loop prompts name no project, build tool, or harness"
+if grep -rniE 'tessera|cargo|npm|claude|examples/expected' loop/; then
+  echo "loop/ must stay generic: the lines above name the project, a build tool, or a harness" >&2
+  exit 1
+fi
+echo "loop/ is generic"
+
 step "cargo fmt --check"
 cargo fmt --all --check
 

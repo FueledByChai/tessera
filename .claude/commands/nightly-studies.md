@@ -1,4 +1,4 @@
-Run the registered feature studies and append the findings to the research log. Follow CLAUDE.md.
+Run the registered feature studies and append the findings to the research log. Follow AGENTS.md.
 
 1. Study configs are `../Tessera-private/research/studies/*.toml`. Each carries its window in
    comment lines `# start = YYYY-MM-DD` and `# end = YYYY-MM-DD` (the lake has fixed coverage;

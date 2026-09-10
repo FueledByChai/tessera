@@ -2,7 +2,10 @@
 
 How development and research run without a person in the middle of every step. The pieces:
 
-- `CLAUDE.md`: the standing rules any agent follows in this checkout.
+- `AGENTS.md`: the standing rules any agent follows in this checkout, whatever harness runs
+  it: the loop section first (the same in every project that uses the loop), then the
+  **Project rules**. `CLAUDE.md` is one line that imports it, so Claude Code reads the same
+  file Codex, OpenCode, and the rest read.
 - `scripts/check.sh`: the definition of done as a command (fmt, tests, build, example parity,
   web, private checks). Green means a ticket may be committed. CI (`.github/workflows/ci.yml`)
   runs the same script: `--quick` in the engine job and `--web-only` in the web job, so a
@@ -18,7 +21,13 @@ How development and research run without a person in the middle of every step. T
   `scripts/release-notes.sh --archive <tag> <previous-tag> <tag>` moves the shipped tickets, text
   and all, out of `BACKLOG.md` into `CHANGELOG.md` under the tag, so the queue holds only open
   work and the changelog is the record of what shipped when.
-- `/next-ticket`: the command that takes the next ticket to done (`.claude/commands/next-ticket.md`).
+- `loop/prompts/next-ticket.md`: the prompt that takes the next ticket to done, and
+  `loop/prompts/grill-me.md`, the one that turns a loose idea into stories, acceptance
+  criteria, and tickets. Both are written against `.loop.toml` and `AGENTS.md` only: no
+  project name, build tool, or harness tool appears in them, and `scripts/check.sh` fails if
+  one does. `.claude/commands/next-ticket.md` and `grill-me.md` are two-line wrappers that
+  point Claude Code at them (`/next-ticket`, `/grill-me <idea>`); another harness is pointed
+  at the prompt file itself.
 - `scripts/deploy-local.sh`: the deploy loop. Every few minutes (a LaunchAgent from
   `--launchd`, or a scheduled task) it pulls `main` fast-forward when `origin/main` moved,
   builds the engine if `src/`, Cargo, `build.rs`, or the strategies changed and the bundle if
