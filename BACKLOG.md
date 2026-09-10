@@ -390,3 +390,69 @@ lagging checkout never re-offers a merged ticket. This is a kit script: change i
 **Done when:** the backlog-status self-test shows a ticket landed on `origin/main` but not on
 the local `main` reported `done` and skipped by `--next`; `.loop.toml` points at the kit tag
 that carries it.
+
+### HK-21 Proof gate in the kit: code changes must touch a proof
+Nothing enforces the rule that a ticket ships the test proving its done line; a PR that only
+touches `src/` merges on green. Add `scripts/proof-gate.sh` to `coding-agent-loop`, configured
+by three new `.loop.toml` keys read through `loop-config.sh`: `code_paths` (globs whose change
+needs a proof), `proof_paths` (globs that count as proof), and `proof_pattern` (a regex; an
+added line matching it in any changed file counts as proof, so a new test function in the same
+file qualifies). Empty keys mean the gate is off. It diffs `origin/<default branch>...HEAD`,
+fails naming the code files when nothing counts as proof, and passes, printing the reason, when
+any commit body in the range has a line `No new test: <reason>`. Serves BT-901.
+**Done when:** the kit's proof-gate self-test proves: a code change without proof fails and
+names the file; one with a changed proof path passes; one adding a line matching the pattern
+passes; one with the body line passes and prints the reason; a change outside `code_paths`
+passes; unset keys pass with "gate off". The kit is tagged and `.loop.toml` here moves
+`kit_ref` to it.
+
+### HK-22 Coverage ratchet in the kit: a floor that only rises — Blocked by HK-21
+Add `scripts/coverage-ratchet.sh` to `coding-agent-loop` with two `.loop.toml` keys:
+`coverage` (a command that prints one percentage, the project's own tool wrapped) and
+`coverage_floor` (the floor file, default `coverage-floor.txt`). The script runs the command,
+fails below the floor naming both numbers, passes at or above it, says "raise the floor to N"
+when above, and `--set` writes the measured number as the new floor. An unset `coverage` key
+passes with "ratchet off". Serves BT-902.
+**Done when:** the kit's coverage-ratchet self-test, with a stub command, proves: below fails;
+equal passes; above passes and names the new floor; `--set` writes it; an unset key reports
+off; a command that prints no number fails with a message. The kit is tagged and `kit_ref`
+moves to it.
+
+### HK-23 Tessera measures coverage with cargo-llvm-cov and gates on the floor — Blocked by HK-21, HK-22
+Wire this checkout to both kit scripts. `.loop.toml`: `code_paths = ["src/"]`, `proof_paths =
+["tests/", "examples/expected/", "web/fixtures/", "web/scripts/*-check.mjs"]`, `proof_pattern`
+matching `#[test]` or `#[cfg(test)]`, `coverage = "scripts/coverage.sh"`. `scripts/coverage.sh`
+runs cargo-llvm-cov over the whole crate and prints the line percentage, failing with the two
+install commands (`rustup component add llvm-tools-preview`; `cargo install cargo-llvm-cov`)
+when the tool is missing. `scripts/check.sh` runs the proof gate in every mode but
+`--web-only` and `--private-only`, and the ratchet in the full check and `--quick` but not
+`--no-web`; the CI engine job installs cargo-llvm-cov and fetches enough history for the gate's
+diff. The first floor is the number measured on `main`. Serves BT-901 and BT-902.
+**Done when:** `scripts/check.sh` prints "coverage N% >= floor N%" and "proof gate: ok" on
+`main`; `coverage-floor.txt` is checked in; the CI engine job is green with the tool installed;
+a scratch branch that adds a function to `src/` with no test fails the gate locally, recorded
+in the commit body.
+
+### HK-24 Agent review prompt and status in the kit — Blocked by HK-21
+Add `prompts/review-prs.md` and `scripts/review-status.sh` to `coding-agent-loop`. The script
+lists open PRs whose head sha has no "Agent review" status (`--pending`), and posts one
+(`<sha> pass|fail "<description>"`) through `gh`. The prompt: for each pending PR, read the
+ticket the title names (its block in the backlog, its done line), the diff, and the Project
+rules in `AGENTS.md`; post a PR review comment with findings; post the status red only for a
+missing proof, an unmet done line, a rules breach, or a defect named with file and line, green
+otherwise. A PR without a ticket id (a `backlog/` branch) is reviewed against the backlog format
+alone. The README documents the owner's override: one `gh` command posting a green status with
+a reason. Serves BT-903.
+**Done when:** the kit's review-status self-test, with a stub `gh`, proves `--pending` lists
+only heads without a status and `pass`/`fail` post the right state and description; the prompt
+exists and the kit's generic grep passes; the kit is tagged and `kit_ref` moves to it.
+
+### HK-25 Tessera PRs wait for the agent review — Blocked by HK-24
+Wire the review in: `.claude/commands/review-prs.md` wraps the prompt; `docs/LOOP.md`
+describes the scheduled task (desktop app, every 10 minutes, like nightly-studies), the override
+command, and the ruleset change; the owner adds "Agent review" to the required status checks
+with the `gh` command the ticket carries. Serves BT-903.
+**Done when:** a PR from this repository shows an "Agent review" status posted by a scheduled
+run; `gh api repos/FueledByChai/tessera/rules/branches/main` lists the context as required;
+auto-merge on a green PR waits for it and fires after it; `docs/LOOP.md` has the override
+command.

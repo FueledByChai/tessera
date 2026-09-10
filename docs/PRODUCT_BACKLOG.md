@@ -752,6 +752,62 @@ replay, accounting, and reporting code can be retired.
 - Limit Buyer, Gap Fade, Two-Day Rebound Short, Overnight Attention, Crypto Daily Trend, and FX
   strategies no longer own duplicate runtime plumbing after migration.
 
+## Epic I: Delivery loop quality
+
+### BT-901 — Every code change ships with its proof
+
+**Status:** Proposed
+**User story:** As the owner, I want a pull request that changes code to be refused unless it
+also changes a test, fixture, or check, so that the "done line has a proof" rule is enforced by
+the loop rather than by trust.
+
+**Acceptance criteria:**
+
+- A PR touching a configured code path and no configured proof path, and adding no line
+  matching the project's test pattern, fails a required check with the files named.
+- A commit-body line `No new test: <reason>` lets the PR through and the reason appears in the
+  check's output.
+- The rule, the paths, and the pattern come from `.loop.toml`; a project in any language sets
+  its own (a Java project's pattern is `@Test`, Python's `def test_`).
+- The same script runs in the local check and in CI.
+
+### BT-902 — Test coverage can only go up
+
+**Status:** Proposed
+**User story:** As the owner, I want the check to fail when line coverage drops below a
+checked-in floor, and the floor to rise with the coverage, so that agents cannot erode the test
+suite while adding code.
+
+**Acceptance criteria:**
+
+- The project's coverage command prints one percentage; the kit compares it with the floor
+  file and fails below it, naming both numbers.
+- When coverage exceeds the floor, the check says so and names the new floor; the ticket that
+  raised coverage raises the floor in its commit.
+- The ratchet runs in the full local check and in the CI engine job, not in the fast check.
+- A missing coverage tool fails the local check with the exact install commands, and CI
+  installs the tool itself.
+- The mechanism is the same for a Java or Python project; only the command differs.
+
+### BT-903 — Every pull request gets a review before it merges
+
+**Status:** Proposed
+**User story:** As the owner, I want an agent to review each PR against its ticket's done line
+and the Project rules, and the merge to wait for that review, so that a green build is not the
+only thing between an agent's commit and main.
+
+**Acceptance criteria:**
+
+- Each open PR's head commit receives exactly one `Agent review` commit status; a new push
+  gets a fresh review.
+- The status is red only for: no proof of the done line, the done line not met, a
+  Project-rules breach, or a named defect with file and line. Everything else is a comment and
+  a green status.
+- The review runs from a schedule on the owner's machine with the owner's agent subscription;
+  no API key lives on GitHub.
+- The ruleset requires the status; auto-merge waits for it.
+- The owner can override a red status with one documented command that records a reason.
+
 ## Recommended delivery milestones
 
 ### Completed foundation — Event-driven SDK steps 1–6
