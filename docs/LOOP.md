@@ -132,6 +132,47 @@ review when a commit's author is not a GitHub account; the loop's commits use th
 noreply address, so it does not bite. Commits from another identity would.
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.
+- `/review-prs`: the command that reviews the open pull requests and posts the `Agent review`
+  status each one waits for (see "Reviewing" below).
+
+## Reviewing
+
+A green build is not a review. Every pull request gets one from an agent before it merges
+(HK-24, HK-25), and the merge waits for it the same way it waits for CI.
+
+- **What reviews.** `loop/prompts/review-prs.md`, from the kit, wrapped here as
+  `/review-prs`. It takes every open PR whose head commit has no `Agent review` status
+  (`scripts/review-status.sh --pending`), reads the ticket the title names and its done
+  line, the diff, and the Project rules in `AGENTS.md`, and judges four questions only: is
+  the proof present, is the done line met, is a Project rule breached, is there a defect it
+  can name with file and line. It posts one review comment with its findings and one commit
+  status per head: red only when one of the four failed. Style and preference are comments,
+  never a fail. A `backlog/` PR is judged against the backlog format. It never approves,
+  merges, or pushes. A new push is a new sha and gets a fresh review.
+- **When it runs.** From a scheduled task in the desktop app (Scheduled tasks), every ten
+  minutes, running `/review-prs` in this checkout, the same way `/nightly-studies` is
+  scheduled. It uses the owner's agent subscription; no API key lives on GitHub. Set the
+  schedule up before requiring the status, or nothing merges until the first run.
+- **What requires it.** The ruleset on `main` lists `Agent review` among the required status
+  checks, beside the two CI jobs (`docs/github/ruleset-main.json` is the full ruleset as it
+  should stand; a status posted through the API carries no integration id, so its entry has
+  none). Applied once by the owner:
+
+  ```bash
+  gh api -X PUT repos/FueledByChai/tessera/rulesets/22655615 --input docs/github/ruleset-main.json
+  gh api repos/FueledByChai/tessera/rules/branches/main --jq '.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[].context'
+  ```
+
+  With that in force, auto-merge on a green PR waits for the status and fires when it lands.
+- **Overriding a wrong red.** The owner posts a green status with the reason, which stays in
+  the commit's status history:
+
+  ```bash
+  scripts/review-status.sh <sha> pass "override: <reason>"
+  ```
+
+  `scripts/review-status.sh --pending` shows what is waiting;
+  `gh api repos/FueledByChai/tessera/commits/<sha>/status` shows what was posted.
 
 ## What CI does not run, and why there is no self-hosted runner
 

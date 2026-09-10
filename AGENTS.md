@@ -41,8 +41,11 @@ below it are this project's own and are what the loop prompts mean when they say
   `--archive <tag>` moves the shipped tickets out of the backlog into `CHANGELOG.md`.
 - **Prompts.** `loop/prompts/next-ticket.md` takes the next ticket to done;
   `loop/prompts/grill-me.md` turns a loose idea into stories, acceptance criteria, and
-  tickets. A harness with slash commands wraps them (`.claude/commands/`); any other agent is
-  pointed at the prompt file directly.
+  tickets; `loop/prompts/review-prs.md` reviews the open pull requests and posts the
+  `Agent review` status the branch rules require (red only for a missing proof, an unmet
+  done line, a rules breach, or a named defect; the owner overrides with
+  `scripts/review-status.sh <sha> pass "override: <reason>"`). A harness with slash commands
+  wraps them (`.claude/commands/`); any other agent is pointed at the prompt file directly.
 - **The kit.** The loop scripts and prompts are copies from the loop kit named by `kit` in
   `.loop.toml`; `scripts/loop-kit-sync.sh --check` fails when they drift, and
   `scripts/loop-kit-sync.sh` brings them up to the kit's tag. Change them in the kit
