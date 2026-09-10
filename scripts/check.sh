@@ -91,17 +91,17 @@ step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 
 if [ "$WEB_ONLY" = 0 ]; then
-step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, install, deploy"
+step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, deploy"
 scripts/loop-config.sh --self-test
 scripts/backlog-status.sh --self-test
 scripts/open-ticket-pr.sh --self-test
 scripts/release-notes.sh --self-test
 scripts/loop-kit-sync.sh --self-test
-loop/install.sh --self-test
 scripts/deploy-local.sh --self-test
 
-# The loop scripts and prompts are copies from the kit (HK-16); drift fails the check.
-step "loop kit: scripts/ and loop/prompts/ match the kit"
+# The loop scripts and prompts are copies from the kit's tagged release (HK-16, HK-19);
+# drift fails the check.
+step "loop kit: scripts/ and loop/prompts/ match the kit at its tag"
 scripts/loop-kit-sync.sh --check
 
 # The loop prompts belong to every project that adopts the loop (HK-15): nothing in loop/

@@ -28,19 +28,17 @@ How development and research run without a person in the middle of every step. T
   one does. `.claude/commands/next-ticket.md` and `grill-me.md` are two-line wrappers that
   point Claude Code at them (`/next-ticket`, `/grill-me <idea>`); another harness is pointed
   at the prompt file itself.
-- `loop/`: the loop kit, the source of truth for the four loop scripts, the prompts, and
-  the templates any project needs to adopt the loop (`AGENTS.md` with an empty Project
-  rules, `loop.toml.example`, a workflow skeleton, the branch ruleset, the two wrappers, an
-  `install.sh`, and a README that says GitHub is the only hosting assumption). It is laid out
-  as the repository it will become (HK-16); `loop/install.sh --self-test` installs it into a
-  fresh repository with a stub check and runs the installed self-tests there.
-  `scripts/loop-kit-sync.sh` copies the kit's scripts and prompts into this checkout and
-  `--check` (run by `scripts/check.sh`) fails when they drift, so `scripts/` never edits its
-  own copy of a loop script: the change goes into `loop/scripts/` and the sync copies it out.
-  `kit` and `kit_ref` in `.loop.toml` name the kit; today `kit = "loop"`. Publishing it
-  (HK-19) is: create the repository, push the contents of `loop/` to it, tag `v0.1.0`, set
-  `kit` to its URL and `kit_ref` to the tag, and then `loop/` here shrinks to the copied
-  prompts.
+- The loop kit, [FueledByChai/coding-agent-loop](https://github.com/FueledByChai/coding-agent-loop):
+  the source of truth for the loop scripts, the prompts, and the templates any project needs
+  to adopt the loop (`AGENTS.md` with an empty Project rules, `loop.toml.example`, a workflow
+  skeleton, the branch ruleset, the two wrappers, an `install.sh`, a README that says GitHub
+  is the only hosting assumption, and its own `check.sh` that CI runs). It was built here as
+  `loop/` (HK-16) and published as `v0.1.0` (HK-19); its history is `loop/`'s. `kit` and
+  `kit_ref` in `.loop.toml` name the URL and the tag. `scripts/loop-kit-sync.sh --check`
+  (run by `scripts/check.sh`) clones the tag and fails when `scripts/` or `loop/prompts/`
+  differ from it, so a loop script is never edited here: change it in the kit, tag a release,
+  move `kit_ref`, run `scripts/loop-kit-sync.sh`, and commit the copies. `loop/` here holds
+  only the prompts now.
 - `scripts/deploy-local.sh`: the deploy loop. Every few minutes (a LaunchAgent from
   `--launchd`, or a scheduled task) it pulls `main` fast-forward when `origin/main` moved,
   builds the engine if `src/`, Cargo, `build.rs`, or the strategies changed and the bundle if

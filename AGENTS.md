@@ -45,9 +45,9 @@ below it are this project's own and are what the loop prompts mean when they say
   pointed at the prompt file directly.
 - **The kit.** The loop scripts and prompts are copies from the loop kit named by `kit` in
   `.loop.toml`; `scripts/loop-kit-sync.sh --check` fails when they drift, and
-  `scripts/loop-kit-sync.sh` brings them up to the kit's tag. Change them in the kit, not in
-  `scripts/`. Until the kit is published it is the `loop/` directory of this checkout, so a
-  change goes into `loop/scripts/` and the sync copies it out.
+  `scripts/loop-kit-sync.sh` brings them up to the kit's tag. Change them in the kit
+  (`https://github.com/FueledByChai/coding-agent-loop`), tag a release there, move `kit_ref`
+  here, and sync; never edit the copies in `scripts/` or `loop/prompts/` directly.
 
 ## Project rules
 
