@@ -160,8 +160,10 @@ step "cargo build --release (tessera, tessera-ui)"
 cargo build --release --quiet --bin tessera --bin tessera-ui
 
 step "parity against examples/expected"
+# Per-run outputs stay under this checkout's own target/: the shared directory holds the
+# build cache only, so two worktrees checking at once cannot delete each other's outputs.
 for strategy in rsi_mean_reversion moving_average_cross; do
-  out="$TARGET_DIR/check_$strategy"
+  out="$ROOT/target/check_$strategy"
   rm -rf "$out"
   "$TARGET_DIR/release/tessera" run-strategy \
     --config "examples/configs/$strategy.toml" \
