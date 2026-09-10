@@ -26,6 +26,10 @@
 #                                            scripts/proof-gate.sh); empty: gate off
 #   proof_paths       []                     globs that count as proof when changed
 #   proof_pattern     ""                     a regex; an added line matching it counts as proof
+#   coverage          ""                     a command whose output ends in a percentage (the
+#                                            coverage ratchet, scripts/coverage-ratchet.sh);
+#                                            empty: ratchet off
+#   coverage_floor    "coverage-floor.txt"   the committed floor the measurement must reach
 #
 # LOOP_ROOT overrides the root (the fixture repos of the self-tests); LOOP_CONFIG names another
 # file outright. TOML is only the config format: it says nothing about the project's language.
@@ -50,10 +54,11 @@ read_config() {
     use strict; use warnings;
     my ($file, $mode, $key) = @ARGV;
     my @order = qw(default_branch backlog check check_fast review_paths trailer_required kit kit_ref
-                   code_paths proof_paths proof_pattern);
+                   code_paths proof_paths proof_pattern coverage coverage_floor);
     my %default = (default_branch => "main", backlog => "BACKLOG.md", check => "scripts/check.sh",
                    check_fast => undef, review_paths => [], trailer_required => "true",
-                   kit => "", kit_ref => "", code_paths => [], proof_paths => [], proof_pattern => "");
+                   kit => "", kit_ref => "", code_paths => [], proof_paths => [], proof_pattern => "",
+                   coverage => "", coverage_floor => "coverage-floor.txt");
     my %value;
     if (open my $fh, "<", $file) {
       my $table = "";
@@ -142,6 +147,8 @@ kit_ref = "v1.2.3"
 code_paths = ["src/", "lib/"]
 proof_paths = ["tests/"]
 proof_pattern = "#\\[test\\]|@Test"
+coverage = "scripts/coverage.sh"
+coverage_floor = "ci/floor.txt"
 EOF
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" backlog)"; [ "$got" = "docs/QUEUE.md" ] || { echo "self-test: backlog should be docs/QUEUE.md, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" check_fast)"; [ "$got" = "make lint" ] || { echo "self-test: check_fast should be set, got '$got'"; exit 1; }
@@ -150,7 +157,9 @@ EOF
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" code_paths)"; [ "$got" = $'src/\nlib/' ] || { echo "self-test: code_paths should list two globs, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" proof_pattern)"; [ "$got" = '#\[test\]|@Test' ] || { echo "self-test: an escaped backslash should come through single: '$got'"; exit 1; }
   got="$(LOOP_ROOT="$dir" "$me" proof_pattern)"; [ -z "$got" ] || { echo "self-test: proof_pattern should default to nothing, got '$got'"; exit 1; }
-  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 11 ] || { echo "self-test: --all should print eleven keys, got $got"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" coverage_floor)"; [ "$got" = "ci/floor.txt" ] || { echo "self-test: coverage_floor should be set, got '$got'"; exit 1; }
+  got="$(LOOP_ROOT="$dir" "$me" coverage_floor)"; [ "$got" = "coverage-floor.txt" ] || { echo "self-test: coverage_floor should default, got '$got'"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 13 ] || { echo "self-test: --all should print thirteen keys, got $got"; exit 1; }
   # An unknown key is an error; an unknown key in the file is a warning, not a failure.
   if LOOP_ROOT="$dir" "$me" colour >/dev/null 2>&1; then echo "self-test: an unknown key must fail"; exit 1; fi
   printf '[loop]\nfoo = "bar"\n' > "$dir/.loop.toml"
