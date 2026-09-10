@@ -11,6 +11,12 @@ name: CI
 # status checks on main, and a pull request must be up to date with main when they pass: after
 # another PR merges, a branch is rebased (scripts/open-ticket-pr.sh <id> --update) and both jobs
 # run again on the exact result that would land (HK-10).
+#
+# The browser (HK-17): playwright's Chromium is cached under ~/.cache/ms-playwright, keyed on
+# the lock file, so a run on the same dependencies restores it instead of downloading it. The
+# system libraries it needs come from apt on every run, and apt's mirrors have failed with
+# index hash mismatches on a docs-only PR; the install step therefore retries once after a
+# pause before failing. On a cache hit only the libraries are installed.
 
 on:
   push:
@@ -44,9 +50,28 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci
         working-directory: web
-      - name: Install playwright's Chromium
-        run: npx playwright install --with-deps chromium
+      - name: Cache playwright's Chromium
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+      - name: Install playwright's Chromium (retrying once if apt's mirror fails)
         working-directory: web
+        env:
+          CACHE_HIT: ${{ steps.playwright-cache.outputs.cache-hit }}
+        run: |
+          if [ "$CACHE_HIT" = "true" ]; then
+            echo "browser restored from the cache; installing its system libraries only"
+            cmd="npx playwright install-deps chromium"
+          else
+            cmd="npx playwright install --with-deps chromium"
+          fi
+          if ! $cmd; then
+            echo "install failed once (apt mirror?); retrying in 20 s"
+            sleep 20
+            $cmd
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the engine for the scratch console
