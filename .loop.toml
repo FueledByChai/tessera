@@ -16,7 +16,7 @@ trailer_required = true
 # --check` fails when scripts/ or loop/prompts/ drift from the tag; move kit_ref to take a
 # newer release, then run the sync.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.5.0"
+kit_ref = "v0.6.0"
 # The proof gate (scripts/proof-gate.sh, HK-23): a change under src/ must come with a change
 # under a proof path, or add a #[test] or #[cfg(test)] line, or say why in the commit body
 # (`No new test: <reason>`).
@@ -28,3 +28,5 @@ proof_pattern = "#\\[test\\]|#\\[cfg\\(test\\)\\]"
 # that raises coverage raises the floor with `scripts/coverage-ratchet.sh --set`.
 coverage = "scripts/coverage.sh"
 coverage_floor = "coverage-floor.txt"
+# The suite's coverage jitters by about a tenth of a point run to run (HK-26); 0.2 absorbs it.
+coverage_slack = "0.2"
