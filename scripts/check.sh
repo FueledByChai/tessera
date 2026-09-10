@@ -6,6 +6,8 @@
 #   scripts/check.sh --quick          skip web and the private checks (the CI engine job)
 #   scripts/check.sh --web-only       only the web step (the CI web job); the headless layout
 #                                     and chart checks skip themselves without a Chromium
+#   scripts/check.sh --private-only   only the private checks (the deploy loop's post-merge
+#                                     guard, HK-18); fails when no private checkout is there
 #   scripts/check.sh --refresh-baseline
 #                                     rewrite examples/expected from the current engine; only after
 #                                     an intentional results change, and say so in the commit
@@ -28,6 +30,7 @@ cd "$ROOT"
 NO_WEB=0
 QUICK=0
 WEB_ONLY=0
+PRIVATE_ONLY=0
 REFRESH=0
 RESOLVE=0
 for arg in "$@"; do
@@ -35,13 +38,18 @@ for arg in "$@"; do
     --no-web) NO_WEB=1 ;;
     --quick) QUICK=1; NO_WEB=1 ;;
     --web-only) WEB_ONLY=1; QUICK=1 ;;
+    --private-only) PRIVATE_ONLY=1; NO_WEB=1 ;;
     --refresh-baseline) REFRESH=1 ;;
     --resolve) RESOLVE=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
 if [ "$WEB_ONLY" = 1 ] && [ "$NO_WEB" = 1 ]; then
-  echo "--web-only and --no-web/--quick exclude each other" >&2
+  echo "--web-only and --no-web/--quick/--private-only exclude each other" >&2
+  exit 2
+fi
+if [ "$PRIVATE_ONLY" = 1 ] && [ "$QUICK" = 1 ]; then
+  echo "--private-only and --quick exclude each other" >&2
   exit 2
 fi
 
@@ -90,7 +98,7 @@ fi
 step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 
-if [ "$WEB_ONLY" = 0 ]; then
+if [ "$WEB_ONLY" = 0 ] && [ "$PRIVATE_ONLY" = 0 ]; then
 step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, deploy"
 scripts/loop-config.sh --self-test
 scripts/backlog-status.sh --self-test
@@ -158,6 +166,10 @@ if [ "$QUICK" = 0 ]; then
   if [ -x "$PRIVATE_ROOT/scripts/check.sh" ]; then
     step "private checks ($PRIVATE_ROOT, engine from $ROOT)"
     TESSERA_ENGINE_ROOT="$ROOT" "$PRIVATE_ROOT/scripts/check.sh"
+  elif [ "$PRIVATE_ONLY" = 1 ]; then
+    step "private checks"
+    echo "no private checkout at $PRIVATE_ROOT (set TESSERA_PRIVATE_ROOT to point at one)" >&2
+    exit 1
   else
     step "private checks"
     echo "skipped: no private checkout at $PRIVATE_ROOT (set TESSERA_PRIVATE_ROOT to point at one)"

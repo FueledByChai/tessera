@@ -80,8 +80,10 @@ Bloomberg-style research console (Vite + React bundle served by the Rust service
   `TESSERA_ROOT=$PWD nohup ./target/release/tessera-ui > data/ui/api.log 2>&1 &` and write the new
   pid to `data/ui/api.pid`. Do not restart while a job is `running` in the catalog.
   `scripts/deploy-local.sh` does all of this from `origin/main` on a schedule (pull, build what
-  changed, restart only for engine changes and only when idle; `--dry-run` shows the plan,
-  `--launchd` prints the LaunchAgent that runs it every five minutes).
+  changed, run the private checks against a new engine, restart only for engine changes
+  whose private checks passed and only when idle; `--dry-run` shows the plan, `--launchd`
+  prints the LaunchAgent that runs it every five minutes). A failed private check shows in
+  `data/ui/deploy.log` on every run until a later build passes.
 - CLI runs: `./target/release/tessera run-strategy --config <toml> --start <date> --end <date>
   --output-dir <dir>`. Scratch outputs go under `target/` or the session scratchpad, never `artifacts/`.
 
@@ -93,7 +95,7 @@ and chart checks, and the private checks when that checkout exists. `--no-web` i
 check. If an engine change intentionally alters results, refresh the baseline with
 `scripts/check.sh --refresh-baseline` and say why in the commit; `examples/expected/` is the
 review path, so that PR waits for the owner. CI runs `--quick` in the engine job and
-`--web-only` in the web job. From a worktree the script finds the main checkout through the
+`--web-only` in the web job; the deploy loop runs `--private-only` after a merge. From a worktree the script finds the main checkout through the
 shared git dir, the private checkout beside it (`TESSERA_PRIVATE_ROOT` overrides), writes
 `local.toml` from the main one with its relative paths made absolute, links
 `web/node_modules`, and builds the private legacy crate against the worktree's engine;

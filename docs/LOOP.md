@@ -43,10 +43,15 @@ How development and research run without a person in the middle of every step. T
 - `scripts/deploy-local.sh`: the deploy loop. Every few minutes (a LaunchAgent from
   `--launchd`, or a scheduled task) it pulls `main` fast-forward when `origin/main` moved,
   builds the engine if `src/`, Cargo, `build.rs`, or the strategies changed and the bundle if
-  `web/` did, and restarts the console only for an engine change and only when no job or
-  study is running; a busy console makes it refuse and wait for the next run. Each run is one
-  line in `data/ui/deploy.log`. So a merged pull request reaches the console on the Mac mini
-  without anyone touching it.
+  `web/` did, runs the private checks against the new engine (`scripts/check.sh
+  --private-only`, output in `data/ui/private-check.log`), and restarts the console only for
+  an engine change whose private checks passed and only when no job or study is running; a
+  busy console makes it refuse and wait for the next run, and a failed private check leaves
+  the console on its previous build, logs the failure, and repeats it on every idle run until
+  a later build passes (HK-18). Each run is one line in `data/ui/deploy.log`. So a merged
+  pull request reaches the console on the Mac mini without anyone touching it, and a merge
+  that breaks the private crate or a private strategy test is caught here, the one place
+  that has the private checkout, before the console runs it.
 - `scripts/open-ticket-pr.sh`: the hand-off. `--claim` pushes `ticket/<id>` to origin before
   work starts, so a second agent's `backlog-status.sh --next` passes over the ticket; after the
   commit the plain form pushes the branch and opens the pull request whose body is the ticket
@@ -150,10 +155,10 @@ What covers the gap instead:
 
 - Before the PR: `scripts/check.sh` in the worktree (the `/next-ticket` prompt requires it, and
   its report says so). A PR whose author skipped the private checks is the review question.
-- After the merge: HK-18 adds the private checks to `scripts/deploy-local.sh`, so the deploy
-  loop refuses to restart the service on a `main` whose private crate no longer builds and
-  writes the failure to `data/ui/deploy.log`. That catches the case the ruleset cannot, on the
-  machine that has the data, without exposing it to anyone.
+- After the merge: the deploy loop runs the private checks against every new engine build
+  and refuses to restart the service when they fail, writing the failure to
+  `data/ui/deploy.log` and `data/ui/private-check.log` (HK-18). That catches the case the
+  ruleset cannot, on the machine that has the data, without exposing it to anyone.
 
 Revisit HK-12 when either condition above changes; the ticket text keeps the security settings
 a runner would need (skip fork PRs, require approval for outside collaborators, keep the private
