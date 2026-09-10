@@ -343,6 +343,10 @@ which copies the kit's files in and diffs them, so the kit stays the source of t
 followed by `scripts/backlog-status.sh --self-test`, `scripts/release-notes.sh --self-test`,
 and `scripts/loop-config.sh --self-test` all pass; and in this checkout
 `scripts/loop-kit-sync.sh --check` reports no difference from the kit's tagged release.
+Resolved in two steps: the kit is built and proven as the `loop/` directory of this checkout
+(laid out as the repository, with `install.sh --self-test` covering the fresh-repository
+case and `loop-kit-sync.sh --check` passing against `kit = "loop"`); creating the public
+repository, pushing `loop/` to it, and tagging it is the owner's, as HK-19.
 
 ### HK-17 CI installs Playwright's browser without depending on the apt mirror
 PR #6's web job failed in 24 s with `Failed to install browsers` after an apt index hash
@@ -362,3 +366,16 @@ write the failure to `data/ui/deploy.log` so the owner sees it the next morning.
 **Done when:** the deploy script's self-test shows a fixture where the private check fails
 leaving the service untouched with `private checks failed` in the log, and one where it passes
 and the restart proceeds; `docs/LOOP.md` names it as the post-merge guard.
+
+### HK-19 The loop kit is published and this checkout consumes it by tag — `blocked needs the owner to pick the name and create the repository`
+HK-16 built the kit as `loop/` and proved it; the repository itself needs the owner: pick the
+name (working name `loop-kit`), create it under `FueledByChai` as public, push the contents of
+`loop/` to it (`git subtree split --prefix=loop` keeps the history, or a plain copy), tag
+`v0.1.0`, and apply its own ruleset from `ci/ruleset.json`. Then in this checkout set `kit` to
+the repository URL and `kit_ref` to the tag in `.loop.toml`, run `scripts/loop-kit-sync.sh`,
+and remove from `loop/` everything the sync now supplies, leaving only `loop/prompts/`. From
+then on a change to a loop script is made in the kit, tagged, and pulled in by moving
+`kit_ref`.
+**Done when:** `scripts/loop-config.sh kit` prints a `https://github.com/` URL and `kit_ref`
+a tag; `scripts/loop-kit-sync.sh --check` passes against them from a clean clone; `loop/`
+holds only `prompts/`; and `docs/LOOP.md` names the kit repository.

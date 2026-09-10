@@ -1,0 +1,25 @@
+name: CI
+
+# The definition of done, run by the same script a developer runs locally (the `check` in
+# .loop.toml), so CI and the checkout agree on what "passing" means. One job per check
+# command; each job's `name` is a required status check in the branch ruleset
+# (ci/ruleset.json), and a pull request must be up to date with the default branch when the
+# jobs pass, so after another PR merges a branch is rebased (scripts/open-ticket-pr.sh <id>
+# --update) and the jobs run again on the exact result that would land.
+#
+# Add the toolchain steps your check needs before the `run` line (language setup, caches,
+# browsers). Split the check into more jobs by giving the script flags and adding a job per
+# flag, each with its own name in the ruleset.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Check (scripts/check.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check.sh

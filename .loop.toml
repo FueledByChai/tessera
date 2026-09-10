@@ -12,3 +12,9 @@ check_fast = "scripts/check.sh --no-web"
 # cannot judge: the PR is labelled needs-review and waits for the owner instead of auto-merging.
 review_paths = ["examples/expected/"]
 trailer_required = true
+# The loop kit: the source of the four loop scripts, the prompts, and the templates.
+# `scripts/loop-kit-sync.sh --check` fails when scripts/ or loop/prompts/ drift from it. Until
+# the kit is published (HK-19) it is the loop/ directory of this checkout; then a git URL and
+# a tag (kit_ref) replace it.
+kit = "loop"
+kit_ref = ""

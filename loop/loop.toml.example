@@ -1,0 +1,21 @@
+# Settings for the ticket loop, read by scripts/loop-config.sh. Copy to .loop.toml at the
+# repository root. One flat table; strings double-quoted, arrays on one line; a missing key
+# takes its default. `scripts/loop-config.sh --all` shows the effective values. TOML is only
+# the config format: nothing here depends on the project's language.
+[loop]
+# The branch pull requests target and done is judged on.
+default_branch = "main"
+# The ticket file.
+backlog = "BACKLOG.md"
+# The definition of done, and the cheaper check to run while iterating.
+check = "scripts/check.sh"
+check_fast = "scripts/check.sh --fast"
+# Changes under these paths (a file, a prefix, or a shell pattern) are the kind the checks
+# cannot judge: the PR is labelled needs-review and waits for a person instead of auto-merging.
+review_paths = []
+# Commits must end with a Co-Authored-By trailer naming the agent and model that did the work.
+trailer_required = true
+# The loop kit: a git URL and a tag, or a directory inside this checkout.
+# scripts/loop-kit-sync.sh --check fails when the copied scripts and prompts drift from it.
+kit = ""
+kit_ref = ""
