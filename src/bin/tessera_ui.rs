@@ -580,6 +580,7 @@ async fn main() -> Result<()> {
     seed_strategies(&connection)?;
     seed_cost_profiles(&connection)?;
     seed_automation_schedules(&connection)?;
+    seed_feature_presets(&connection)?;
 
     let local = LocalConfig::load(&root)?;
     eprintln!(
@@ -1102,6 +1103,51 @@ fn seed_cost_profiles(connection: &Connection) -> Result<()> {
                 profile.7, profile.8, profile.9, profile.10, profile.11, now
             ],
         )?;
+    }
+    Ok(())
+}
+
+/// The vol feature set (WB-15): named expressions the feature library starts with, so a
+/// realized-vol study is a click per feature. Each is inserted only when no preset of that
+/// name exists, so an edit or a deletion by the owner survives every later start.
+pub const SEEDED_FEATURE_PRESETS: [(&str, &str, &str); 5] = [
+    (
+        "rv 5s",
+        "mid | rv 5s",
+        "realized vol over the last 5 seconds, bps",
+    ),
+    (
+        "rv 30s",
+        "mid | rv 30s",
+        "realized vol over the last 30 seconds, bps",
+    ),
+    (
+        "rv 60s",
+        "mid | rv 60s",
+        "realized vol over the last 60 seconds, bps",
+    ),
+    (
+        "vol ratio 5s/60s",
+        "mid | rv 5s | ratio_to rv 60s",
+        "short vol over long: above 1 when the last 5 seconds ran hotter than the minute",
+    ),
+    (
+        "vol of vol 60s",
+        "mid | rv 5s | std 60s",
+        "how unsteady the 5-second vol was over the last minute, bps",
+    ),
+];
+
+fn seed_feature_presets(connection: &Connection) -> Result<()> {
+    for (name, expression, note) in SEEDED_FEATURE_PRESETS {
+        let exists: bool = connection.query_row(
+            "SELECT COUNT(*) FROM feature_presets WHERE name = ?1",
+            [name],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !exists {
+            save_feature_preset(connection, name, expression, note, false)?;
+        }
     }
     Ok(())
 }
@@ -4274,8 +4320,8 @@ struct CreateStudyRequest {
     /// Accepted feature expressions regressed out before the incremental IC.
     #[serde(default)]
     accepted: Vec<String>,
-    /// `return` (default), `realized_variance`, `abs_move`, `spread_change`,
-    /// `fair_value_residual`, or `microprice_residual`.
+    /// `return` (default), `realized_variance`, `realized_vol`, `abs_move`,
+    /// `spread_change`, `fair_value_residual`, or `microprice_residual`.
     #[serde(default)]
     target: Option<String>,
 }
@@ -6508,6 +6554,59 @@ mod tests {
         assert!(query_feature_presets(&connection).unwrap().is_empty());
         drop(connection);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// WB-15: a fresh catalog starts with the vol feature set; a second start adds nothing,
+    /// and an edit to a seeded preset survives it.
+    #[test]
+    fn a_fresh_catalog_is_seeded_with_the_vol_features_once() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        assert!(query_feature_presets(&connection).unwrap().is_empty());
+        seed_feature_presets(&connection).unwrap();
+        let presets = query_feature_presets(&connection).unwrap();
+        assert_eq!(presets.len(), SEEDED_FEATURE_PRESETS.len());
+        let mut names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "rv 30s",
+                "rv 5s",
+                "rv 60s",
+                "vol of vol 60s",
+                "vol ratio 5s/60s"
+            ]
+        );
+        let ratio = presets
+            .iter()
+            .find(|p| p.name == "vol ratio 5s/60s")
+            .unwrap();
+        assert_eq!(ratio.expression, "mid | rv 5s | ratio_to rv 60s");
+        assert!(!ratio.accepted);
+        // Every seeded expression parses under the grammar.
+        for (_, expression, _) in SEEDED_FEATURE_PRESETS {
+            tessera::feature_expr::parse(expression)
+                .unwrap_or_else(|e| panic!("{expression}: {e}"));
+        }
+        // The owner edits one and deletes another; the next start touches neither.
+        save_feature_preset(&connection, "rv 5s", "mid | rv 10s", "edited", false).unwrap();
+        let sixty = presets.iter().find(|p| p.name == "rv 60s").unwrap();
+        delete_feature_preset(&connection, &sixty.id).unwrap();
+        seed_feature_presets(&connection).unwrap();
+        let again = query_feature_presets(&connection).unwrap();
+        assert_eq!(
+            again.len(),
+            SEEDED_FEATURE_PRESETS.len(),
+            "the deleted preset comes back once, nothing duplicates"
+        );
+        let five = again.iter().find(|p| p.name == "rv 5s").unwrap();
+        assert_eq!(five.expression, "mid | rv 10s", "an edit survives the seed");
+        seed_feature_presets(&connection).unwrap();
+        assert_eq!(
+            query_feature_presets(&connection).unwrap().len(),
+            SEEDED_FEATURE_PRESETS.len()
+        );
     }
 
     /// WB-09: promoting a preset changes what every study regresses candidates against: the

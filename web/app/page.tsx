@@ -1611,6 +1611,7 @@ const LAKE_STEPS = [1, 2, 5, 10, 15, 30] as const;
 const STUDY_TARGETS = [
   ["return", "Forward return (bps)"],
   ["realized_variance", "Realized variance (bps²)"],
+  ["realized_vol", "Realized vol (bps)"],
   ["abs_move", "Absolute move (bps)"],
   ["spread_change", "Spread change (bps)"],
   ["fair_value_residual", "Mid − 60 s EMA at horizon (bps)"],
