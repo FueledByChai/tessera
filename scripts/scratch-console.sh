@@ -29,10 +29,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-# The binaries and the scratch root: the checkout's own target/, or the shared worktree one
-# when scripts/check.sh set CARGO_TARGET_DIR (HK-27).
+# The binaries come from the checkout's own target/, or the shared worktree one when
+# scripts/check.sh set CARGO_TARGET_DIR (HK-27); the scratch root is per checkout regardless.
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-SCRATCH="$TARGET_DIR/scratch-console-$PORT"
+SCRATCH="$ROOT/target/scratch-console-$PORT"
 ORIGIN="http://127.0.0.1:$PORT"
 API="$ORIGIN/api"
 
