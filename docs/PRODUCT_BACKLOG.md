@@ -808,6 +808,59 @@ only thing between an agent's commit and main.
 - The ruleset requires the status; auto-merge waits for it.
 - The owner can override a red status with one documented command that records a reason.
 
+### BT-904 — Decisions are recorded once and cited everywhere
+
+**Status:** Proposed
+**User story:** As the owner, I want every architecture and product decision written down
+with its alternatives and reasons, so that agents and I cite one record instead of
+re-deciding, and a wrong decision can be superseded without losing why it was made.
+
+**Acceptance criteria:**
+
+- A decision is one file under `docs/decisions/`, numbered, with Context, Decision,
+  Alternatives, Consequences, and "what would show this was wrong"; an index lists them.
+- A decision is never edited in place: a change is a new record that names the one it
+  supersedes, and the old one is marked superseded.
+- grill-me reads the index before asking anything, stops and asks when a story implies a
+  decision no record covers, writes the record in the session, and cites it in the ticket.
+- Tessera's fifteen locked product decisions exist as records; the product backlog points
+  at the index.
+
+### BT-905 — A new project is interviewed into rules, decisions, and a check before code
+
+**Status:** Proposed
+**User story:** As the owner starting a project, I want one session that asks the questions
+that shape everything after (users, data, runtime, deploy, UI, non-negotiables) and leaves
+behind the Project rules, the decision records, the first epics, and a check skeleton, so
+that `/next-ticket` can run on day one.
+
+**Acceptance criteria:**
+
+- `grill-project` asks in rounds over the five areas and does not draft until each has a
+  decision or an explicit deferral with a date.
+- It writes `docs/decisions/` records, the Project rules section of `AGENTS.md`, the first
+  epics in the product backlog, and `scripts/check.sh` with the decided stack's test, lint,
+  format, build, and coverage commands (Rust, Python, Node/TypeScript, Java, Go known; TODO
+  lines otherwise).
+- Every decision names what would show it was wrong.
+
+### BT-906 — grill-me grills, and shows the screen it is describing
+
+**Status:** Proposed
+**User story:** As the owner, I want grill-me to keep asking until every story is testable,
+and to sketch any screen it is about to describe, so that tickets do not arrive with an
+unprovable done line or a table described in prose.
+
+**Acceptance criteria:**
+
+- At least three rounds; the last is proofs and edge cases only; it cannot draft a story
+  without a named proof.
+- A story that touches a screen carries a text wireframe in the draft the owner confirms,
+  and the ticket points at it; the design canvas is used when the owner asks or the screen
+  is new.
+- A story that contradicts a recorded decision stops for "which wins" and, if the decision
+  changes, a superseding record.
+
 ## Epic J: Feature workbench
 
 ### BT-1001 — Realized volatility at any lookback as a study feature
