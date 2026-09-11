@@ -110,6 +110,11 @@ changed, make one with the harness's design canvas when it has one and otherwise
 single HTML file, save it beside the product backlog (`docs/wireframes/<story id>.html`),
 and link it from the story and the ticket.
 
+**The sprint.** `sprint` in `.loop.toml` is the list of tickets chosen for now, in order;
+`scripts/backlog-status.sh --next` takes them first. Ask the owner which of the new tickets
+go into the sprint and where (ahead of, behind, or between the ones there), or none; the
+write step edits that list in the same commit.
+
 Ask the owner to confirm the draft, and apply their edits, before going on.
 
 ## 4. Write and hand off
@@ -131,5 +136,5 @@ Never write to the default branch. From the main checkout:
    deferred (record those as a `blocked <question>` claim on the ticket that needs the answer).
 
 Rules: this prompt changes only the product backlog, the ticket file, the decision
-records, and the wireframe files. It never edits code or anything the Project rules say never to touch, and never
+records, the wireframe files, and the `sprint` list in `.loop.toml`. It never edits code or anything the Project rules say never to touch, and never
 copies private details into a public backlog.

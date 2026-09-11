@@ -8,8 +8,9 @@ branch pull requests target, `trailer_required` whether commits sign with an age
 Steps:
 
 1. Run `scripts/backlog-status.sh --next`. It names the first `todo` ticket whose `Blocked by`
-   tickets have a commit on the default branch (`scripts/backlog-status.sh` shows every
-   ticket's derived state). If it names none, report that and stop. Read the ticket, mark it
+   tickets have a commit on the default branch, taking the `sprint` list in `.loop.toml`
+   first, in its order, then file order (`scripts/backlog-status.sh` shows every ticket's
+   derived state; `--sprint` shows the sprint's). If it names none, report that and stop. Read the ticket, mark it
    `doing` in the backlog file, and claim it once the worktree exists:
    `scripts/open-ticket-pr.sh <id> --claim` pushes `ticket/<id>` to origin. If that refuses,
    another checkout holds the ticket: leave it and take the next.

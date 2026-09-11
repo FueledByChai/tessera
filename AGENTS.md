@@ -10,15 +10,16 @@ below it are this project's own and are what the loop prompts mean when they say
 - **Settings.** `.loop.toml` holds everything the loop knows about this project:
   `default_branch`, `backlog` (the ticket file), `check` (the full check), `check_fast` (the
   check to run while iterating), `review_paths` (changes that need a human review),
-  `trailer_required`, and `kit` (where the loop kit lives). `scripts/loop-config.sh --all`
-  prints the effective values. Prompts and scripts read them from there; they never hard-code
+  `trailer_required`, `kit` (where the loop kit lives), and `sprint` (the tickets chosen
+  for now, in order). `scripts/loop-config.sh --all` prints the effective values. Prompts and scripts read them from there; they never hard-code
   a branch, a path, or a build command.
 - **Tickets.** The backlog is a list of tickets, each a paragraph of intent plus a **Done when**
   line naming the test, fixture, or measurable output that proves it. Git is the record of
   done: a ticket is done when a commit whose subject starts with its id is on the default
   branch. `scripts/backlog-status.sh` derives every ticket's state from the commits and
-  `--next` names the first `todo` whose `Blocked by` tickets have landed. The backlog file
-  carries only claims: `doing` while someone works a ticket, `blocked <reason>` when it needs
+  `--next` names the first `todo` whose `Blocked by` tickets have landed, taking the
+  `sprint` list first and file order after it (`--sprint` shows the sprint's states). The
+  backlog file carries only claims: `doing` while someone works a ticket, `blocked <reason>` when it needs
   a decision. Clear the `doing` claim in the ticket's own commit and never write a done line.
   Anything discovered while working goes in as a new ticket, not into the current one.
 - **Claims and hand-off.** Before work starts, `scripts/open-ticket-pr.sh <id> --claim` pushes

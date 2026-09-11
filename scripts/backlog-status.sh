@@ -6,8 +6,11 @@
 # scripts/loop-config.sh (HK-14).
 #
 #   scripts/backlog-status.sh                 every ticket: id, state, date, sha, blockers, title
-#   scripts/backlog-status.sh --next          the id of the first todo whose blockers are done
-#                                             (exit 1 when there is none)
+#   scripts/backlog-status.sh --next          the id of the first todo whose blockers are done:
+#                                             from the `sprint` list in .loop.toml first, in its
+#                                             order, then file order (exit 1 when there is none)
+#   scripts/backlog-status.sh --sprint        the sprint's tickets in sprint order with their
+#                                             states, and a summary line (HK-39)
 #   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default: the
 #                                             default branch as origin has it, after a fetch,
 #                                             so a checkout that has not pulled yet never
@@ -34,6 +37,7 @@ LOCAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --next) MODE=next ;;
+    --sprint) MODE=sprint ;;
     --local) LOCAL=1 ;;
     --self-test) MODE=selftest ;;
     --ref) REF="$2"; REF_GIVEN=1; shift ;;
@@ -61,15 +65,18 @@ judged_ref() {
 status() {
   local backlog="$1" ref mode="$3"
   ref="$(judged_ref "$2")"
-  local claimed=""
+  local claimed="" sprint
+  sprint="$("$ROOT/scripts/loop-config.sh" sprint | tr '\n' ',')"
   if [ "$LOCAL" = 0 ]; then
     # No origin, or one that does not answer, means no claims (and no failure).
     claimed="$( (git ls-remote --heads origin 'refs/heads/ticket/*' 2>/dev/null || true) | sed 's#.*refs/heads/ticket/##' | tr '\n' ',')"
   fi
   git log --reverse --date=short --format='%h %ad %s' "$ref" -- 2>/dev/null \
     | perl -e '
-      my ($backlog, $mode, $claimed) = @ARGV;
+      my ($backlog, $mode, $claimed, $sprint) = @ARGV;
       my %claimed = map { $_ => 1 } grep { length } split /,/, $claimed;
+      my @sprint = grep { length } split /,/, $sprint;
+      my %sprint; my $pos = 0; $sprint{$_} //= ++$pos for @sprint;
       my %done;
       while (my $line = <STDIN>) {
         chomp $line;
@@ -108,21 +115,37 @@ status() {
         for my $b (@{ $t->{blockers} }) { return 0 unless $landed->($b); }
         return 1;
       };
+      my %by_id = map { $_->{id} => $_ } @tickets;
+      for my $id (@sprint) { print STDERR "sprint: $id is not in the backlog file\n" unless $by_id{$id}; }
       if ($mode eq "next") {
+        for my $id (@sprint) { my $t = $by_id{$id} or next; if ($ready->($t)) { print "$t->{id}\n"; exit 0; } }
+        print STDERR "sprint: nothing ready in it; falling back to file order\n" if @sprint;
         for my $t (@tickets) { if ($ready->($t)) { print "$t->{id}\n"; exit 0; } }
         print STDERR "no todo ticket has all its blockers done\n";
         exit 1;
       }
-      printf "%-6s %-8s %-10s %-8s %-6s %-22s %s\n", "id", "state", "date", "sha", "ready", "blocked by", "title";
-      for my $t (@tickets) {
+      my @rows = @tickets;
+      if ($mode eq "sprint") {
+        @rows = grep { defined } map { $by_id{$_} } @sprint;
+        if (!@rows) { print "sprint: empty (set sprint = [...] in .loop.toml)\n"; exit 0; }
+      }
+      printf "%-6s %-8s %-10s %-8s %-6s %-6s %-22s %s\n", "id", "state", "date", "sha", "ready", "sprint", "blocked by", "title";
+      for my $t (@rows) {
         my ($date, $sha) = $done{ $t->{id} } ? @{ $done{ $t->{id} } } : ("-", "-");
         my $blockers = join ",", map { $_ . ($landed->($_) ? "" : "!") } @{ $t->{blockers} };
         my $state = $t->{state};
         $state .= " (was $t->{claim})" if $state eq "done" && $t->{claim} ne "" && $t->{claim} ne "todo";
         $state = $t->{claim} if $state eq "blocked";
-        printf "%-6s %-8s %-10s %-8s %-6s %-22s %s\n", $t->{id}, $state, $date, $sha, ($ready->($t) ? "yes" : ""), $blockers, $t->{title};
+        printf "%-6s %-8s %-10s %-8s %-6s %-6s %-22s %s\n", $t->{id}, $state, $date, $sha, ($ready->($t) ? "yes" : ""), ($sprint{ $t->{id} } // ""), $blockers, $t->{title};
       }
-    ' "$backlog" "$mode" "$claimed"
+      if ($mode eq "sprint") {
+        my %n; $n{ $_->{state} }++ for @rows;
+        my $ready_n = grep { $ready->($_) } @rows;
+        printf "sprint: %d ticket(s), %d done, %d ready, %d claimed or doing, %d blocked or waiting\n",
+          scalar(@rows), $n{done} // 0, $ready_n, ($n{claimed} // 0) + ($n{doing} // 0),
+          scalar(@rows) - ($n{done} // 0) - $ready_n - ($n{claimed} // 0) - ($n{doing} // 0);
+      }
+    ' "$backlog" "$mode" "$claimed" "$sprint"
 }
 
 self_test() {
@@ -168,6 +191,24 @@ EOF
     # Nothing else landed yet: AA-01 is still the doing claim; AA-04 is the first ready todo.
     next="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next)"
     [ "$next" = "AA-04" ] || { echo "self-test: expected AA-04 next before anything landed, got $next"; exit 1; }
+    # A sprint list (HK-39): --next takes the first ready ticket in sprint order before file
+    # order, warns about an id the file lacks, and falls back to file order when nothing in
+    # the sprint is ready; --sprint shows the sprint's rows in its order with a summary.
+    printf '[loop]\nsprint = ["ZZ-99", "AA-05", "AA-06", "AA-04"]\n' > sprint.toml
+    out="$(LOOP_CONFIG="$PWD/sprint.toml" "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next 2>&1)"
+    echo "$out" | grep -q '^AA-06$' || { echo "self-test: the sprint should put AA-06 before AA-04, got:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q 'sprint: ZZ-99 is not in the backlog file' || { echo "self-test: an unknown sprint id should be reported, got:"; echo "$out"; exit 1; }
+    printf '[loop]\nsprint = ["AA-05", "AA-02"]\n' > sprint.toml
+    out="$(LOOP_CONFIG="$PWD/sprint.toml" "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --next 2>&1)"
+    echo "$out" | grep -q '^AA-04$' || { echo "self-test: an exhausted sprint should fall back to file order (AA-04), got:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q 'sprint: nothing ready' || { echo "self-test: the fallback should be announced, got:"; echo "$out"; exit 1; }
+    printf '[loop]\nsprint = ["AA-06", "AA-05", "AA-04"]\n' > sprint.toml
+    out="$(LOOP_CONFIG="$PWD/sprint.toml" "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --sprint 2>&1)"
+    [ "$(echo "$out" | grep -c '^AA-')" = 3 ] || { echo "self-test: --sprint should list the three sprint tickets:"; echo "$out"; exit 1; }
+    echo "$out" | sed -n '2p' | grep -q '^AA-06  todo .* yes  *1 ' || { echo "self-test: AA-06 should lead the sprint view at position 1:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q '^sprint: 3 ticket(s), 0 done, 2 ready, 0 claimed or doing, 1 blocked or waiting$' || { echo "self-test: the sprint summary is off:"; echo "$out"; exit 1; }
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --sprint 2>&1)"
+    echo "$out" | grep -q '^sprint: empty' || { echo "self-test: no sprint configured should say so:"; echo "$out"; exit 1; }
     # AA-01 lands while its line still says doing: git wins, with the commit's date and sha.
     git commit -q --allow-empty -m "AA-01: first landed"
     sha="$(git rev-parse --short HEAD)"
