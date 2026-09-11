@@ -16,7 +16,7 @@ trailer_required = true
 # --check` fails when scripts/ or loop/prompts/ drift from the tag; move kit_ref to take a
 # newer release, then run the sync.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.10.0"
+kit_ref = "v0.11.0"
 # The proof gate (scripts/proof-gate.sh, HK-23): a change under src/ must come with a change
 # under a proof path, or add a #[test] or #[cfg(test)] line, or say why in the commit body
 # (`No new test: <reason>`).

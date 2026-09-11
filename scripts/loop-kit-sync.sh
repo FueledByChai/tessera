@@ -12,6 +12,11 @@
 #                                       a fixture kit and checkout prove both modes
 #
 # A directory is used as it stands (no tag); a URL, file:// included, is cloned at kit_ref.
+# Each file is written beside its target and renamed into place, this script's own copy is
+# replaced last, and when it was replaced the new copy is run once more (HK-35): a sync that
+# updates loop-kit-sync.sh itself would otherwise overwrite the file the running shell is
+# still reading and stop with an error, and the files only the new copy knows to list would
+# wait for a second run.
 # When the kit is a directory inside this checkout (the unpublished kit lives at loop/), the
 # prompts are the kit's own files and only the scripts are compared.
 set -euo pipefail
@@ -56,8 +61,16 @@ pairs() {
   return 0
 }
 
+# Copies src over dst through a temporary file beside it and one rename, so a reader of the
+# old file (this shell, when dst is this script) keeps the old inode to the end.
+place() {
+  mkdir -p "$(dirname "$2")"
+  cp "$1" "$2.tmp"; chmod +x "$2.tmp" 2>/dev/null || true
+  mv -f "$2.tmp" "$2"
+}
+
 run() {
-  local kit mode="$1" src dst rel differ=0 same=0 changed=0
+  local kit mode="$1" src dst rel differ=0 same=0 changed=0 self_src="" self_dst=""
   kit="$(resolve_kit)"
   while read -r src dst; do
     [ -n "$src" ] || continue
@@ -68,12 +81,22 @@ run() {
     elif [ "$mode" = check ]; then
       differ=$((differ + 1))
       if [ -e "$dst" ]; then echo "differs: $rel"; else echo "missing: $rel"; fi
+    elif [ "$dst" = "$SCRIPT_ROOT/scripts/loop-kit-sync.sh" ]; then
+      self_src="$src"; self_dst="$dst"
     else
-      mkdir -p "$(dirname "$dst")"
-      cp "$src" "$dst"; chmod +x "$dst" 2>/dev/null || true
+      place "$src" "$dst"
       changed=$((changed + 1)); echo "updated: $rel"
     fi
   done < <(pairs "$kit")
+  if [ -n "$self_dst" ]; then
+    place "$self_src" "$self_dst"
+    changed=$((changed + 1)); echo "updated: ${self_dst#"$ROOT"/}"
+    if [ -z "${LOOP_KIT_SYNC_AGAIN:-}" ]; then
+      echo "loop kit: loop-kit-sync.sh changed; running the new copy for the files it lists"
+      cleanup; KIT_CLONE=""
+      LOOP_KIT_SYNC_AGAIN=1 exec "$self_dst"
+    fi
+  fi
   local where; where="$("$CONFIG" kit)"; [ -n "$("$CONFIG" kit_ref)" ] && where="$where at $("$CONFIG" kit_ref)"
   if [ "$mode" = check ]; then
     if [ "$differ" -gt 0 ]; then echo "loop kit: $differ file(s) differ from $where; run scripts/loop-kit-sync.sh" >&2; return 1; fi
@@ -124,6 +147,31 @@ self_test() {
   printf '[loop]\n' > "$dir/work/.loop.toml"
   if "$me" --check >/dev/null 2>&1; then echo "self-test: --check must fail with no kit configured"; exit 1; fi
   unset LOOP_ROOT
+  # A sync that replaces loop-kit-sync.sh itself (HK-35): the checkout runs its own copy of
+  # this script; the kit's copy differs in the middle (it lists one more kind of file,
+  # extras/*.txt), so the running shell's offset into its own file would land in shifted
+  # text if the file were overwritten in place. One run must finish without an error, copy
+  # the files sorted after the script, replace the script's own copy byte for byte, and
+  # then copy the file only the new copy knows to list.
+  mkdir -p "$dir/self/scripts" "$dir/kit-src/templates/check" "$dir/kit-src/extras"
+  cp "$me" "$dir/self/scripts/loop-kit-sync.sh"; cp "$SCRIPT_ROOT/scripts/loop-config.sh" "$dir/self/scripts/"
+  awk '{print} /templates\/check\/\*\.sh/ && !done {print "  for f in \"$kit\"/extras/*.txt; do [ -e \"$f\" ] \&\& echo \"$f $ROOT/loop/extras/$(basename \"$f\")\"; done"; done=1}' "$me" > "$dir/kit-src/scripts/loop-kit-sync.sh"
+  grep -q 'extras/\*\.txt' "$dir/kit-src/scripts/loop-kit-sync.sh" || { echo "self-test: the fixture kit's sync script should list extras"; exit 1; }
+  printf '#!/usr/bin/env bash\necho zz\n' > "$dir/kit-src/scripts/zz-after.sh"
+  printf 'skeleton\n' > "$dir/kit-src/templates/check/other.sh"
+  printf 'only the new copy lists this\n' > "$dir/kit-src/extras/new.txt"
+  printf '[loop]\nkit = "%s"\n' "$dir/kit-src" > "$dir/self/.loop.toml"
+  out="$("$dir/self/scripts/loop-kit-sync.sh" 2>&1)" || { echo "self-test: a sync that replaces the script itself must finish (rc $?):"; echo "$out"; exit 1; }
+  for f in scripts/zz-after.sh loop/templates/check/other.sh scripts/loop-kit-sync.sh loop/extras/new.txt; do
+    echo "$out" | grep -q "^updated: $f\$" || { echo "self-test: one run should copy $f:"; echo "$out"; exit 1; }
+  done
+  n_zz="$(echo "$out" | grep -n '^updated: scripts/zz-after.sh$' | cut -d: -f1)"
+  n_self="$(echo "$out" | grep -n '^updated: scripts/loop-kit-sync.sh$' | cut -d: -f1)"
+  n_new="$(echo "$out" | grep -n '^updated: loop/extras/new.txt$' | cut -d: -f1)"
+  [ "$n_zz" -lt "$n_self" ] && [ "$n_self" -lt "$n_new" ] || { echo "self-test: the script's own copy should be replaced after the old list and before the new list:"; echo "$out"; exit 1; }
+  cmp -s "$dir/kit-src/scripts/loop-kit-sync.sh" "$dir/self/scripts/loop-kit-sync.sh" || { echo "self-test: the script's own copy should equal the kit's after one run"; exit 1; }
+  [ -z "$(ls "$dir/self/scripts"/*.tmp 2>/dev/null)" ] || { echo "self-test: no temporary file may be left behind"; exit 1; }
+  "$dir/self/scripts/loop-kit-sync.sh" --check >/dev/null || { echo "self-test: --check should pass after the self-replacing sync"; exit 1; }
   echo "loop-kit-sync self-test passed"
 }
 
