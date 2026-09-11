@@ -727,3 +727,28 @@ order, an unknown id is reported, an exhausted sprint falls back, and `--sprint`
 sprint with a summary; `loop-config.sh --self-test` parses and defaults the key;
 `prompt-check.sh` asserts "sprint" in next-ticket and grill-me; `kit_ref` here moves to the
 tag and `scripts/backlog-status.sh --next` names the sprint's first ticket.
+
+### HK-40 Sprint-day views: open tickets, a ticket or story in full, and derived story status
+Choosing a sprint meant reading two files: the table for titles, the ticket file for a
+description, and the product backlog's `Status:` lines, which say Proposed forever. Add to
+the kit's `backlog-status.sh`: `--open [--section]` (tickets not done and not in the sprint,
+grouped by section, with blockers and the story each serves), `--show <id>` (a ticket with
+its state and story, or a story with its derived status and tickets), and `--stories` (every
+story in the product backlog, `stories` in `.loop.toml`, with a status derived from git: done
+when every ticket that says `Serves BT-nnn` landed, open k/n, unticketed); and
+`scripts/sprint.sh add|remove|set|clear` to edit the sprint line. grill-me grounds itself with
+`--stories` and `--open`. Kit change, tag, sync. Serves BT-904.
+**Done when:** the kit's `backlog-status.sh --self-test` proves the three views against a
+fixture product backlog before and after its tickets land; `sprint.sh --self-test` proves
+add, `--before`, refusals, remove, set, and clear; `kit_ref` here moves to the tag and
+`scripts/backlog-status.sh --stories` here derives a status for every story.
+
+### HK-41 --stories counts the tickets archived into CHANGELOG.md
+`scripts/release-notes.sh --archive` moves shipped tickets out of the ticket file, so a story
+served only by archived tickets would show as unticketed once a release is archived. The kit's
+`backlog-status.sh --stories` and `--show` should also read the tickets under `CHANGELOG.md`
+(the archive `--archive` writes) for their `Serves` lines, counting them as done. Kit change,
+tag, sync.
+**Done when:** the kit's `backlog-status.sh --self-test` archives a fixture release with
+`release-notes.sh --archive` and shows the story it served still done; `kit_ref` here moves
+to the tag.

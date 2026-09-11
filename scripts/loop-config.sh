@@ -40,6 +40,10 @@
 #   sprint            []                     the tickets chosen for now, in order: backlog-status.sh
 #                                            --next takes the first ready one of them before file
 #                                            order, and --sprint shows their states
+#   stories           "docs/PRODUCT_BACKLOG.md" the product backlog (stories with acceptance
+#                                            criteria); backlog-status.sh --stories derives each
+#                                            story's status from the tickets that serve it; ""
+#                                            when the project keeps none
 #
 # LOOP_ROOT overrides the root (the fixture repos of the self-tests); LOOP_CONFIG names another
 # file outright. TOML is only the config format: it says nothing about the project's language.
@@ -65,12 +69,12 @@ read_config() {
     my ($file, $mode, $key) = @ARGV;
     my @order = qw(default_branch backlog check check_fast review_paths trailer_required kit kit_ref
                    code_paths proof_paths proof_pattern coverage coverage_floor coverage_slack review_context
-                   decisions sprint);
+                   decisions sprint stories);
     my %default = (default_branch => "main", backlog => "BACKLOG.md", check => "scripts/check.sh",
                    check_fast => undef, review_paths => [], trailer_required => "true",
                    kit => "", kit_ref => "", code_paths => [], proof_paths => [], proof_pattern => "",
                    coverage => "", coverage_floor => "coverage-floor.txt", coverage_slack => "0",
-                   review_context => "Agent review", decisions => "docs/decisions", sprint => []);
+                   review_context => "Agent review", decisions => "docs/decisions", sprint => [], stories => "docs/PRODUCT_BACKLOG.md");
     my %value;
     if (open my $fh, "<", $file) {
       my $table = "";
@@ -165,6 +169,7 @@ coverage_slack = "0.3"
 review_context = "Robot review"
 decisions = "adr"
 sprint = ["AB-12", "AB-07"]
+stories = "docs/STORIES.md"
 EOF
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" backlog)"; [ "$got" = "docs/QUEUE.md" ] || { echo "self-test: backlog should be docs/QUEUE.md, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" check_fast)"; [ "$got" = "make lint" ] || { echo "self-test: check_fast should be set, got '$got'"; exit 1; }
@@ -183,7 +188,9 @@ EOF
   got="$(LOOP_ROOT="$dir" "$me" decisions)"; [ "$got" = "docs/decisions" ] || { echo "self-test: decisions should default, got '$got'"; exit 1; }
   got="$(LOOP_CONFIG="$dir/other.toml" "$me" sprint)"; [ "$got" = $'AB-12\nAB-07' ] || { echo "self-test: sprint should list two ids in order, got '$got'"; exit 1; }
   got="$(LOOP_ROOT="$dir" "$me" sprint)"; [ -z "$got" ] || { echo "self-test: sprint should default to empty, got '$got'"; exit 1; }
-  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 17 ] || { echo "self-test: --all should print seventeen keys, got $got"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" stories)"; [ "$got" = "docs/STORIES.md" ] || { echo "self-test: stories should be set, got '$got'"; exit 1; }
+  got="$(LOOP_ROOT="$dir" "$me" stories)"; [ "$got" = "docs/PRODUCT_BACKLOG.md" ] || { echo "self-test: stories should default, got '$got'"; exit 1; }
+  got="$(LOOP_CONFIG="$dir/other.toml" "$me" --all | grep -c '=')"; [ "$got" = 18 ] || { echo "self-test: --all should print eighteen keys, got $got"; exit 1; }
   # An unknown key is an error; an unknown key in the file is a warning, not a failure.
   if LOOP_ROOT="$dir" "$me" colour >/dev/null 2>&1; then echo "self-test: an unknown key must fail"; exit 1; fi
   printf '[loop]\nfoo = "bar"\n' > "$dir/.loop.toml"

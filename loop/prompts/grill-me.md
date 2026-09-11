@@ -15,7 +15,8 @@ Read the decision records: the index in the decisions directory (`docs/decisions
 by default) and every record that touches the idea. A decision that has a record is settled;
 never ask about it, cite it by number. Then read the product backlog (every epic that
 touches the idea), the ticket file (the protocol and the tickets in the sections the idea
-touches), and run `scripts/backlog-status.sh` so you know what has landed. Skim the code and
+touches), and run `scripts/backlog-status.sh --stories` and `--open` so you know which
+stories are unticketed or open and what has landed. Skim the code and
 docs the idea would change, using the Layout in the Project rules to find them, so every
 question you ask is one the repository cannot answer.
 
@@ -113,7 +114,7 @@ and link it from the story and the ticket.
 **The sprint.** `sprint` in `.loop.toml` is the list of tickets chosen for now, in order;
 `scripts/backlog-status.sh --next` takes them first. Ask the owner which of the new tickets
 go into the sprint and where (ahead of, behind, or between the ones there), or none; the
-write step edits that list in the same commit.
+write step edits that list in the same commit (`scripts/sprint.sh add <id> [--before <id>]`).
 
 Ask the owner to confirm the draft, and apply their edits, before going on.
 

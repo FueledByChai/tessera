@@ -156,7 +156,7 @@ self_test() {
   # then copy the file only the new copy knows to list.
   mkdir -p "$dir/self/scripts" "$dir/kit-src/templates/check" "$dir/kit-src/extras"
   cp "$me" "$dir/self/scripts/loop-kit-sync.sh"; cp "$SCRIPT_ROOT/scripts/loop-config.sh" "$dir/self/scripts/"
-  awk '{print} /templates\/check\/\*\.sh/ && !done {print "  for f in \"$kit\"/extras/*.txt; do [ -e \"$f\" ] \&\& echo \"$f $ROOT/loop/extras/$(basename \"$f\")\"; done"; done=1}' "$me" > "$dir/kit-src/scripts/loop-kit-sync.sh"
+  awk '{print} /templates\/check\/\*\.sh/ && !done {print "  for f in \"$kit\"/extras/*.txt; do [ -e \"$f\" ] && echo \"$f $ROOT/loop/extras/$(basename \"$f\")\"; done"; done=1}' "$me" > "$dir/kit-src/scripts/loop-kit-sync.sh"
   grep -q 'extras/\*\.txt' "$dir/kit-src/scripts/loop-kit-sync.sh" || { echo "self-test: the fixture kit's sync script should list extras"; exit 1; }
   printf '#!/usr/bin/env bash\necho zz\n' > "$dir/kit-src/scripts/zz-after.sh"
   printf 'skeleton\n' > "$dir/kit-src/templates/check/other.sh"

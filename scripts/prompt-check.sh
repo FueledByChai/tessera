@@ -25,6 +25,7 @@ grill-me.md	without a named proof
 grill-me.md	wireframe
 grill-me.md	80 columns
 grill-me.md	sprint
+grill-me.md	--stories
 review-prs.md	four questions
 review-prs.md	one status per head commit
 grill-project.md	in a sentence
