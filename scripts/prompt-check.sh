@@ -23,6 +23,7 @@ grill-me.md	superseding
 grill-me.md	without a named proof
 review-prs.md	four questions
 review-prs.md	one status per head commit
+grill-project.md	in a sentence
 grill-project.md	Who and where
 grill-project.md	The data
 grill-project.md	Runtime and deploy
