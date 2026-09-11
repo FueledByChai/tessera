@@ -3,8 +3,10 @@
 # line names a test, fixture, or check; this is what makes a pull request that changed code
 # without touching one fail instead of merging on green.
 #
-#   scripts/proof-gate.sh               judge origin/<default branch>...HEAD (exit 1 when a
-#                                       code file changed and nothing counts as proof)
+#   scripts/proof-gate.sh               judge what is about to be committed: the working tree
+#                                       (uncommitted and untracked files included) against
+#                                       the merge base with origin/<default branch>; exit 1
+#                                       when a code file changed and nothing counts as proof
 #   scripts/proof-gate.sh --code-changed
 #                                       the query alone: exit 0 listing the changed code
 #                                       files, exit 1 with "no code change" when none is
@@ -22,7 +24,9 @@
 # With code_paths empty, or both proof_paths and proof_pattern empty, the gate is off.
 #
 # A commit body line `No new test: <reason>` anywhere in the range lets the change through;
-# the reason is printed so it is visible in the check's output and in the PR.
+# the reason is printed so it is visible in the check's output and in the PR. Judging the
+# working tree rather than the commits means a check run before the commit, the usual
+# order, exercises the gate too; CI, with everything committed, sees the same answer.
 set -euo pipefail
 SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="${LOOP_ROOT:-$SCRIPT_ROOT}"
@@ -55,26 +59,48 @@ base_ref() {
   if git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1; then echo "origin/$branch"; else echo "$branch"; fi
 }
 
+# The commit the working tree is compared with: where this branch left the base, so the
+# base moving on does not count as our change.
+merge_base() { git merge-base "$1" HEAD 2>/dev/null || echo "$1"; }
+
+# Every file that differs from the merge base in the working tree: committed on this branch,
+# modified but not committed, or untracked and not ignored.
+changed_files() {
+  { git diff --name-only "$1" 2>/dev/null; git ls-files --others --exclude-standard; } | sed '/^$/d' | sort -u
+}
+
+# The lines a file gained against the merge base; every line of an untracked file.
+added_lines() {
+  local mb="$1" file="$2"
+  if git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    git diff "$mb" -- "$file" | grep -v '^+++' | grep '^+' || true
+  else
+    cat "$file" 2>/dev/null || true
+  fi
+}
+
 # The query: did the range touch a code path? Prints the code files; exit 1 when none.
 code_changed() {
   cd "$ROOT"
-  local base glob file
+  local base mb glob file
   base="$(base_ref)"
+  mb="$(merge_base "$base")"
   local -a code_globs=() code=()
   while IFS= read -r glob; do code_globs+=("$glob"); done < <(read_globs code_paths)
   if [ "${#code_globs[@]}" = 0 ]; then echo "code_paths unset: assuming a code change"; return 0; fi
   while IFS= read -r file; do
     [ -n "$file" ] || continue
     if matches_any "$file" "${code_globs[@]}"; then code+=("$file"); fi
-  done < <(git diff --name-only "$base...HEAD" 2>/dev/null || true)
+  done < <(changed_files "$mb")
   if [ "${#code[@]}" = 0 ]; then echo "no code change against $base"; return 1; fi
   printf '%s\n' "${code[@]}"
 }
 
 gate() {
   cd "$ROOT"
-  local base
+  local base mb
   base="$(base_ref)"
+  mb="$(merge_base "$base")"
   local -a code_globs=() proof_globs=()
   local glob pattern
   while IFS= read -r glob; do code_globs+=("$glob"); done < <(read_globs code_paths)
@@ -92,8 +118,8 @@ gate() {
     is_code=0
     if matches_any "$file" "${code_globs[@]}"; then code+=("$file"); is_code=1; fi
     if [ "${#proof_globs[@]}" -gt 0 ] && matches_any "$file" "${proof_globs[@]}"; then proof+=("$file (path)"); continue; fi
-    if [ "$is_code" = 1 ] && [ -n "$pattern" ] && git diff "$base...HEAD" -- "$file" | grep -v '^+++' | grep '^+' | grep -qE -- "$pattern"; then proof+=("$file (adds a line matching the pattern)"); fi
-  done < <(git diff --name-only "$base...HEAD" 2>/dev/null || true)
+    if [ "$is_code" = 1 ] && [ -n "$pattern" ] && added_lines "$mb" "$file" | grep -qE -- "$pattern"; then proof+=("$file (adds a line matching the pattern)"); fi
+  done < <(changed_files "$mb")
   if [ "${#code[@]}" = 0 ]; then echo "proof gate: ok (no code change against $base)"; return 0; fi
   if [ "${#proof[@]}" -gt 0 ]; then
     echo "proof gate: ok (${#code[@]} code file(s) with proof: $(printf '%s; ' "${proof[@]}" | sed 's/; $//'))"
@@ -127,7 +153,7 @@ self_test() {
     git add -A; git commit -q -m "Scaffold"; git push -q -u origin main 2>/dev/null
   )
   export LOOP_ROOT="$dir/work"
-  fresh() { (cd "$dir/work" && git checkout -q main && git reset -q --hard origin/main && git checkout -q -B case); }
+  fresh() { (cd "$dir/work" && git checkout -q main && git reset -q --hard origin/main && git clean -fdq && git checkout -q -B case); }
   # 1. Code without proof: fails and names the file.
   fresh; (cd "$dir/work" && echo "fn b() {}" >> src/lib.rs && git commit -q -am "AA-01: add b")
   rc=0; out="$("$me" 2>&1)" || rc=$?
@@ -151,6 +177,24 @@ self_test() {
   # 5. A change outside code_paths: ok, no code change.
   fresh; (cd "$dir/work" && echo "more" >> docs/README.md && git commit -q -am "HK-01: docs")
   out="$("$me")" && echo "$out" | grep -q 'ok (no code change' || { echo "self-test: a docs change should pass as no code change:"; echo "$out"; exit 1; }
+  # 5a. Uncommitted work is judged too (the check runs before the commit): a code change in
+  #     the working tree with no proof fails before any commit; an untracked test file passes
+  #     it; the query sees the uncommitted change as well; a base that moved on after the
+  #     branch left it is not counted as ours.
+  fresh; (cd "$dir/work" && echo "fn u() {}" >> src/lib.rs)
+  rc=0; out="$("$me" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q '^  src/lib.rs$' || { echo "self-test: an uncommitted code change with no proof should fail (rc $rc):"; echo "$out"; exit 1; }
+  out="$("$me" --code-changed)" && [ "$out" = "src/lib.rs" ] || { echo "self-test: --code-changed should see the uncommitted change:"; echo "$out"; exit 1; }
+  (cd "$dir/work" && echo "fn u_works() {}" > tests/u.rs)
+  out="$("$me")" && echo "$out" | grep -q 'tests/u.rs (path)' || { echo "self-test: an untracked test file should count as proof:"; echo "$out"; exit 1; }
+  (cd "$dir/work" && rm tests/u.rs && printf '#[test]\nfn u_works() {}\n' >> src/lib.rs)
+  out="$("$me")" && echo "$out" | grep -q 'src/lib.rs (adds a line matching the pattern)' || { echo "self-test: an uncommitted test line should count as proof:"; echo "$out"; exit 1; }
+  fresh; (cd "$dir/work" && git commit -q --allow-empty -m "AA-07: nothing yet")
+  (cd "$dir" && git clone -q -b main origin.git mover 2>/dev/null && cd mover && git config user.email m@example.com && git config user.name m && echo "fn moved() {}" >> src/lib.rs && git commit -q -am "AA-08: base moves on" && git push -q origin main)
+  (cd "$dir/work" && git fetch -q origin)
+  rc=0; out="$("$me" --code-changed)" || rc=$?
+  [ "$rc" = 1 ] || { echo "self-test: a base that moved on must not count as our code change (rc $rc):"; echo "$out"; exit 1; }
+  (cd "$dir" && rm -rf mover)
   # 5b. The query: a code change lists the files; a docs change says no; unset keys assume.
   fresh; (cd "$dir/work" && echo "fn q() {}" >> src/lib.rs && git commit -q -am "AA-06: q")
   out="$("$me" --code-changed)" && [ "$out" = "src/lib.rs" ] || { echo "self-test: --code-changed should list src/lib.rs:"; echo "$out"; exit 1; }
