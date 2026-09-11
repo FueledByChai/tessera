@@ -944,6 +944,88 @@ promotion study's results):
   disabled)" with a link to the automation page.
 ```
 
+## Epic K: Console pages
+
+### BT-1101 — A strategy page is a summary, a Run button, and its history; configuration lives in a dialog
+
+**Status:** Proposed
+**User story:** As a researcher who launches runs and reviews history equally often, I want
+the strategy page to show the current configuration as one strip with a Run button and the
+historical runs directly under it, with the full form in a dialog, so that a repeat run and a
+look at history both happen without scrolling.
+
+**Acceptance criteria:**
+
+- The page order is: the hero (title, badges, View source, Configure run); Production rules
+  folded, closed by default, with the rule count on the bar; a summary strip of the current
+  configuration (research label, window, universe, resolution, capital, entry limits, every
+  strategy parameter with its value, the preset name) with Configure run and Run buttons;
+  the Historical runs table. Nothing else sits between the strip and the table.
+- Configure run opens a modal dialog in the terminal look (decision 0003): one form with four
+  labelled rows (Identity, Data, Limits, Parameters), presets (apply, save as) inside it, an
+  advanced toggle, Cancel and Run. Escape or Cancel closes it and keeps the edits in memory
+  until the page changes; Run inside it launches and closes it.
+- The Run button on the page sends exactly the configuration the strip shows: the request
+  body of a run launched from the strip equals the one launched from the dialog with no
+  edits.
+- Numeric fields in every form grid are sized to their content (six characters for numbers),
+  dates and selects keep their width, and the grid auto-fits so a row holds at least six
+  fields at 1280 px; every control keeps its 42 px height and 18 px text (UI-01 stands).
+- At 1280 and 1440 px in both display modes the dialog fits the viewport and the page
+  behind it does not scroll horizontally; the layout check proves it.
+
+**Wireframe** (the strategy page, then the dialog):
+
+```
++ STR  GAP_FADE v3 - ETF - PRODUCTION            [View source] [Configure run] +
+| > Production rules (6)                                                folded |
+| RUN  Development - 2024-01-01 -> 2026-09-10 - ETFs - 1m - $100k              |
+|      entries 3/day, 10 open, priority - gap 1.5%  hold 30m  stop 2%          |
+|      preset: baseline                              [Configure run]  [Run]    |
++------------------------------------------------------------------------------+
++ HST  HISTORICAL RUNS - 42 - starred only [ ] - label v                       +
+| * NAME            WINDOW       CAGR  SHARPE  MAXDD  TRADES  LABEL   STARTED  |
+| ...                                                                          |
++------------------------------------------------------------------------------+
+
+  CONFIGURE RUN (modal, ~900 px wide)                                      [x]
+  IDENTITY  label v    start [      ]  end [      ]   cost profile v
+  DATA      universe v  resolution v  session v  size [   ] capital [   ] min px [ ]
+  LIMITS    per day [  ]  open [  ]  tie-break v  seed [    ]
+  PARAMS    gap % [   ]  hold min [   ]  stop % [   ]  ...        advanced [ ]
+  presets: baseline v  [save as...]                          [Cancel]  [Run]
+```
+
+### BT-1102 — The strategies catalog is a scoreboard
+
+**Status:** Proposed
+**User story:** As a researcher choosing what to work on, I want each strategy's row to show
+its last completed run's CAGR, Sharpe, and max drawdown with that run's date, in fewer and
+denser columns, so that the catalog answers "how is it doing" without opening each page.
+
+**Acceptance criteria:**
+
+- Columns: #, name (version and status as badges under the name), asset, runs, CAGR, Sharpe,
+  max DD, last run (date), open. Each metric column sorts.
+- The metrics are the last completed run's cached metrics (`metrics_json`); a strategy with
+  no completed run, or whose last run has no cached metrics, shows a dash and no error.
+- Rows go dense (15 px cells, 13 px headers) under 1500 px like the run history, and the
+  table fits 1280 px without horizontal scroll; the layout check proves it.
+
+**Wireframe:**
+
+```
++ CAT  STRATEGIES - 12 - sort: sharpe v                                        +
+| #  NAME                     ASSET  RUNS  CAGR %  SHARPE  MAXDD %  LAST RUN  |
+| 1  gap_fade                 ETF      42    18.2    1.31    -9.4   09-10 [>] |
+|    v3 - production                                                          |
+| 2  limit_buyer              US     117    11.0    0.92   -14.8   09-08 [>] |
+|    v2 - research                                                            |
+| 3  orb_breakout             ETF       0       -       -       -        - [>]|
+|    draft                                                                    |
++------------------------------------------------------------------------------+
+```
+
 ## Recommended delivery milestones
 
 ### Completed foundation — Event-driven SDK steps 1–6

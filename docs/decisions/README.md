@@ -5,3 +5,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 
 - [0001](0001-scheduled-research-work-runs-inside-the-service-s-scheduler.md) Scheduled research work runs inside the service's scheduler — accepted
 - [0002](0002-alerts-surface-in-the-console-and-the-research-log-never-out.md) Alerts surface in the console and the research log, never outbound — accepted
+- [0003](0003-run-configuration-is-edited-in-a-modal-dialog-a-page-shows-a.md) Run configuration is edited in a modal dialog; a page shows a summary and a Run button — accepted

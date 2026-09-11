@@ -37,7 +37,7 @@ decisions = "docs/decisions"
 # The sprint (HK-39): the tickets chosen for now, in the order to work them. backlog-status.sh
 # --next takes the first ready one of these before file order; --sprint shows their states.
 # Choosing a sprint is a commit that edits this list; a ticket keeps no sprint state.
-sprint = ["HK-33"]
+sprint = ["HK-33", "UI-04", "UI-05", "UI-06"]
 # The product backlog (HK-40): stories with acceptance criteria that tickets say they serve
 # ("Serves BT-nnn"); backlog-status.sh --stories derives each story's status from them.
 stories = "docs/PRODUCT_BACKLOG.md"
