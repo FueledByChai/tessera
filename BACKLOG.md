@@ -58,6 +58,51 @@ asserts `document.documentElement.scrollWidth <= window.innerWidth` and that no 
 edge exceeds the viewport unless an ancestor has `overflow-x: auto`; `theme-check.mjs` fails on
 any grid track wider than `minmax(0, 1fr)` without `min-width: 0` on the track's children.
 
+### UI-04 Numeric fields are sized to their content; form grids auto-fit
+Every form grid (`.field-grid`, `.field-grid.five` in `web/app/globals.css`) is a fixed
+four- or five-track grid, so a field holding one to three digits is as wide as a date or a
+universe select and a row holds five fields. Numeric inputs (`type="number"`, and text
+inputs the SDK form renders for int and decimal parameters) get a `size`-driven width of six
+characters, dates and selects keep their width, and the grids become auto-fit tracks with a
+minimum per kind, so a row holds at least six fields at 1280 px. Heights and fonts do not
+change: the 42 px / 18 px rule (UI-01) stands and `web/scripts/theme-check.mjs` keeps its
+floor. Serves BT-1101.
+**Done when:** `web/scripts/layout-check.mjs` counts the fields in the first row of the
+strategy page's Data and sizing grid at 1280 px and fails under six; `theme-check.mjs` still
+passes with its font and height floors untouched.
+
+### UI-05 The strategy page is a summary strip, a Run button, and history; configuration in a dialog — Blocked by UI-04
+`StrategyWorkspace` (`web/app/page.tsx`) reorders to: hero (title, badges, View source,
+Configure run); Production rules as a fold closed by default with the rule count on its bar;
+a summary strip of the current configuration (research label, window, universe, resolution,
+capital, entry limits, every strategy parameter with its value, preset name) with Configure
+run and Run buttons; then `RunHistoryTable`. Configure run opens a modal dialog (a native
+`dialog` element styled in the terminal look, the console's first) holding the whole form
+(`SdkForm` and the identity fields) as four labelled rows (Identity, Data, Limits,
+Parameters), the presets panel inside it, the advanced toggle, Cancel and Run; Escape or
+Cancel closes it keeping the edits in memory; Run launches and closes. The strip's Run sends
+the same request body the dialog's Run would with no edits. `docs/LOCAL_UI.md` describes the
+page and the dialog. Serves BT-1101. Wireframe: BT-1101. Decisions: 0003.
+**Done when:** `web/scripts/layout-check.mjs` opens the dialog on the strategy page at 1280
+and 1440 px in both display modes and fails when the dialog passes the viewport or the page
+scrolls horizontally, and fails when the history table is not the first panel after the
+summary strip; `web/scripts/chart-check.mjs` (or a new `run-form-check.mjs` run by
+`scripts/check.sh`) applies a seeded preset, reads the strip's values, intercepts the POST
+from the strip's Run and from the dialog's Run, and fails unless both bodies match the strip.
+
+### UI-06 The strategies catalog shows each strategy's last completed run, in nine dense columns
+`StrategyCatalog` (`web/app/page.tsx`) shows #, name with version and status as badges under
+it, asset, runs, CAGR, Sharpe, max DD, last run date, open; each metric column sorts
+(`orderCatalogRows`). The catalog endpoint in `src/bin/tessera_ui.rs` adds the last completed
+run's cached metrics (`metrics_json` on `runs`) and its date to each strategy row; no run or
+no cached metrics gives nulls, rendered as a dash. Rows go dense under 1500 px like the run
+history (`web/app/globals.css`). `docs/LOCAL_UI.md` names the columns. Serves BT-1102.
+Wireframe: BT-1102.
+**Done when:** a service test seeds a strategy with two completed runs (one without cached
+metrics) and one with none and asserts the catalog rows carry the last completed run's
+metrics, a null-metrics row, and a no-run row; `web/scripts/layout-check.mjs` measures the
+strategies page at 1280 px with the nine columns and fails on horizontal scroll.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar
