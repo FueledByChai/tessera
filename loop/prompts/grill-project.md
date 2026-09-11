@@ -17,8 +17,12 @@ is in the repository already: a manifest (`Cargo.toml`, `pyproject.toml`, `packa
 ## 2. Interview
 
 Ask in rounds, one area per round, at most four questions each, every question with a
-recommended default first, in whatever way the harness offers for asking the owner. Each area
-ends in one of two things: a decision record written in this session
+recommended default first, in whatever way the harness offers for asking the owner. Round 1
+opens with one question that has no options: what is it, in a sentence: what goes in, what
+comes out, and what it replaces today; tell the owner to type the sentence (a harness that
+offers option buttons delivers free text only through its "other" box, so an option label is
+not an answer). Nothing else is asked until that sentence is in hand, and the restatement at
+the top of round 2 quotes it back word for word. Each area ends in one of two things: a decision record written in this session
 (`scripts/decisions.sh new "<title>"`, then its Context, Decision, Alternatives, Consequences,
 and what would show it was wrong), or a dated deferral: a record whose Status line reads
 `deferred until YYYY-MM-DD` and whose Decision section says what has to be learned first. Do
@@ -28,9 +32,9 @@ at the start of the next round.
 
 The five areas, in order:
 
-1. **Who and where.** Who uses it, how many of them, from where (a terminal, a browser, a
-   phone, another program), how often, and what they do today instead. This decides the
-   shape: a CLI, a service, a web app, a library.
+1. **Who and where.** First the sentence above; then who uses it, how many of them, from
+   where (a terminal, a browser, a phone, another program), how often, and what they do
+   today instead. This decides the shape: a CLI, a service, a web app, a library.
 2. **The data.** What it stores, how much, how fast it grows, how long it is kept, whether
    one person or many write it, what must never be lost, and what must never leave the
    machine. This decides whether there is a database, which kind, and where it lives.
