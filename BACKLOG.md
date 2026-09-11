@@ -554,3 +554,64 @@ self-test should be able to leave the old pid bound so the case is covered.
 **Done when:** the deploy self-test has a fixture where the stub keeps the old listener
 alive and the run reports "restart failed: the old service still holds the port" instead
 of a restart; `--launchd` output contains /usr/sbin; the script has no bare `lsof`.
+
+### HK-31 Decision records, and grill-me that reads, writes, and respects them
+Nothing records why a decision was made; Tessera's locked list is bullets without
+alternatives, and grill-me guesses or buries a choice in a ticket when a story implies one.
+In `coding-agent-loop`: `templates/decision.md` (Context, Decision, Alternatives,
+Consequences, "What would show this was wrong", Status: accepted | superseded by NNNN) and
+`scripts/decisions.sh` (`new "<title>"` creates the next numbered file from the template,
+`index` rewrites `docs/decisions/README.md`, `--check` fails when the index and the files
+disagree, `--self-test`). `prompts/grill-me.md` changes: grounding reads the index; a
+minimum of three rounds with the last on proofs and edge cases only, and no story drafted
+without a named proof; when a story implies a decision no record covers, stop, ask, write
+the record in the session, cite it in the ticket; when a story contradicts a record, ask
+which wins and write a superseding record if the decision changes. The kit's check asserts
+the prompt carries those rules (the phrases "at least three rounds", "docs/decisions",
+"superseding"). `.loop.toml` gains `decisions` (the directory, default `docs/decisions`).
+Serves BT-904, BT-906.
+**Done when:** `scripts/decisions.sh --self-test` proves new, index, --check on a mismatch,
+and a superseding record marking its predecessor; the kit's check fails when a required
+phrase is removed from the prompt (proved in its self-test by a copy with the phrase
+deleted); the PR body records one real grill-me run showing three rounds, a decision record
+written mid-session, and its citation in a ticket; the kit is tagged and `kit_ref` here
+moves to it.
+
+### HK-32 grill-project: the first-day interview that leaves rules, decisions, epics, and a check behind — Blocked by HK-31
+A new project has no Project rules, no decisions, and no check, so `/next-ticket` cannot
+run. Add `prompts/grill-project.md` and its wrapper to `coding-agent-loop`: rounds over who
+and where, the data, runtime and deploy, the UI, and the non-negotiables, each ending in a
+decision record or a dated deferral; then it writes the Project rules section of
+`AGENTS.md`, the records, the first epics in the product backlog, and `scripts/check.sh`
+from a stack table in the prompt (Rust, Python, Node/TypeScript, Java with Maven or Gradle,
+Go: test, lint, format, build, coverage command for the ratchet; TODO lines for any other
+stack), plus `.loop.toml` filled from the answers. `install.sh` installs the wrapper and the
+README says to run it first. Serves BT-905.
+**Done when:** the kit's check asserts the prompt names the five areas and the stack table
+has the five stacks; `install.sh --self-test` sees the wrapper installed; the PR body
+records one real run on a scratch project (a throwaway directory) that ends with
+`AGENTS.md` Project rules filled, at least three records, one epic, and a `scripts/check.sh`
+that runs and exits 0 on the empty project; the kit is tagged and `kit_ref` here moves to
+it.
+
+### HK-33 Tessera's locked product decisions become records — Blocked by HK-31
+The fifteen bullets under "Locked product decisions" in `docs/PRODUCT_BACKLOG.md` become
+`docs/decisions/0001` to `0015`, each quoting its bullet, with Context reconstructed where
+the backlog or the docs say why and "Alternatives: not recorded" where nothing does, and
+"What would show this was wrong" written now. The bullets are replaced by one line pointing
+at the index. `AGENTS.md` Project rules name the directory. Serves BT-904.
+**Done when:** `scripts/decisions.sh --check` passes with fifteen records and an index of
+fifteen; each record's Context quotes its bullet; the product backlog's section is the
+pointer; `scripts/check.sh` runs the decisions check.
+
+### HK-34 grill-me sketches the screen a story touches — Blocked by HK-31
+A ticket that changes a page describes its panel and columns in prose, and the layout gets
+decided by whoever implements it. In `prompts/grill-me.md`: when a story touches a screen,
+the draft carries a text wireframe (a fenced block, at most 80 columns, naming the panels,
+tables, and controls and their order) that the owner confirms, and the ticket points at it
+by story id; when the owner asks, or the screen is new, the prompt uses the harness's design
+canvas for a mockup and the ticket links it. The kit's check asserts the prompt carries the
+wireframe rule. Serves BT-906.
+**Done when:** the kit's check fails when the wireframe rule is removed from the prompt; the
+PR body records one real grill-me run on a screen-touching idea whose draft carries a
+wireframe and whose ticket points at it; the kit is tagged and `kit_ref` here moves to it.
