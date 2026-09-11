@@ -27,6 +27,12 @@ How development and research run without a person in the middle of every step. T
   proves. Done is derived from git, not written into the file: `scripts/backlog-status.sh`
   reports every ticket with its state, date, and sha from the commit whose subject carries its
   id, and `--next` names the next ticket to take.
+- `scripts/backlog-status.sh --sprint` and `sprint = [...]` in `.loop.toml` (HK-39): the
+  tickets chosen for now, in order. `--next` takes the first ready one of them before file
+  order and says so when it falls back; `--sprint` lists them with their states and a
+  summary line; the table shows each ticket's sprint position. Choosing a sprint is a
+  commit that edits the list, so it is dated and diffable like everything else, and tickets
+  carry no sprint state. grill-me asks which new tickets go into the sprint.
 - `scripts/release-notes.sh <from> [<to>]`: what shipped between two refs as Markdown, the
   commits with a ticket id grouped under their backlog section. Tag releases; then
   `scripts/release-notes.sh --archive <tag> <previous-tag> <tag>` moves the shipped tickets, text

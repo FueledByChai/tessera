@@ -713,3 +713,17 @@ should assert the prompt names the toolchain step. Kit change, tag, sync.
 `loop/templates/ci/`; `scripts/prompt-check.sh` asserts "toolchain" in `grill-project.md`;
 the kit PR shows one workflow produced from a snippet passing `actionlint` or a YAML parse;
 `kit_ref` here moves to the tag.
+
+### HK-39 A sprint list in .loop.toml steers --next
+`scripts/backlog-status.sh --next` takes tickets in file order, so choosing what to work on
+next means moving tickets around the file, and nothing records that a sprint was chosen.
+Add `sprint = [...]` to `.loop.toml` (kit: `loop-config.sh`), the tickets chosen for now in
+order: `--next` takes the first ready one of them before file order and announces the
+fallback, `--sprint` lists them with their states and a summary, the table shows each
+ticket's position, and grill-me asks which new tickets go into the sprint and where. Tickets
+carry no sprint state. Kit change, tag, sync; here the first sprint is set.
+**Done when:** the kit's `backlog-status.sh --self-test` proves sprint order beats file
+order, an unknown id is reported, an exhausted sprint falls back, and `--sprint` lists the
+sprint with a summary; `loop-config.sh --self-test` parses and defaults the key;
+`prompt-check.sh` asserts "sprint" in next-ticket and grill-me; `kit_ref` here moves to the
+tag and `scripts/backlog-status.sh --next` names the sprint's first ticket.

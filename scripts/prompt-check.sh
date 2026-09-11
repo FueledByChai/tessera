@@ -16,6 +16,7 @@ ROOT="${LOOP_ROOT:-$SCRIPT_ROOT}"
 RULES='next-ticket.md	Done when
 next-ticket.md	--claim
 next-ticket.md	Never push the default branch
+next-ticket.md	sprint
 grill-me.md	at least three rounds
 grill-me.md	proofs and edge cases
 grill-me.md	docs/decisions
@@ -23,6 +24,7 @@ grill-me.md	superseding
 grill-me.md	without a named proof
 grill-me.md	wireframe
 grill-me.md	80 columns
+grill-me.md	sprint
 review-prs.md	four questions
 review-prs.md	one status per head commit
 grill-project.md	in a sentence

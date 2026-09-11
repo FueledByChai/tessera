@@ -16,7 +16,7 @@ trailer_required = true
 # --check` fails when scripts/ or loop/prompts/ drift from the tag; move kit_ref to take a
 # newer release, then run the sync.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.15.0"
+kit_ref = "v0.16.0"
 # The proof gate (scripts/proof-gate.sh, HK-23): a change under src/ must come with a change
 # under a proof path, or add a #[test] or #[cfg(test)] line, or say why in the commit body
 # (`No new test: <reason>`).
@@ -34,3 +34,7 @@ coverage_slack = "0.2"
 # edited in place; grill-me reads the index before asking and writes a record when a story
 # needs a decision. HK-33 migrates the locked product decisions here.
 decisions = "docs/decisions"
+# The sprint (HK-39): the tickets chosen for now, in the order to work them. backlog-status.sh
+# --next takes the first ready one of these before file order; --sprint shows their states.
+# Choosing a sprint is a commit that edits this list; a ticket keeps no sprint state.
+sprint = ["HK-33"]
