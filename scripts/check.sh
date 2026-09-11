@@ -120,7 +120,7 @@ step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 
 if [ "$WEB_ONLY" = 0 ] && [ "$PRIVATE_ONLY" = 0 ]; then
-step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, proof gate, coverage ratchet, review status, deploy"
+step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, proof gate, coverage ratchet, review status, decisions, prompt check, deploy"
 scripts/loop-config.sh --self-test
 scripts/backlog-status.sh --self-test
 scripts/open-ticket-pr.sh --self-test
@@ -129,12 +129,20 @@ scripts/loop-kit-sync.sh --self-test
 scripts/proof-gate.sh --self-test
 scripts/coverage-ratchet.sh --self-test
 scripts/review-status.sh --self-test
+scripts/decisions.sh --self-test
+scripts/prompt-check.sh --self-test
 scripts/deploy-local.sh --self-test
 
 # The loop scripts and prompts are copies from the kit's tagged release (HK-16, HK-19);
 # drift fails the check.
 step "loop kit: scripts/ and loop/prompts/ match the kit at its tag"
 scripts/loop-kit-sync.sh --check
+
+# The prompts carry their rules (HK-31): a phrase that states a rule may not be edited away;
+# and the decision records, when there are any, keep their sections and their index.
+step "loop prompts carry their rules; decision records are in step"
+scripts/prompt-check.sh
+scripts/decisions.sh --check
 
 # The loop prompts belong to every project that adopts the loop (HK-15): nothing in loop/
 # may name this project, its build tools, a harness, or its review path. (.loop.toml is

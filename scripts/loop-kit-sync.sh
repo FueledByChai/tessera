@@ -4,8 +4,9 @@
 # .loop.toml names it: a directory (relative to the root) or a git URL, with `kit_ref` the tag
 # or branch to take from a URL.
 #
-#   scripts/loop-kit-sync.sh            copy the kit's scripts/*.sh into scripts/ and its
-#                                       prompts/*.md into loop/prompts/, and say what changed
+#   scripts/loop-kit-sync.sh            copy the kit's scripts/*.sh into scripts/, its
+#                                       prompts/*.md into loop/prompts/, and its templates/*.md
+#                                       into loop/templates/, and say what changed
 #   scripts/loop-kit-sync.sh --check    exit 1 with a list when any copy differs from the kit
 #   scripts/loop-kit-sync.sh --self-test
 #                                       a fixture kit and checkout prove both modes
@@ -50,6 +51,7 @@ pairs() {
   local kit="$1" f
   for f in "$kit"/scripts/*.sh; do [ -e "$f" ] && echo "$f $ROOT/scripts/$(basename "$f")"; done
   for f in "$kit"/prompts/*.md; do [ -e "$f" ] && echo "$f $ROOT/loop/prompts/$(basename "$f")"; done
+  for f in "$kit"/templates/*.md; do [ -e "$f" ] && echo "$f $ROOT/loop/templates/$(basename "$f")"; done
   return 0
 }
 

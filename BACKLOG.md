@@ -196,6 +196,48 @@ ratio_to rv 60s`), and "vol of vol 60s" (`mid | rv 5s | std 60s`). `docs/LOCAL_U
 a second start; `web/scripts/chart-check.mjs` finds the `realized_vol` option in the form's
 target select.
 
+### WB-16 Promotion freezes the study and the IC a feature was promoted with
+A promoted preset stores only its expression, so nothing can rescore it apples to apples.
+`feature_presets` gains `promoted_grid`, `promoted_symbols`, `promoted_horizon`,
+`promoted_target`, and `baseline_ic` (nullable); `POST /api/features/{id}/promote` and the
+results-grid promotion fill them from the study the cell came from, and a library promotion
+without a study leaves them null for WB-17's first run to fill. The library panel shows the
+promoted study beside a promoted feature. Serves BT-1003. Decisions: 0001.
+**Done when:** a service test promotes a cell from a stored study and reads the five fields
+back; promoting from the library leaves them null;
+`feature_presets_survive_reopening_the_catalog` still passes; `web/scripts/chart-check.mjs`
+finds the promoted-study text on an accepted row of the fixture library.
+
+### WB-17 A nightly job rescores promoted features and keeps their IC history — Blocked by WB-16
+Add the automation kind `feature_decay` to `automation_schedules` (seeded disabled, local
+time 02:30, weekdays all, like the other kinds) and the table `feature_ic_history(preset_id,
+date, ic, observations, status, reason)` with status in {baseline, ok, watch, alert, skipped}.
+The job runs each promoted feature on its frozen study over the trailing 20 sessions: a null
+baseline is set from this run and recorded as `baseline`; trailing IC under half the
+baseline or of opposite sign is `watch` when the previous row was not, and `alert` when it
+was `watch` or `alert`; no bars for a symbol in the window, a base the grid cannot supply, or
+a horizon beyond the window is `skipped` with the reason, never watch or alert. The
+schedule's `last_status` says how many were scored and skipped. Serves BT-1003. Decisions:
+0001.
+**Done when:** a service test against an in-memory catalog builds a synthetic panel whose
+feature predicts the target for 40 sessions and then stops, with one quiet blip earlier, and
+runs the job day by day: `baseline` on day one, `ok` through the blip, `watch` on the first
+breach, `alert` on the second, and a `skipped` row with its reason on a day with no bars, on
+a day whose base the grid lacks, and on a day whose horizon exceeds the window; the schedule
+row's `last_status` reads "scored N, skipped M".
+
+### WB-18 The dashboard shows decayed features and the research log records them — Blocked by WB-17
+The dashboard gains a "Feature decay" panel from `GET /api/features/decay`: one row per
+promoted feature with its baseline IC, trailing IC, observations, status, and the reason when
+skipped, alerts first, in the terminal look, dense under 1500 px. Each nightly run that
+produced a new alert appends one dated line per alert to the private research log
+(`../Tessera-private/docs/research-log.md`, the file `/nightly-studies` writes) naming the
+feature, the study, and the two ICs. Serves BT-1003. Decisions: 0002.
+**Done when:** `web/fixtures/feature-decay.json` carries an alert, a watch, a baseline-set,
+and a skipped row, and `web/scripts/chart-check.mjs` fails unless all four render with their
+numbers, the panel sits on the page at 1280 px, and no console error appears; a service test
+shows one log line per new alert and none for a repeat; `docs/LOCAL_UI.md` names the panel.
+
 ## Housekeeping
 
 ### HK-01 Required symbols from the manifest
@@ -615,3 +657,14 @@ wireframe rule. Serves BT-906.
 **Done when:** the kit's check fails when the wireframe rule is removed from the prompt; the
 PR body records one real grill-me run on a screen-touching idea whose draft carries a
 wireframe and whose ticket points at it; the kit is tagged and `kit_ref` here moves to it.
+
+### HK-35 The kit sync replaces files atomically, so it cannot break itself mid-run
+Syncing v0.9.0 here, `scripts/loop-kit-sync.sh` copied the kit's newer copy of itself over
+the file bash was still reading (`cp` rewrites the same inode), bash read a half-replaced
+script and stopped with "unexpected EOF", and the templates after it in the list were not
+copied until a second run. The kit script should write each file beside its target and
+rename it into place (`cp` to `<dst>.tmp`, then `mv -f`), which gives the running shell the
+old inode to finish on, and copy its own file last. Kit change, tag, sync.
+**Done when:** the kit's loop-kit-sync self-test includes a kit whose loop-kit-sync.sh
+differs from the checkout's copy and shows one run copying every file, including a file
+listed after the script itself; `kit_ref` here moves to the tag.

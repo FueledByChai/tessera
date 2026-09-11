@@ -898,6 +898,27 @@ read in bps and a vol study takes seconds to set up.
 - A synthetic panel with persistent vol regimes gives a high IC for trailing vol against
   future vol and an IC near zero against future return.
 
+### BT-1003 — Promoted features are watched for IC decay
+
+**Status:** Proposed
+**User story:** As a researcher, I want every promoted feature rescored nightly on the study
+it was promoted from and flagged when its IC has halved or flipped sign, so that a feature
+that stopped working is caught by the console rather than by a losing month.
+
+**Acceptance criteria:**
+
+- Promotion freezes the study a feature was promoted from (grid, symbols, horizon, target)
+  and the IC it had; a feature promoted before this has its baseline set by its first
+  nightly run, and the panel says so.
+- A nightly job inside the service's scheduler (decision 0001) rescores each promoted
+  feature over a trailing window and stores one history row per feature per session.
+- A feature is on watch after one run where the trailing IC is under half its baseline or
+  has flipped sign, and alerted after two consecutive such runs; a gap in data, a base the
+  grid cannot supply, or a horizon longer than the window is a skipped row with a reason,
+  never decay.
+- Alerts appear on the console's dashboard with their numbers and as a dated line in the
+  private research log; nothing is sent outbound (decision 0002).
+
 ## Recommended delivery milestones
 
 ### Completed foundation — Event-driven SDK steps 1–6
