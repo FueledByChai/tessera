@@ -212,6 +212,8 @@ finds the promoted-study text on an accepted row of the fixture library.
 Add the automation kind `feature_decay` to `automation_schedules` (seeded disabled, local
 time 02:30, weekdays all, like the other kinds) and the table `feature_ic_history(preset_id,
 date, ic, observations, status, reason)` with status in {baseline, ok, watch, alert, skipped}.
+A promoted feature whose frozen study no longer exists gets a skipped row with reason
+`study missing` (grill-me, HK-34 run).
 The job runs each promoted feature on its frozen study over the trailing 20 sessions: a null
 baseline is set from this run and recorded as `baseline`; trailing IC under half the
 baseline or of opposite sign is `watch` when the previous row was not, and `alert` when it
@@ -226,17 +228,26 @@ breach, `alert` on the second, and a `skipped` row with its reason on a day with
 a day whose base the grid lacks, and on a day whose horizon exceeds the window; the schedule
 row's `last_status` reads "scored N, skipped M".
 
-### WB-18 The dashboard shows decayed features and the research log records them — Blocked by WB-17
-The dashboard gains a "Feature decay" panel from `GET /api/features/decay`: one row per
-promoted feature with its baseline IC, trailing IC, observations, status, and the reason when
-skipped, alerts first, in the terminal look, dense under 1500 px. Each nightly run that
-produced a new alert appends one dated line per alert to the private research log
-(`../Tessera-private/docs/research-log.md`, the file `/nightly-studies` writes) naming the
-feature, the study, and the two ICs. Serves BT-1003. Decisions: 0002.
-**Done when:** `web/fixtures/feature-decay.json` carries an alert, a watch, a baseline-set,
-and a skipped row, and `web/scripts/chart-check.mjs` fails unless all four render with their
-numbers, the panel sits on the page at 1280 px, and no console error appears; a service test
-shows one log line per new alert and none for a repeat; `docs/LOCAL_UI.md` names the panel.
+### WB-18 The studies page shows decayed features and the research log records them — Blocked by WB-17
+The studies page (`StudiesWorkspace` in `web/app/page.tsx`) gains a `DCY FEATURE DECAY`
+panel directly under the `LIB` feature library, from `GET /api/features/decay`: the title
+carries the counts and the last run date; one row per promoted feature with feature, study,
+baseline IC, trailing IC, observations, status, and reason, in the terminal look, dense under
+1500 px. Alerts come first, then watches, then skipped rows (`no base`, `horizon > window`,
+`data gap`, `study missing`); ok and baseline rows sit behind a show-all, and alerts and
+watches cap at twenty behind the same show-all. Clicking a row opens the frozen promotion
+study's results (the study WB-16 froze); a `study missing` row opens nothing. With nothing
+promoted, or before the job's first run, one line names the next step and links the
+automation page. Each nightly run that produced a new alert appends one dated line per alert
+to the private research log (`../Tessera-private/docs/research-log.md`, the file
+`/nightly-studies` writes) naming the feature, the study, and the two ICs. Serves BT-1003.
+Wireframe: BT-1003. Decisions: 0002.
+**Done when:** `web/fixtures/feature-decay.json` carries an alert, a watch, a skipped, a
+baseline-set, and an ok row, and `web/scripts/chart-check.mjs` fails unless the first three
+render with their numbers under the library panel at 1280 px, the last two appear only after
+show-all, clicking the alert row puts that study's IC-by-horizon chart on the page, and no
+console error appears; a service test shows one log line per new alert and none for a
+repeat; `docs/LOCAL_UI.md` names the panel.
 
 ## Housekeeping
 

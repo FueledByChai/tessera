@@ -916,8 +916,33 @@ that stopped working is caught by the console rather than by a losing month.
   has flipped sign, and alerted after two consecutive such runs; a gap in data, a base the
   grid cannot supply, or a horizon longer than the window is a skipped row with a reason,
   never decay.
-- Alerts appear on the console's dashboard with their numbers and as a dated line in the
-  private research log; nothing is sent outbound (decision 0002).
+- Alerts appear in a Feature decay panel on the studies page, directly under the feature
+  library, with their numbers, and as a dated line in the private research log; nothing is
+  sent outbound (decision 0002). The panel shows alerts, then watches, then skipped rows
+  (a base the grid cannot supply, a horizon longer than the window, a data gap, a frozen
+  study that no longer exists); ok and baseline rows sit behind a show-all, and alerts and
+  watches cap at twenty behind the same show-all. Clicking a row opens the frozen promotion
+  study's results; a skipped row for a missing study does not open anything. With nothing
+  promoted, or before the job's first run, one line names the next step.
+
+**Wireframe** (the studies page, directly under the feature library; alerts, then watches,
+then skipped rows; ok and baseline rows behind show-all; a row click opens the frozen
+promotion study's results):
+
+```
++ LIB  FEATURE LIBRARY - 3 accepted - 7 saved ---------------------------------+
+| (unchanged)                                                                  |
++------------------------------------------------------------------------------+
++ DCY  FEATURE DECAY - 1 alert - 1 watch - 1 skipped - 2 ok - run 09-11 02:30 -+
+| FEATURE           STUDY      BASE IC  TRAIL IC   OBS  STATUS   REASON        |
+| mid | rv 30s      vol-5s-A     0.062     0.021   840  ALERT    halved        |
+| ret 5s | std 60s  vol-5s-A     0.041    -0.008   840  WATCH    sign flip     |
+| mom 60s           px-1s-B          -         -     0  SKIPPED  no base       |
+| [show all 5]                                                                 |
++------------------------------------------------------------------------------+
+  empty: "No promoted features yet." / "Nightly decay job has not run (02:30,
+  disabled)" with a link to the automation page.
+```
 
 ## Recommended delivery milestones
 
