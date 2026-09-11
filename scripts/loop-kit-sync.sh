@@ -52,6 +52,7 @@ pairs() {
   for f in "$kit"/scripts/*.sh; do [ -e "$f" ] && echo "$f $ROOT/scripts/$(basename "$f")"; done
   for f in "$kit"/prompts/*.md; do [ -e "$f" ] && echo "$f $ROOT/loop/prompts/$(basename "$f")"; done
   for f in "$kit"/templates/*.md; do [ -e "$f" ] && echo "$f $ROOT/loop/templates/$(basename "$f")"; done
+  for f in "$kit"/templates/check/*.sh; do [ -e "$f" ] && echo "$f $ROOT/loop/templates/check/$(basename "$f")"; done
   return 0
 }
 

@@ -668,3 +668,15 @@ old inode to finish on, and copy its own file last. Kit change, tag, sync.
 **Done when:** the kit's loop-kit-sync self-test includes a kit whose loop-kit-sync.sh
 differs from the checkout's copy and shows one run copying every file, including a file
 listed after the script itself; `kit_ref` here moves to the tag.
+
+### HK-36 grill-project asks for the project's purpose as its own first question
+The recorded HK-32 run opened with the shape questions (who, how many, from where, how
+often) and only got the one-sentence purpose on the third ask: the owner picked an option
+label instead of typing, and in a harness whose question tool offers options, free text
+arrives only through its "Other" box. `prompts/grill-project.md` should make round 1 open
+with a single free-text question, "what is it, in a sentence: what goes in, what comes out,
+what it replaces", with the prompt saying to type the sentence, before the shape questions;
+and the restatement at the top of round 2 should quote that sentence back. Kit change,
+tag, sync.
+**Done when:** `scripts/prompt-check.sh` asserts the phrase "in a sentence" in
+`grill-project.md`; a recorded run in the kit PR shows the purpose captured in round 1.

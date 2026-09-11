@@ -47,7 +47,9 @@ below it are this project's own and are what the loop prompts mean when they say
   reads it first and stops to write a record when a story needs a decision.
 - **Prompts.** `loop/prompts/next-ticket.md` takes the next ticket to done;
   `loop/prompts/grill-me.md` turns a loose idea into stories, acceptance criteria, and
-  tickets; `loop/prompts/review-prs.md` reviews the open pull requests and posts the
+  tickets; `loop/prompts/grill-project.md` is the first-day interview that writes the
+  Project rules, the decision records, the first epics, and the check skeleton for a new
+  project; `loop/prompts/review-prs.md` reviews the open pull requests and posts the
   `Agent review` status the branch rules require (red only for a missing proof, an unmet
   done line, a rules breach, or a named defect; the owner overrides with
   `scripts/review-status.sh <sha> pass "override: <reason>"`). A harness with slash commands
