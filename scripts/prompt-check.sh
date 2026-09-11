@@ -22,7 +22,18 @@ grill-me.md	docs/decisions
 grill-me.md	superseding
 grill-me.md	without a named proof
 review-prs.md	four questions
-review-prs.md	one status per head commit'
+review-prs.md	one status per head commit
+grill-project.md	Who and where
+grill-project.md	The data
+grill-project.md	Runtime and deploy
+grill-project.md	The UI
+grill-project.md	Non-negotiables
+grill-project.md	dated deferral
+grill-project.md	rust.sh
+grill-project.md	python.sh
+grill-project.md	node.sh
+grill-project.md	java.sh
+grill-project.md	go.sh'
 
 prompts_dir() {
   if [ -d "$ROOT/loop/prompts" ]; then echo "$ROOT/loop/prompts"

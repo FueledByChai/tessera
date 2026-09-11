@@ -32,17 +32,26 @@ How development and research run without a person in the middle of every step. T
   `scripts/release-notes.sh --archive <tag> <previous-tag> <tag>` moves the shipped tickets, text
   and all, out of `BACKLOG.md` into `CHANGELOG.md` under the tag, so the queue holds only open
   work and the changelog is the record of what shipped when.
-- `loop/prompts/next-ticket.md`: the prompt that takes the next ticket to done, and
+- `loop/prompts/next-ticket.md`: the prompt that takes the next ticket to done;
   `loop/prompts/grill-me.md`, the one that turns a loose idea into stories, acceptance
-  criteria, and tickets. Both are written against `.loop.toml` and `AGENTS.md` only: no
+  criteria, and tickets; and `loop/prompts/grill-project.md` (HK-32), the first-day
+  interview for a project that has nothing yet: five rounds (who and where; the data;
+  runtime and deploy; the UI; non-negotiables), each ending in a decision record or a dated
+  deferral, then it writes the Project rules section of `AGENTS.md`, the records, the first
+  epics, the ticket file, `.loop.toml`, and `scripts/check.sh` from the kit's skeleton for
+  the stack (`loop/templates/check/`: Rust, Python, Node or TypeScript, Java with Maven or
+  Gradle, Go, or a TODO skeleton), which passes on the empty repository and starts failing
+  as code arrives. All three are written against `.loop.toml` and `AGENTS.md` only: no
   project name, build tool, or harness tool appears in them, and `scripts/check.sh` fails if
-  one does. `.claude/commands/next-ticket.md` and `grill-me.md` are two-line wrappers that
-  point Claude Code at them (`/next-ticket`, `/grill-me <idea>`); another harness is pointed
-  at the prompt file itself.
+  one does. `.claude/commands/next-ticket.md`, `grill-me.md`, and `grill-project.md` are
+  two-line wrappers that point Claude Code at them (`/next-ticket`, `/grill-me <idea>`,
+  `/grill-project <project>`); another harness is pointed at the prompt file itself. Tessera
+  already has its rules, so `/grill-project` is for the next repository, run there after the
+  kit's `install.sh`.
 - The loop kit, [FueledByChai/coding-agent-loop](https://github.com/FueledByChai/coding-agent-loop):
   the source of truth for the loop scripts, the prompts, and the templates any project needs
   to adopt the loop (`AGENTS.md` with an empty Project rules, `loop.toml.example`, a workflow
-  skeleton, the branch ruleset, the two wrappers, an `install.sh`, a README that says GitHub
+  skeleton, the branch ruleset, the wrappers, the check skeletons, an `install.sh`, a README that says GitHub
   is the only hosting assumption, and its own `check.sh` that CI runs). It was built here as
   `loop/` (HK-16) and published as `v0.1.0` (HK-19); its history is `loop/`'s. `kit` and
   `kit_ref` in `.loop.toml` name the URL and the tag. `scripts/loop-kit-sync.sh --check`
