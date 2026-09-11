@@ -19,7 +19,9 @@
 # The proof gate (scripts/proof-gate.sh) runs in every mode but --web-only and
 # --private-only: a change under src/ must bring a test, fixture, or check, or say why. The
 # coverage ratchet (scripts/coverage-ratchet.sh over scripts/coverage.sh) runs in the full
-# check and --quick: line coverage must not drop below coverage-floor.txt (HK-23).
+# check and --quick: line coverage must not drop below coverage-floor.txt (HK-23). On a
+# branch that touched no code path it skips its instrumented build, since coverage cannot
+# have moved (HK-28); on the default branch itself it always runs.
 #
 # Worktrees: from .claude/worktrees/<name> the script finds the main checkout through the shared
 # git dir, takes the private checkout beside it (or TESSERA_PRIVATE_ROOT), writes a local.toml
@@ -188,7 +190,16 @@ fi
 
 if [ "$RATCHET" = 1 ]; then
   step "coverage ratchet: line coverage against coverage-floor.txt"
-  scripts/coverage-ratchet.sh
+  # Coverage moves only when code does: a branch with no change under a code path skips the
+  # instrumented build (HK-28). The default branch itself (HEAD is origin/<default>) and any
+  # checkout without an origin always measure.
+  DEFAULT_BRANCH="$(scripts/loop-config.sh default_branch)"
+  ORIGIN_HEAD="$(git rev-parse -q --verify "origin/$DEFAULT_BRANCH" 2>/dev/null || echo none)"
+  if [ "$(git rev-parse HEAD)" = "$ORIGIN_HEAD" ] || [ "$ORIGIN_HEAD" = none ] || scripts/proof-gate.sh --code-changed >/dev/null; then
+    scripts/coverage-ratchet.sh
+  else
+    echo "coverage ratchet: skipped, no code change against origin/$DEFAULT_BRANCH"
+  fi
 fi
 
 if [ "$NO_WEB" = 0 ]; then

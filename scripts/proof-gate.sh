@@ -5,6 +5,12 @@
 #
 #   scripts/proof-gate.sh               judge origin/<default branch>...HEAD (exit 1 when a
 #                                       code file changed and nothing counts as proof)
+#   scripts/proof-gate.sh --code-changed
+#                                       the query alone: exit 0 listing the changed code
+#                                       files, exit 1 with "no code change" when none is
+#                                       under code_paths (exit 0 with "code_paths unset"
+#                                       when the gate is off, so a caller assumes a change);
+#                                       a check uses it to skip work that only code can move
 #   scripts/proof-gate.sh --self-test   a fixture repository proves every verdict
 #
 # Settings, from .loop.toml through scripts/loop-config.sh:
@@ -24,6 +30,7 @@ CONFIG="$SCRIPT_ROOT/scripts/loop-config.sh"
 MODE=gate
 case "${1:-}" in
   --self-test) MODE=selftest ;;
+  --code-changed) MODE=query ;;
   "") ;;
   *) echo "usage: scripts/proof-gate.sh [--self-test]" >&2; exit 2 ;;
 esac
@@ -41,11 +48,33 @@ matches_any() {  # $1 file, then globs
   return 1
 }
 
+# The base a change is judged against: origin's default branch when it exists, else the
+# local one.
+base_ref() {
+  local branch; branch="$("$CONFIG" default_branch)"
+  if git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1; then echo "origin/$branch"; else echo "$branch"; fi
+}
+
+# The query: did the range touch a code path? Prints the code files; exit 1 when none.
+code_changed() {
+  cd "$ROOT"
+  local base glob file
+  base="$(base_ref)"
+  local -a code_globs=() code=()
+  while IFS= read -r glob; do code_globs+=("$glob"); done < <(read_globs code_paths)
+  if [ "${#code_globs[@]}" = 0 ]; then echo "code_paths unset: assuming a code change"; return 0; fi
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if matches_any "$file" "${code_globs[@]}"; then code+=("$file"); fi
+  done < <(git diff --name-only "$base...HEAD" 2>/dev/null || true)
+  if [ "${#code[@]}" = 0 ]; then echo "no code change against $base"; return 1; fi
+  printf '%s\n' "${code[@]}"
+}
+
 gate() {
   cd "$ROOT"
-  local base branch
-  branch="$("$CONFIG" default_branch)"
-  if git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1; then base="origin/$branch"; else base="$branch"; fi
+  local base
+  base="$(base_ref)"
   local -a code_globs=() proof_globs=()
   local glob pattern
   while IFS= read -r glob; do code_globs+=("$glob"); done < <(read_globs code_paths)
@@ -122,16 +151,28 @@ self_test() {
   # 5. A change outside code_paths: ok, no code change.
   fresh; (cd "$dir/work" && echo "more" >> docs/README.md && git commit -q -am "HK-01: docs")
   out="$("$me")" && echo "$out" | grep -q 'ok (no code change' || { echo "self-test: a docs change should pass as no code change:"; echo "$out"; exit 1; }
+  # 5b. The query: a code change lists the files; a docs change says no; unset keys assume.
+  fresh; (cd "$dir/work" && echo "fn q() {}" >> src/lib.rs && git commit -q -am "AA-06: q")
+  out="$("$me" --code-changed)" && [ "$out" = "src/lib.rs" ] || { echo "self-test: --code-changed should list src/lib.rs:"; echo "$out"; exit 1; }
+  fresh; (cd "$dir/work" && echo "more" >> docs/README.md && git commit -q -am "HK-02: docs")
+  rc=0; out="$("$me" --code-changed)" || rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -q '^no code change' || { echo "self-test: --code-changed should say no on a docs change (rc $rc):"; echo "$out"; exit 1; }
+  fresh
+  rc=0; out="$("$me" --code-changed)" || rc=$?
+  [ "$rc" = 1 ] || { echo "self-test: --code-changed on the base itself should say no (rc $rc):"; echo "$out"; exit 1; }
   # 6. Unset keys: the gate is off.
   fresh; (cd "$dir/work" && printf '[loop]\n' > .loop.toml && echo "fn d() {}" >> src/lib.rs && git commit -q -am "AA-04: no config")
   out="$("$me")" && echo "$out" | grep -q 'off (no code_paths' || { echo "self-test: unset keys should switch the gate off:"; echo "$out"; exit 1; }
   (cd "$dir/work" && printf '[loop]\ncode_paths = ["src/"]\n' > .loop.toml && git commit -q -am "AA-04: code paths only")
   out="$("$me")" && echo "$out" | grep -q 'off (no proof_paths or proof_pattern' || { echo "self-test: code_paths alone should switch the gate off:"; echo "$out"; exit 1; }
+  (cd "$dir/work" && printf '[loop]\n' > .loop.toml && git commit -q -am "AA-04: nothing set")
+  out="$("$me" --code-changed)" && echo "$out" | grep -q 'code_paths unset: assuming' || { echo "self-test: --code-changed with code_paths unset should assume a change:"; echo "$out"; exit 1; }
   unset LOOP_ROOT
   echo "proof-gate self-test passed"
 }
 
 case "$MODE" in
   selftest) self_test ;;
+  query) code_changed ;;
   gate) gate ;;
 esac

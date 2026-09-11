@@ -12,7 +12,9 @@ How development and research run without a person in the middle of every step. T
   test, fixture, or check and no `No new test: <reason>` line; the ratchet fails line
   coverage below `coverage-floor.txt`, measured by `scripts/coverage.sh` with cargo-llvm-cov
   in the full check and `--quick`, and a ticket that raises coverage raises the floor with
-  `scripts/coverage-ratchet.sh --set`. CI (`.github/workflows/ci.yml`)
+  `scripts/coverage-ratchet.sh --set`. On a branch that touched nothing under `src/` the
+  ratchet prints "skipped, no code change" instead of running its instrumented build
+  (HK-28, using the gate's `--code-changed` query); on `main` itself it always runs. CI (`.github/workflows/ci.yml`)
   runs the same script: `--quick` in the engine job and `--web-only` in the web job, so a
   parity break fails the pull request the way it fails the checkout. Run from a worktree it
   resolves the main and private checkouts itself (`--resolve` prints them), builds into the
