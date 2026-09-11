@@ -16,7 +16,7 @@ trailer_required = true
 # --check` fails when scripts/ or loop/prompts/ drift from the tag; move kit_ref to take a
 # newer release, then run the sync.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.8.0"
+kit_ref = "v0.9.0"
 # The proof gate (scripts/proof-gate.sh, HK-23): a change under src/ must come with a change
 # under a proof path, or add a #[test] or #[cfg(test)] line, or say why in the commit body
 # (`No new test: <reason>`).
@@ -30,3 +30,7 @@ coverage = "scripts/coverage.sh"
 coverage_floor = "coverage-floor.txt"
 # The suite's coverage jitters by about a tenth of a point run to run (HK-26); 0.2 absorbs it.
 coverage_slack = "0.2"
+# Decision records (scripts/decisions.sh, HK-31): one numbered file per decision, never
+# edited in place; grill-me reads the index before asking and writes a record when a story
+# needs a decision. HK-33 migrates the locked product decisions here.
+decisions = "docs/decisions"

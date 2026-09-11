@@ -144,6 +144,16 @@ noreply address, so it does not bite. Commits from another identity would.
   research log in the private repo.
 - `/review-prs`: the command that reviews the open pull requests and posts the `Agent review`
   status each one waits for (see "Reviewing" below).
+- `docs/decisions/`: decision records (HK-31), one numbered file per decision from the kit's
+  template (Context, Decision, Alternatives, Consequences, what would show it was wrong),
+  never edited in place: a change is a new record with `scripts/decisions.sh new "<title>"
+  --supersedes NNNN`. `scripts/decisions.sh index` keeps the index; `--check` runs inside
+  `scripts/check.sh`. `/grill-me` reads the index before asking anything, asks at least
+  three rounds with the last on proofs and edge cases, stops to write a record when a story
+  implies a decision none covers, and cites the records in every ticket. A prompt cannot be
+  unit-tested, so `scripts/prompt-check.sh` (also in the check) fails when a prompt no longer
+  carries a phrase that states one of its rules, and a prompt change's PR records one real
+  run. HK-33 moves the locked product decisions into `docs/decisions/`.
 
 ## Reviewing
 
