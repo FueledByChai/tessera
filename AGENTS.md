@@ -18,8 +18,11 @@ below it are this project's own and are what the loop prompts mean when they say
   done: a ticket is done when a commit whose subject starts with its id is on the default
   branch. `scripts/backlog-status.sh` derives every ticket's state from the commits and
   `--next` names the first `todo` whose `Blocked by` tickets have landed, taking the
-  `sprint` list first and file order after it (`--sprint` shows the sprint's states). The
-  backlog file carries only claims: `doing` while someone works a ticket, `blocked <reason>` when it needs
+  `sprint` list first and file order after it (`--sprint` shows the sprint's states;
+  `--open` the pick list of tickets not done and not in the sprint; `--show <id>` a ticket
+  or story in full; `--stories` every story with a status derived from the tickets that
+  serve it; `scripts/sprint.sh add|remove|set` edits the sprint list). The backlog file
+  carries only claims: `doing` while someone works a ticket, `blocked <reason>` when it needs
   a decision. Clear the `doing` claim in the ticket's own commit and never write a done line.
   Anything discovered while working goes in as a new ticket, not into the current one.
 - **Claims and hand-off.** Before work starts, `scripts/open-ticket-pr.sh <id> --claim` pushes

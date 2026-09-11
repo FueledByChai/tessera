@@ -2,7 +2,7 @@
 # script on its own. Expects ROOT and the step function.
 loop_checks() {
   step "loop self-tests"
-  for s in loop-config backlog-status open-ticket-pr release-notes loop-kit-sync proof-gate coverage-ratchet review-status decisions prompt-check; do
+  for s in loop-config backlog-status open-ticket-pr release-notes loop-kit-sync proof-gate coverage-ratchet review-status decisions prompt-check sprint; do
     [ -x "scripts/$s.sh" ] && "scripts/$s.sh" --self-test
   done
   step "loop kit, prompts, and decision records in step"

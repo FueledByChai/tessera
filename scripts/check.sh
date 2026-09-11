@@ -120,7 +120,7 @@ step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 
 if [ "$WEB_ONLY" = 0 ] && [ "$PRIVATE_ONLY" = 0 ]; then
-step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, proof gate, coverage ratchet, review status, decisions, prompt check, deploy"
+step "loop self-tests: config, backlog status, ticket PRs, release notes, kit sync, proof gate, coverage ratchet, review status, decisions, prompt check, sprint, deploy"
 scripts/loop-config.sh --self-test
 scripts/backlog-status.sh --self-test
 scripts/open-ticket-pr.sh --self-test
@@ -131,6 +131,7 @@ scripts/coverage-ratchet.sh --self-test
 scripts/review-status.sh --self-test
 scripts/decisions.sh --self-test
 scripts/prompt-check.sh --self-test
+scripts/sprint.sh --self-test
 scripts/deploy-local.sh --self-test
 
 # The loop scripts and prompts are copies from the kit's tagged release (HK-16, HK-19);

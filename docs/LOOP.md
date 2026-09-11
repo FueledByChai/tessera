@@ -32,7 +32,15 @@ How development and research run without a person in the middle of every step. T
   order and says so when it falls back; `--sprint` lists them with their states and a
   summary line; the table shows each ticket's sprint position. Choosing a sprint is a
   commit that edits the list, so it is dated and diffable like everything else, and tickets
-  carry no sprint state. grill-me asks which new tickets go into the sprint.
+  carry no sprint state. grill-me asks which new tickets go into the sprint, and
+  `scripts/sprint.sh add|remove|set|clear` edits the list (HK-40).
+- `scripts/backlog-status.sh --open`, `--show <id>`, and `--stories` (HK-40): the sprint-day
+  views. `--open` lists the tickets not done and not in the sprint, grouped by section, with
+  blockers and the story each serves (`--section` narrows it); `--show` prints a ticket with
+  its state and story, or a story with its tickets; `--stories` lists every story in
+  `docs/PRODUCT_BACKLOG.md` (`stories` in `.loop.toml`) with a status derived from git: done
+  when every ticket that says `Serves BT-nnn` has landed, open k/n, or unticketed. The
+  hand-written `Status:` lines in the product backlog are no longer the record.
 - `scripts/release-notes.sh <from> [<to>]`: what shipped between two refs as Markdown, the
   commits with a ticket id grouped under their backlog section. Tag releases; then
   `scripts/release-notes.sh --archive <tag> <previous-tag> <tag>` moves the shipped tickets, text

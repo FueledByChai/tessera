@@ -11,6 +11,16 @@
 #                                             order, then file order (exit 1 when there is none)
 #   scripts/backlog-status.sh --sprint        the sprint's tickets in sprint order with their
 #                                             states, and a summary line (HK-39)
+#   scripts/backlog-status.sh --open [--section <name>]
+#                                             the tickets not done and not in the sprint, grouped
+#                                             by section, with the story each serves: the pick
+#                                             list for the next sprint (HK-40)
+#   scripts/backlog-status.sh --show <id>     a ticket's text, state, and the story it serves, or
+#                                             a story's text, derived status, and its tickets
+#   scripts/backlog-status.sh --stories       every story in the product backlog (`stories` in
+#                                             .loop.toml) with a status derived from git: done
+#                                             when every ticket that serves it landed, open k/n,
+#                                             or unticketed
 #   scripts/backlog-status.sh --ref <ref>     commits reachable from <ref> (default: the
 #                                             default branch as origin has it, after a fetch,
 #                                             so a checkout that has not pulled yet never
@@ -34,10 +44,18 @@ REF_GIVEN=0
 BACKLOG="$ROOT/$("$ROOT/scripts/loop-config.sh" backlog)"
 MODE=table
 LOCAL=0
+WANT=""
+SECTION=""
+STORIES_FILE="$("$ROOT/scripts/loop-config.sh" stories)"
 while [ $# -gt 0 ]; do
   case "$1" in
     --next) MODE=next ;;
     --sprint) MODE=sprint ;;
+    --open) MODE=open ;;
+    --section) SECTION="$2"; shift ;;
+    --show) MODE=show; WANT="$2"; shift ;;
+    --stories) MODE=stories ;;
+    --stories-file) STORIES_FILE="$2"; shift ;;
     --local) LOCAL=1 ;;
     --self-test) MODE=selftest ;;
     --ref) REF="$2"; REF_GIVEN=1; shift ;;
@@ -65,15 +83,20 @@ judged_ref() {
 status() {
   local backlog="$1" ref mode="$3"
   ref="$(judged_ref "$2")"
-  local claimed="" sprint
+  local claimed="" sprint stories=""
   sprint="$("$ROOT/scripts/loop-config.sh" sprint | tr '\n' ',')"
+  # The product backlog sits beside the ticket file's root; a relative path is resolved from
+  # the ticket file's repository root, an absolute one (--stories-file) as given.
+  if [ -n "$STORIES_FILE" ]; then
+    case "$STORIES_FILE" in /*) stories="$STORIES_FILE" ;; *) stories="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/$STORIES_FILE" ;; esac
+  fi
   if [ "$LOCAL" = 0 ]; then
     # No origin, or one that does not answer, means no claims (and no failure).
     claimed="$( (git ls-remote --heads origin 'refs/heads/ticket/*' 2>/dev/null || true) | sed 's#.*refs/heads/ticket/##' | tr '\n' ',')"
   fi
   git log --reverse --date=short --format='%h %ad %s' "$ref" -- 2>/dev/null \
     | perl -e '
-      my ($backlog, $mode, $claimed, $sprint) = @ARGV;
+      my ($backlog, $mode, $claimed, $sprint, $stories_file, $want, $section_filter) = @ARGV;
       my %claimed = map { $_ => 1 } grep { length } split /,/, $claimed;
       my @sprint = grep { length } split /,/, $sprint;
       my %sprint; my $pos = 0; $sprint{$_} //= ++$pos for @sprint;
@@ -84,27 +107,66 @@ status() {
         next unless defined $subject && $subject =~ /^([A-Z]+-\d+):/;
         $done{$1} //= [$date, $sha];
       }
+      # The ticket file: `## <section>` headings, `### <ID> <title>` tickets with their claim and
+      # blockers, and the body of each ticket (for --show and the story it serves).
       open my $fh, "<", $backlog or die "cannot read $backlog: $!";
-      my @tickets;
+      my (@tickets, $section, $cur);
+      $section = "";
       while (my $line = <$fh>) {
         chomp $line;
-        next unless $line =~ /^### (\S+) (.*)$/;
-        my ($id, $rest) = ($1, $2);
-        my @parts = split / — /, $rest;
-        my $title = shift @parts;
-        my ($claim, @blockers) = ("", ());
-        for my $part (@parts) {
-          if ($part =~ /^`(.*)`$/) { $claim = $1; }
-          elsif ($part =~ /^Blocked by (.*)$/) { push @blockers, split /,\s*/, $1; }
+        if ($line =~ /^## (.*)$/) { $section = $1; $cur = undef; next; }
+        if ($line =~ /^### (\S+) (.*)$/) {
+          my ($id, $rest) = ($1, $2);
+          my @parts = split / — /, $rest;
+          my $title = shift @parts;
+          my ($claim, @blockers) = ("", ());
+          for my $part (@parts) {
+            if ($part =~ /^`(.*)`$/) { $claim = $1; }
+            elsif ($part =~ /^Blocked by (.*)$/) { push @blockers, split /,\s*/, $1; }
+          }
+          my $state = $done{$id} ? "done"
+                    : $claim =~ /^blocked/ ? "blocked"
+                    : $claim eq "doing" ? "doing"
+                    : $claimed{$id} ? "claimed"
+                    : "todo";
+          $cur = { id => $id, title => $title, state => $state, claim => $claim, blockers => \@blockers,
+                   section => $section, heading => $line, body => [], serves => [] };
+          push @tickets, $cur;
+          next;
         }
-        my $state = $done{$id} ? "done"
-                  : $claim =~ /^blocked/ ? "blocked"
-                  : $claim eq "doing" ? "doing"
-                  : $claimed{$id} ? "claimed"
-                  : "todo";
-        push @tickets, { id => $id, title => $title, state => $state, claim => $claim, blockers => \@blockers };
+        push @{ $cur->{body} }, $line if $cur;
       }
       close $fh;
+      for my $t (@tickets) {
+        my $text = join " ", @{ $t->{body} };
+        while ($text =~ /\bserves\s+([A-Z]+-\d+(?:\s*,\s*[A-Z]+-\d+)*)/gi) { push @{ $t->{serves} }, split /\s*,\s*/, $1; }
+      }
+      # The product backlog, when the project keeps one: `## <epic>` and `### <ID> — <title>`
+      # stories with their body; the status of a story is derived from the tickets that serve it.
+      my (@stories, %story);
+      if ($stories_file ne "" && open my $sf, "<", $stories_file) {
+        my ($epic, $s) = ("", undef);
+        while (my $line = <$sf>) {
+          chomp $line;
+          if ($line =~ /^## (.*)$/) { $epic = $1; $s = undef; next; }
+          if ($line =~ /^### ([A-Z]+-\d+) — (.*)$/) {
+            $s = { id => $1, title => $2, epic => $epic, written => "", heading => $line, body => [], tickets => [] };
+            push @stories, $s; $story{$1} = $s; next;
+          }
+          next unless $s;
+          $s->{written} = $1 if $line =~ /^\*\*Status:\*\*\s*(.*?)\s*$/;
+          push @{ $s->{body} }, $line;
+        }
+        close $sf;
+        for my $t (@tickets) { for my $id (@{ $t->{serves} }) { push @{ $story{$id}{tickets} }, $t if $story{$id}; } }
+      }
+      my $story_status = sub {
+        my $s = shift;
+        my @t = @{ $s->{tickets} };
+        return "unticketed" unless @t;
+        my $d = grep { $_->{state} eq "done" } @t;
+        return $d == @t ? "done" : "open $d/" . scalar(@t);
+      };
       # A blocker is done when its ticket is, or when it has landed and left the file (archived
       # into CHANGELOG.md by scripts/release-notes.sh).
       my %state = map { $_->{id} => $_->{state} } @tickets;
@@ -117,12 +179,64 @@ status() {
       };
       my %by_id = map { $_->{id} => $_ } @tickets;
       for my $id (@sprint) { print STDERR "sprint: $id is not in the backlog file\n" unless $by_id{$id}; }
+      my $blockers_of = sub { my $t = shift; join ",", map { $_ . ($landed->($_) ? "" : "!") } @{ $t->{blockers} }; };
+      my $state_of = sub {
+        my $t = shift; my $state = $t->{state};
+        $state .= " (was $t->{claim})" if $state eq "done" && $t->{claim} ne "" && $t->{claim} ne "todo";
+        $state = $t->{claim} if $state eq "blocked";
+        return $state;
+      };
       if ($mode eq "next") {
         for my $id (@sprint) { my $t = $by_id{$id} or next; if ($ready->($t)) { print "$t->{id}\n"; exit 0; } }
         print STDERR "sprint: nothing ready in it; falling back to file order\n" if @sprint;
         for my $t (@tickets) { if ($ready->($t)) { print "$t->{id}\n"; exit 0; } }
         print STDERR "no todo ticket has all its blockers done\n";
         exit 1;
+      }
+      if ($mode eq "show") {
+        if (my $t = $by_id{$want}) {
+          print "$t->{heading}\n", map { "$_\n" } @{ $t->{body} };
+          printf "state: %s%s%s\n", $state_of->($t), ($ready->($t) ? ", ready" : ""), ($sprint{$want} ? ", sprint position $sprint{$want}" : "");
+          for my $id (@{ $t->{serves} }) {
+            my $s = $story{$id};
+            my $st = $s ? $story_status->($s) : "";
+            printf "serves: %s%s\n", $id, $s ? " — $s->{title} ($st)" : " (not in the product backlog)";
+          }
+          exit 0;
+        }
+        if (my $s = $story{$want}) {
+          print "$s->{heading}\n", map { "$_\n" } @{ $s->{body} };
+          printf "status: %s (the file says: %s)\n", $story_status->($s), ($s->{written} || "nothing");
+          printf "ticket: %-6s %-8s %s\n", $_->{id}, $state_of->($_), $_->{title} for @{ $s->{tickets} };
+          exit 0;
+        }
+        print STDERR "$want: no such ticket or story\n";
+        exit 1;
+      }
+      if ($mode eq "stories") {
+        if (!@stories) { print STDERR "no product backlog" . ($stories_file ne "" ? " at $stories_file" : " configured (stories in .loop.toml)") . "\n"; exit 1; }
+        printf "%-8s %-11s %-8s %-30s %s\n", "id", "status", "tickets", "epic", "title";
+        for my $s (@stories) {
+          my $epic = $s->{epic}; $epic = substr($epic, 0, 29) . "…" if length $epic > 30;
+          my @ids = map { $_->{id} } @{ $s->{tickets} };
+          printf "%-8s %-11s %-8s %-30s %s\n", $s->{id}, $story_status->($s), (@ids ? scalar(@ids) : "-"), $epic, $s->{title};
+        }
+        my %n; $n{ ($story_status->($_) =~ /^(\w+)/)[0] }++ for @stories;
+        printf "stories: %d, %d done, %d open, %d unticketed\n", scalar(@stories), $n{done} // 0, $n{open} // 0, $n{unticketed} // 0;
+        exit 0;
+      }
+      if ($mode eq "open") {
+        my $last = "\0"; my $n = 0;
+        for my $t (@tickets) {
+          next if $t->{state} eq "done" || $sprint{ $t->{id} };
+          next if $section_filter ne "" && index(lc $t->{section}, lc $section_filter) < 0;
+          if ($t->{section} ne $last) { print "## $t->{section}\n"; $last = $t->{section}; }
+          my $serves = join ",", @{ $t->{serves} };
+          printf "%-6s %-8s %-6s %-14s %-10s %s\n", $t->{id}, $state_of->($t), ($ready->($t) ? "ready" : ""), $blockers_of->($t), $serves, $t->{title};
+          $n++;
+        }
+        print "open: $n ticket(s) not done and not in the sprint", (@sprint ? " (sprint: " . join(", ", @sprint) . ")" : " (no sprint set)"), "\n";
+        exit 0;
       }
       my @rows = @tickets;
       if ($mode eq "sprint") {
@@ -132,11 +246,7 @@ status() {
       printf "%-6s %-8s %-10s %-8s %-6s %-6s %-22s %s\n", "id", "state", "date", "sha", "ready", "sprint", "blocked by", "title";
       for my $t (@rows) {
         my ($date, $sha) = $done{ $t->{id} } ? @{ $done{ $t->{id} } } : ("-", "-");
-        my $blockers = join ",", map { $_ . ($landed->($_) ? "" : "!") } @{ $t->{blockers} };
-        my $state = $t->{state};
-        $state .= " (was $t->{claim})" if $state eq "done" && $t->{claim} ne "" && $t->{claim} ne "todo";
-        $state = $t->{claim} if $state eq "blocked";
-        printf "%-6s %-8s %-10s %-8s %-6s %-6s %-22s %s\n", $t->{id}, $state, $date, $sha, ($ready->($t) ? "yes" : ""), ($sprint{ $t->{id} } // ""), $blockers, $t->{title};
+        printf "%-6s %-8s %-10s %-8s %-6s %-6s %-22s %s\n", $t->{id}, $state_of->($t), $date, $sha, ($ready->($t) ? "yes" : ""), ($sprint{ $t->{id} } // ""), $blockers_of->($t), $t->{title};
       }
       if ($mode eq "sprint") {
         my %n; $n{ $_->{state} }++ for @rows;
@@ -145,7 +255,7 @@ status() {
           scalar(@rows), $n{done} // 0, $ready_n, ($n{claimed} // 0) + ($n{doing} // 0),
           scalar(@rows) - ($n{done} // 0) - $ready_n - ($n{claimed} // 0) - ($n{doing} // 0);
       }
-    ' "$backlog" "$mode" "$claimed" "$sprint"
+    ' "$backlog" "$mode" "$claimed" "$sprint" "$stories" "$WANT" "$SECTION"
 }
 
 self_test() {
@@ -209,6 +319,58 @@ EOF
     echo "$out" | grep -q '^sprint: 3 ticket(s), 0 done, 2 ready, 0 claimed or doing, 1 blocked or waiting$' || { echo "self-test: the sprint summary is off:"; echo "$out"; exit 1; }
     out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --sprint 2>&1)"
     echo "$out" | grep -q '^sprint: empty' || { echo "self-test: no sprint configured should say so:"; echo "$out"; exit 1; }
+    # Stories (HK-40): a product backlog whose stories the tickets serve. AA-01 and AA-02 serve
+    # BT-1, AA-05 serves BT-2, nothing serves BT-3. Nothing has landed yet.
+    cat > PRODUCT.md <<'EOF2'
+# Product backlog
+
+## Epic A: Alpha things
+
+### BT-1 — Two tickets serve this
+
+**Status:** Proposed
+**User story:** As a tester, I want two tickets, so that the status is derived.
+
+**Acceptance criteria:**
+
+- Both land.
+
+### BT-2 — One blocked ticket serves this
+
+**Status:** Proposed
+
+## Epic B: Beta things
+
+### BT-3 — Nothing serves this yet
+
+**Status:** Proposed
+EOF2
+    printf '# Fixture queue\n\n## Alpha\n\n### AA-01 First — `doing`\nBody. Serves BT-1.\n**Done when:** it lands.\n\n### AA-02 Second — `todo` — Blocked by AA-01\nSecond body, which serves\nBT-1 across a line break.\n### AA-03 Third — `blocked waiting on data`\n\n## Beta\n\n### AA-04 Fourth\n### AA-05 Fifth — `todo` — Blocked by AA-03, AA-04\nServes BT-2.\n### AA-06 Sixth — `todo` — Blocked by ZZ-09\n' > BACKLOG.md
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --stories-file "$PWD/PRODUCT.md" --stories 2>&1)"
+    echo "$out" | grep -q '^BT-1 *open 0/2 *2 ' || { echo "self-test: BT-1 should be open 0/2:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q '^BT-3 *unticketed *- ' || { echo "self-test: BT-3 should be unticketed:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q '^stories: 3, 0 done, 2 open, 1 unticketed$' || { echo "self-test: the stories summary is off:"; echo "$out"; exit 1; }
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --stories-file "$PWD/PRODUCT.md" --show AA-02 2>&1)"
+    echo "$out" | grep -q '^### AA-02 Second' && echo "$out" | grep -q '^Second body' && echo "$out" | grep -q '^state: todo$' && echo "$out" | grep -q '^serves: BT-1 — Two tickets serve this (open 0/2)$' \
+      || { echo "self-test: --show AA-02 should print its text, state, and story:"; echo "$out"; exit 1; }
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --stories-file "$PWD/PRODUCT.md" --show BT-1 2>&1)"
+    echo "$out" | grep -q '^### BT-1 — Two tickets' && echo "$out" | grep -q '^status: open 0/2 (the file says: Proposed)$' && echo "$out" | grep -q '^ticket: AA-02  todo ' \
+      || { echo "self-test: --show BT-1 should print its text, derived status, and tickets:"; echo "$out"; exit 1; }
+    if "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --show AA-99 >/dev/null 2>&1; then echo "self-test: --show of an unknown id must fail"; exit 1; fi
+    printf '[loop]\nsprint = ["AA-04"]\n' > sprint.toml
+    out="$(LOOP_CONFIG="$PWD/sprint.toml" "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --stories-file "$PWD/PRODUCT.md" --open 2>&1)"
+    echo "$out" | grep -q '^## Alpha$' && echo "$out" | grep -q '^## Beta$' || { echo "self-test: --open should group by section:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q '^AA-04 ' && { echo "self-test: --open must leave out the sprint's tickets:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q '^AA-05  todo .*AA-03!,AA-04! *BT-2 ' || { echo "self-test: --open should show AA-05 with its blockers and story:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q '^open: 5 ticket(s) not done and not in the sprint (sprint: AA-04)$' || { echo "self-test: the open summary is off:"; echo "$out"; exit 1; }
+    out="$(LOOP_CONFIG="$PWD/sprint.toml" "$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --open --section beta 2>&1)"
+    [ "$(echo "$out" | grep -c '^AA-')" = 2 ] || { echo "self-test: --section beta should list two tickets:"; echo "$out"; exit 1; }
+    # AA-01 and AA-02 land: BT-1 is done, and --open no longer lists them.
+    git commit -q --allow-empty -m "AA-01: first" && git commit -q --allow-empty -m "AA-02: second"
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --stories-file "$PWD/PRODUCT.md" --stories 2>&1)"
+    echo "$out" | grep -q '^BT-1 *done ' || { echo "self-test: BT-1 should be done once both tickets landed:"; echo "$out"; exit 1; }
+    git reset -q --hard HEAD~2
+    git checkout -q -- BACKLOG.md; rm -f PRODUCT.md sprint.toml
     # AA-01 lands while its line still says doing: git wins, with the commit's date and sha.
     git commit -q --allow-empty -m "AA-01: first landed"
     sha="$(git rev-parse --short HEAD)"
