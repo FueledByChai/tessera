@@ -1111,30 +1111,18 @@ fn seed_cost_profiles(connection: &Connection) -> Result<()> {
 /// realized-vol study is a click per feature. Each is inserted only when no preset of that
 /// name exists, so an edit or a deletion by the owner survives every later start.
 pub const SEEDED_FEATURE_PRESETS: [(&str, &str, &str); 5] = [
-    (
-        "rv 5s",
-        "mid | rv 5s",
-        "realized vol over the last 5 seconds, bps",
-    ),
-    (
-        "rv 30s",
-        "mid | rv 30s",
-        "realized vol over the last 30 seconds, bps",
-    ),
-    (
-        "rv 60s",
-        "mid | rv 60s",
-        "realized vol over the last 60 seconds, bps",
-    ),
+    ("rv 5s", "mid | rv 5s", "realized vol, last 5 s (bps)"),
+    ("rv 30s", "mid | rv 30s", "realized vol, last 30 s (bps)"),
+    ("rv 60s", "mid | rv 60s", "realized vol, last 60 s (bps)"),
     (
         "vol ratio 5s/60s",
         "mid | rv 5s | ratio_to rv 60s",
-        "short vol over long: above 1 when the last 5 seconds ran hotter than the minute",
+        "5 s vol over 60 s vol",
     ),
     (
         "vol of vol 60s",
         "mid | rv 5s | std 60s",
-        "how unsteady the 5-second vol was over the last minute, bps",
+        "std of the 5 s vol over 60 s (bps)",
     ),
 ];
 
