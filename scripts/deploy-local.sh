@@ -8,14 +8,17 @@
 # data/ui/deploy.log.
 #
 #   scripts/deploy-local.sh                 deploy if origin/main moved (exit 0; 3 when refused;
-#                                           4 when the private checks failed and the service
-#                                           keeps its previous build)
+#                                           4 when the private checks failed or the restart
+#                                           did not take, and the service keeps its previous
+#                                           build)
 #   scripts/deploy-local.sh --dry-run       say what a run would do, change nothing
 #   scripts/deploy-local.sh --launchd       print a LaunchAgent plist that runs it every 5 min
 #   scripts/deploy-local.sh --self-test     a fixture origin and a stubbed service prove the
 #                                           decisions: nothing new, engine change, web change,
-#                                           docs change, a running job, and the private checks
-#                                           failing (no restart) and passing (restart)
+#                                           docs change, a running job, the private checks
+#                                           failing (no restart) and passing (restart), and a
+#                                           restart that does not take because the old
+#                                           service still holds the port
 #
 # Decisions, in order: not on a clean main → refuse. origin/main not ahead → nothing new, exit
 # at once (saying so if the last engine build failed its private checks and the service is
@@ -23,8 +26,14 @@
 # stays what the service runs. Otherwise pull, build what changed; for an engine change run
 # `scripts/check.sh --private-only` (output in data/ui/private-check.log) and, only when it
 # passes, restart (the pid in data/ui/api.pid, checked against the port's listener), wait for
-# /api/health, print the pid. A failed private check leaves the service on its previous build
-# and marks data/ui/private-check.failed with the sha until a later build passes.
+# /api/health, and print the pid only once the port's listener is that pid (HK-30: a health
+# answer alone can come from the old service, as it did when the new one died with "Address
+# already in use"). A failed private check or a restart that did not take leaves the service
+# on its previous build and marks data/ui/private-check.failed or data/ui/restart.failed with
+# the sha until a later build passes; every idle run repeats that the service is behind.
+#
+# lsof is called by its absolute path, /usr/sbin/lsof: under launchd the PATH is whatever the
+# plist sets, and /usr/sbin was not on it, which is how the listener went unseen (HK-30).
 set -euo pipefail
 # TESSERA_DEPLOY_ROOT deploys another checkout (the self-test's fixture); default: this one.
 ROOT="${TESSERA_DEPLOY_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -44,6 +53,8 @@ done
 ADDR="${TESSERA_ADDR:-127.0.0.1:8787}"
 PORT="${ADDR##*:}"
 STUB="${TESSERA_DEPLOY_STUB:-}"
+LSOF="${TESSERA_LSOF:-/usr/sbin/lsof}"
+[ -x "$LSOF" ] || LSOF="$(command -v lsof || echo /usr/sbin/lsof)"
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$ROOT/data/ui/deploy.log" >&2; }
 
@@ -60,7 +71,7 @@ running_work() {  # prints "N job(s), M study(ies)" when something runs, nothing
 
 listener_pid() {
   if [ -n "$STUB" ]; then cat "$STUB/pid" 2>/dev/null || true; return 0; fi
-  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
+  "$LSOF" -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
 }
 
 build_engine() {
@@ -85,30 +96,50 @@ private_checks() {
   (cd "$ROOT" && scripts/check.sh --private-only > data/ui/private-check.log 2>&1)
 }
 
-restart_service() {  # prints the new pid
+# Starts a new service and prints its pid. In stub mode the new pid is the old one plus one;
+# with $STUB/sticky set the stub's listener stays the old pid, which is the case where the
+# old service was never stopped and the new one could not bind.
+start_service() {
+  local old="$1" new
   if [ -n "$STUB" ]; then
-    local old; old="$(listener_pid)"
-    echo "$((${old:-1000} + 1))" > "$STUB/pid"
-    echo "restarted from ${old:-none}" >> "$STUB/restarted"
-    cat "$STUB/pid"
+    new="$((${old:-1000} + 1))"
+    echo "$new" >> "$STUB/started"
+    [ "$(cat "$STUB/sticky" 2>/dev/null || echo 0)" = 1 ] || echo "$new" > "$STUB/pid"
+    echo "$new"
     return 0
-  fi
-  local pid recorded
-  pid="$(listener_pid)"
-  recorded="$(cat "$ROOT/data/ui/api.pid" 2>/dev/null || true)"
-  if [ -n "$recorded" ] && [ "$recorded" != "$pid" ]; then
-    log "note: data/ui/api.pid says $recorded but the listener on $PORT is ${pid:-nobody}; using the listener"
-  fi
-  if [ -n "$pid" ]; then
-    kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 30); do [ -z "$(listener_pid)" ] && break; sleep 1; done
-    [ -z "$(listener_pid)" ] || { log "the old service ($pid) did not stop"; return 1; }
   fi
   (cd "$ROOT" && TESSERA_ROOT="$ROOT" nohup ./target/release/tessera-ui > data/ui/api.log 2>&1 &
    echo $! > data/ui/api.pid)
   for _ in $(seq 1 60); do curl -sf "http://$ADDR/api/health" >/dev/null 2>&1 && break; sleep 1; done
-  curl -sf "http://$ADDR/api/health" >/dev/null 2>&1 || { log "the new service did not answer on $ADDR; see data/ui/api.log"; return 1; }
   cat "$ROOT/data/ui/api.pid"
+}
+
+restart_service() {  # prints the new pid once the port's listener is that pid
+  local old new now recorded
+  old="$(listener_pid)"
+  if [ -z "$STUB" ]; then
+    recorded="$(cat "$ROOT/data/ui/api.pid" 2>/dev/null || true)"
+    if [ -n "$recorded" ] && [ "$recorded" != "$old" ]; then
+      log "note: data/ui/api.pid says $recorded but the listener on $PORT is ${old:-nobody}; using the listener"
+    fi
+    if [ -n "$old" ]; then
+      kill "$old" 2>/dev/null || true
+      for _ in $(seq 1 30); do [ -z "$(listener_pid)" ] && break; sleep 1; done
+      [ -z "$(listener_pid)" ] || { log "restart failed: the old service ($old) did not stop"; return 1; }
+    fi
+  fi
+  new="$(start_service "$old")"
+  now="$(listener_pid)"
+  if [ "$now" != "$new" ]; then
+    if [ -n "$now" ] && [ "$now" = "$old" ]; then
+      log "restart failed: the old service ($old) still holds the port; the new one ($new) could not bind (data/ui/api.log)"
+    else
+      log "restart failed: the listener on $PORT is ${now:-nobody}, not the new service ($new); see data/ui/api.log"
+    fi
+    return 1
+  fi
+  [ -n "$STUB" ] && echo "restarted from ${old:-none}" >> "$STUB/restarted"
+  echo "$new"
 }
 
 # Which kinds of files a commit range touched: engine, web, other.
@@ -137,6 +168,8 @@ deploy() {  # $1: dry (1) or real (0)
   if [ "$old" = "$new" ]; then
     if [ "$(cat data/ui/private-check.failed 2>/dev/null || true)" = "$old" ]; then
       log "nothing new: main is at $(git rev-parse --short "$old"); private checks failed on it, the service is still on the build before (data/ui/private-check.log)"
+    elif [ "$(cat data/ui/restart.failed 2>/dev/null || true)" = "$old" ]; then
+      log "nothing new: main is at $(git rev-parse --short "$old"); the restart on it did not take, the service is still on the build before (data/ui/deploy.log, data/ui/api.log)"
     else
       log "nothing new: main is at $(git rev-parse --short "$old")"
     fi
@@ -163,8 +196,14 @@ deploy() {  # $1: dry (1) or real (0)
     fi
     rm -f data/ui/private-check.failed
     log "private checks passed"
-    local pid; pid="$(restart_service)"
-    log "restarted the service: pid $pid"
+    local pid
+    if ! pid="$(restart_service)"; then
+      git rev-parse HEAD > data/ui/restart.failed
+      log "the service keeps its previous build; restart by hand (AGENTS.md, build and run) and check data/ui/api.log"
+      return 4
+    fi
+    rm -f data/ui/restart.failed
+    log "restarted the service: pid $pid (the listener on $PORT)"
     echo "$pid"
   else
     log "no restart needed"
@@ -186,7 +225,7 @@ launchd_plist() {
   <key>StandardOutPath</key><string>$ROOT/data/ui/deploy-launchd.log</string>
   <key>StandardErrorPath</key><string>$ROOT/data/ui/deploy-launchd.log</string>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.cargo/bin</string></dict>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin</string></dict>
 </dict>
 </plist>
 EOF
@@ -277,6 +316,28 @@ self_test() {
     rc=0; pid="$(run)" || rc=$?
     [ "$rc" = 0 ] && [ "$pid" = 4245 ] && grep -q 'private checks passed' "$dir/last.err" && grep -q 'restarted from 4244' stub/restarted || { echo "self-test: passing private checks: rc $rc pid '$pid'"; cat "$dir/last.err"; ls stub; exit 1; }
     [ ! -e deploy/data/ui/private-check.failed ] || { echo "self-test: the failure marker should be cleared after a passing build"; exit 1; }
+    # 10. The restart does not take: the stub keeps the old listener bound (sticky), so the
+    #     run fails loudly (exit 4, the marker, the log line) and the service stays on the
+    #     previous build; the next idle run says so; with the port free again the next engine
+    #     change restarts and clears the marker.
+    echo 1 > stub/sticky
+    rm -f stub/built stub/restarted stub/started
+    (cd upstream && echo "fn main() { println!(\"sticky\"); }" > src/main.rs && git commit -q -am "WB-95: sticky" && git push -q origin main)
+    rc=0; run || rc=$?
+    [ "$rc" = 4 ] && grep -q 'restart failed: the old service (4245) still holds the port; the new one (4246) could not bind' "$dir/last.err" || { echo "self-test: sticky restart: rc $rc"; cat "$dir/last.err"; exit 1; }
+    [ "$(cat stub/pid)" = 4245 ] && [ ! -e stub/restarted ] && grep -q '^4246$' stub/started || { echo "self-test: sticky restart must leave the old pid bound and record no restart"; ls stub; cat stub/pid; exit 1; }
+    [ "$(cat deploy/data/ui/restart.failed)" = "$(git -C deploy rev-parse HEAD)" ] || { echo "self-test: the restart marker should carry the sha"; exit 1; }
+    grep -q 'the service keeps its previous build; restart by hand' "$dir/last.err" || { echo "self-test: the failed restart should say what to do:"; cat "$dir/last.err"; exit 1; }
+    rc=0; run || rc=$?
+    [ "$rc" = 0 ] && grep -q 'nothing new: .*the restart on it did not take, the service is still on the build before' "$dir/last.err" || { echo "self-test: the idle run after a failed restart should say the service is behind: rc $rc"; cat "$dir/last.err"; exit 1; }
+    rm -f stub/sticky stub/built stub/restarted stub/started
+    (cd upstream && echo "fn main() { println!(\"unstuck\"); }" > src/main.rs && git commit -q -am "WB-94: unstuck" && git push -q origin main)
+    rc=0; pid="$(run)" || rc=$?
+    [ "$rc" = 0 ] && [ "$pid" = 4246 ] && grep -q 'restarted from 4245' stub/restarted && [ ! -e deploy/data/ui/restart.failed ] || { echo "self-test: restart after the port freed: rc $rc pid '$pid'"; cat "$dir/last.err"; ls stub; exit 1; }
+    grep -q 'restarted the service: pid 4246 (the listener on' "$dir/last.err" || { echo "self-test: a real restart names the listener:"; cat "$dir/last.err"; exit 1; }
+    # 11. The script calls lsof by its absolute path, and the LaunchAgent PATH has /usr/sbin.
+    if grep -nE '(^|[ (;|])lsof -' "$script" | grep -q .; then echo "self-test: a bare lsof call remains:"; grep -nE '(^|[ (;|])lsof -' "$script"; exit 1; fi
+    bash "$script" --launchd 2>/dev/null | grep -q '/usr/sbin' || { echo "self-test: the LaunchAgent PATH should include /usr/sbin"; exit 1; }
     # 7. Not on main, or dirty: refuse.
     (cd deploy && git checkout -q -b elsewhere) ; rc=0; run || rc=$?
     [ "$rc" = 3 ] && grep -q 'not main' "$dir/last.err" || { echo "self-test: off-main run: rc $rc"; cat "$dir/last.err"; exit 1; }

@@ -58,7 +58,12 @@ How development and research run without a person in the middle of every step. T
   an engine change whose private checks passed and only when no job or study is running; a
   busy console makes it refuse and wait for the next run, and a failed private check leaves
   the console on its previous build, logs the failure, and repeats it on every idle run until
-  a later build passes (HK-18). Each run is one line in `data/ui/deploy.log`. So a merged
+  a later build passes (HK-18). A restart counts only once the port's listener is the pid it
+  started: a health answer alone can come from the old service, which is how two restarts
+  went unreported on 2026-09-10 while the console stayed on a stale engine (`lsof` was not on
+  the LaunchAgent's PATH and is now called by absolute path; a restart that does not take
+  exits 4, marks `data/ui/restart.failed`, and repeats on every idle run; HK-30). Each run
+  is one line in `data/ui/deploy.log`. So a merged
   pull request reaches the console on the Mac mini without anyone touching it, and a merge
   that breaks the private crate or a private strategy test is caught here, the one place
   that has the private checkout, before the console runs it.
