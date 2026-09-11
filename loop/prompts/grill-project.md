@@ -44,6 +44,11 @@ The five areas, in order:
 4. **The UI.** None, a terminal, or a browser; who has to be able to read it; the look the
    owner wants and any conventions (density, colour, what must fit on one screen). This
    becomes the UI conventions in the Project rules and the first fixture the checks render.
+   When the answer is a browser or a laid-out terminal screen, the round closes by sketching
+   the first screen as a text wireframe (a fenced block at most 80 columns wide naming the
+   panels, tables, and controls and their order) and getting it corrected; the sketch goes
+   into the round's decision record under Decision, and the UI conventions in the Project
+   rules point at that record.
 5. **Non-negotiables.** What must never be touched, committed, sent, or deleted; what must be
    private; what must be exact; what would make the owner stop trusting the tool. These
    become the rules the prompts refuse to cross and the review paths the loop labels for a

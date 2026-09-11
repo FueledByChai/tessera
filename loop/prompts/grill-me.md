@@ -38,7 +38,9 @@ settle:
 - **Inputs and data.** What it reads; what happens when that is missing, partial, or wrong.
   Whether anything private is involved that the Project rules keep out of this repository.
 - **Where it shows up.** Which surface: a page and panel, an endpoint, command output, or a
-  file. For a page: which of the UI conventions in the Project rules apply.
+  file. For a page: which of the UI conventions in the Project rules apply, and what the
+  panel holds in what order. Sketch that as a text wireframe in the next round's restatement,
+  so the owner corrects a picture rather than a paragraph.
 - **Decisions.** A story that implies a decision no record covers (a store, a protocol, a
   library, a boundary, a rule) does not get to guess: stop, ask the owner the decision as its
   own question with the alternatives named, and write the record in this session
@@ -98,6 +100,16 @@ A ticket is one commit's worth of work for one agent, testable on its own with t
 Split anything larger. Put `Blocked by` only where the work cannot start earlier. Do not add
 `todo` or any other state; the heading carries no state until someone claims it.
 
+**Wireframes.** A story that touches a screen carries, after its acceptance criteria, a
+fenced text wireframe at most 80 columns wide that names the panels, tables, and controls and
+their order, top to bottom and left to right, with what the story adds or changes marked.
+The owner confirms it with the draft. The ticket points at it by story id (`Wireframe:
+BT-nnn`) rather than describing the layout again, and its done line's fixture or check
+matches the wireframe. When the owner asks for a mockup, or the screen is new rather than
+changed, make one with the harness's design canvas when it has one and otherwise as a
+single HTML file, save it beside the product backlog (`docs/wireframes/<story id>.html`),
+and link it from the story and the ticket.
+
 Ask the owner to confirm the draft, and apply their edits, before going on.
 
 ## 4. Write and hand off
@@ -118,6 +130,6 @@ Never write to the default branch. From the main checkout:
    superseded, what the first next-ticket run will pick up, and any question the owner
    deferred (record those as a `blocked <question>` claim on the ticket that needs the answer).
 
-Rules: this prompt changes only the product backlog, the ticket file, and the decision
-records. It never edits code or anything the Project rules say never to touch, and never
+Rules: this prompt changes only the product backlog, the ticket file, the decision
+records, and the wireframe files. It never edits code or anything the Project rules say never to touch, and never
 copies private details into a public backlog.
