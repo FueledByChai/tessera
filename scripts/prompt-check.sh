@@ -37,7 +37,8 @@ grill-project.md	python.sh
 grill-project.md	node.sh
 grill-project.md	java.sh
 grill-project.md	go.sh
-grill-project.md	wireframe'
+grill-project.md	wireframe
+grill-project.md	toolchain'
 
 prompts_dir() {
   if [ -d "$ROOT/loop/prompts" ]; then echo "$ROOT/loop/prompts"

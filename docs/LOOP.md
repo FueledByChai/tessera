@@ -51,7 +51,8 @@ How development and research run without a person in the middle of every step. T
 - The loop kit, [FueledByChai/coding-agent-loop](https://github.com/FueledByChai/coding-agent-loop):
   the source of truth for the loop scripts, the prompts, and the templates any project needs
   to adopt the loop (`AGENTS.md` with an empty Project rules, `loop.toml.example`, a workflow
-  skeleton, the branch ruleset, the wrappers, the check skeletons, an `install.sh` that also writes
+  skeleton, the branch ruleset, the wrappers, the check skeletons and the CI toolchain steps
+  per stack that grill-project splices into the workflow (HK-38), an `install.sh` that also writes
   `CLAUDE.md` as `@AGENTS.md` so Claude Code and Codex read the same file (HK-37), a README that says GitHub
   is the only hosting assumption, and its own `check.sh` that CI runs). It was built here as
   `loop/` (HK-16) and published as `v0.1.0` (HK-19); its history is `loop/`'s. `kit` and

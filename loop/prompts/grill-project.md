@@ -5,7 +5,8 @@ that runs. Interrogate first, write second. Follow the standing instructions in 
 
 Settings come from `.loop.toml` when it exists (`scripts/loop-config.sh --all`); this session
 fills it in. The kit's templates are under `loop/templates/` after `install.sh`: the decision
-record, and a check skeleton per stack under `loop/templates/check/`.
+record, a check skeleton per stack under `loop/templates/check/`, and the CI toolchain steps
+per stack under `loop/templates/ci/`.
 
 ## 1. Ground yourself
 
@@ -78,21 +79,27 @@ Show the owner everything below in chat and get a yes before writing.
   `check_fast`, `code_paths` and `proof_paths` and `proof_pattern` for the stack from the
   table below, `coverage` when the stack row gives a command, `review_paths` from area 5,
   `kit` and `kit_ref` (the kit's URL and its current tag).
+- **`.github/workflows/loop.yml`**: the kit's workflow (`install.sh` put it there when the
+  repository had none) with the stack's toolchain steps from `loop/templates/ci/<stack>.yml`
+  spliced in between the checkout step and the `run: scripts/check.sh` line, comment lines
+  dropped. The steps tolerate the empty repository (setup actions run, installs are skipped
+  until the manifest exists), so CI is green on the first pull request and the first real
+  ticket does not fail for want of uv, Node, a JDK, or Go.
 - **`scripts/check.sh`**, copied from the stack's skeleton under `loop/templates/check/` and
   made executable. The skeleton runs the loop's own checks first, then the stack's format,
   lint, test, and build steps, each skipped with a note while the manifest is absent, so it
   exits 0 on an empty repository and starts failing as code arrives. Fill the TODO lines the
   interview answered; leave the rest as TODO with the question they wait on.
 
-The stack table. A stack not in it gets `other.sh`, whose steps are all TODO.
+The stack table. A stack not in it gets `other.sh` and `other.yml`, whose steps are all TODO.
 
-| Stack | Skeleton | `code_paths` | `proof_paths` | `proof_pattern` |
-| --- | --- | --- | --- | --- |
-| Rust | `rust.sh` | `["src/"]` | `["tests/"]` | `#\\[test\\]` |
-| Python | `python.sh` | `["src/"]` | `["tests/"]` | `def test_` |
-| Node or TypeScript | `node.sh` | `["src/"]` | `["test/", "tests/", "__tests__/"]` | `\\b(test|it)\\(` |
-| Java, Maven or Gradle | `java.sh` | `["src/main/"]` | `["src/test/"]` | `@Test` |
-| Go | `go.sh` | `["./"]` | `["_test.go"]` | `func Test` |
+| Stack | Skeleton | CI steps | `code_paths` | `proof_paths` | `proof_pattern` |
+| --- | --- | --- | --- | --- | --- |
+| Rust | `rust.sh` | `rust.yml` | `["src/"]` | `["tests/"]` | `#\\[test\\]` |
+| Python | `python.sh` | `python.yml` | `["src/"]` | `["tests/"]` | `def test_` |
+| Node or TypeScript | `node.sh` | `node.yml` | `["src/"]` | `["test/", "tests/", "__tests__/"]` | `\\b(test|it)\\(` |
+| Java, Maven or Gradle | `java.sh` | `java.yml` | `["src/main/"]` | `["src/test/"]` | `@Test` |
+| Go | `go.sh` | `go.yml` | `["./"]` | `["_test.go"]` | `func Test` |
 
 Then run `scripts/check.sh` and show its output: it must exit 0 before you finish. Run
 `scripts/decisions.sh --check` and `scripts/prompt-check.sh` as well.

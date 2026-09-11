@@ -146,12 +146,12 @@ scripts/decisions.sh --check
 
 # The loop prompts belong to every project that adopts the loop (HK-15): nothing in loop/
 # may name this project, its build tools, a harness, or its review path. (.loop.toml is
-# exempt: it holds this project's own values.) The first-day interview and the check
-# skeletons (HK-32) name every stack's tools on purpose, so only the project and the harness
-# are forbidden there.
+# exempt: it holds this project's own values.) The first-day interview, the check
+# skeletons, and the CI toolchain steps (HK-32, HK-38) name every stack's tools on purpose,
+# so only the project and the harness are forbidden there.
 step "loop prompts name no project, build tool, or harness"
 if grep -rniE 'tessera|claude|examples/expected' loop/ \
-   || grep -rniE 'cargo|npm' loop/ --exclude-dir=check --exclude=grill-project.md; then
+   || grep -rniE 'cargo|npm' loop/ --exclude-dir=check --exclude-dir=ci --exclude=grill-project.md; then
   echo "loop/ must stay generic: the lines above name the project, a build tool, or a harness" >&2
   exit 1
 fi

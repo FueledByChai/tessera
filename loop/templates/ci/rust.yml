@@ -1,0 +1,10 @@
+# Toolchain steps for a Rust project, written by grill-project into
+# .github/workflows/loop.yml between the checkout step and the `run: scripts/check.sh` line
+# (same indentation as those steps). Every step tolerates the empty repository, so the
+# workflow is green before the manifest exists; the comments say what to add once it does.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Coverage for the ratchet, once `coverage` is set in .loop.toml:
+      #   - run: rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --locked
