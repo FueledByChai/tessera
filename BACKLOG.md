@@ -540,3 +540,17 @@ sync.
 **Done when:** the kit's proof-gate self-test adds an uncommitted code change with no proof
 and sees the gate fail before any commit, and pass once a proof file is added, still
 uncommitted; `kit_ref` here moves to the tag.
+
+### HK-30 The deploy loop sees the listener under launchd and confirms the restart
+On 2026-09-10 the loop logged "restarted the service: pid 45285" for WB-14 while the console
+kept running the September 9 binary: under launchd `lsof` is not on the PATH the plist sets
+(it lives in /usr/sbin), so `listener_pid` printed nothing, the old service was never
+stopped, the new one died with "Address already in use", and the health probe that followed
+was answered by the old process. `scripts/deploy-local.sh` should call `/usr/sbin/lsof` by
+absolute path (and `--launchd` should put /usr/sbin on the PATH), and `restart_service`
+should confirm the listener's pid equals the pid it just started before reporting a restart,
+failing loudly (exit 4, the marker file, the log line) when it does not. The stub in the
+self-test should be able to leave the old pid bound so the case is covered.
+**Done when:** the deploy self-test has a fixture where the stub keeps the old listener
+alive and the run reports "restart failed: the old service still holds the port" instead
+of a restart; `--launchd` output contains /usr/sbin; the script has no bare `lsof`.

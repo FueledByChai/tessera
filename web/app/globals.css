@@ -4142,6 +4142,9 @@ nav {
 .feature-library .feature-save { margin: 10px 0 12px; }
 .feature-library .feature-save button { align-self: end; height: 42px; }
 .feature-library-table th, .feature-library-table td { text-align: left; }
+/* Expressions and notes wrap inside the panel (the generic table rule keeps cells on one
+   line); a long note must never push the library past the page (WB-15, layout-check). */
+.feature-library-table td { white-space: normal; overflow-wrap: anywhere; }
 .feature-library-table th:last-child, .feature-library-table td:last-child { text-align: right; }
 .feature-library-table .feature-expression { color: var(--accent, #f89828); }
 .feature-library-table em { font-style: normal; color: var(--text-muted, #b8b8b8); letter-spacing: 0.06em; }
