@@ -21,6 +21,8 @@ grill-me.md	proofs and edge cases
 grill-me.md	docs/decisions
 grill-me.md	superseding
 grill-me.md	without a named proof
+grill-me.md	wireframe
+grill-me.md	80 columns
 review-prs.md	four questions
 review-prs.md	one status per head commit
 grill-project.md	in a sentence
@@ -34,7 +36,8 @@ grill-project.md	rust.sh
 grill-project.md	python.sh
 grill-project.md	node.sh
 grill-project.md	java.sh
-grill-project.md	go.sh'
+grill-project.md	go.sh
+grill-project.md	wireframe'
 
 prompts_dir() {
   if [ -d "$ROOT/loop/prompts" ]; then echo "$ROOT/loop/prompts"

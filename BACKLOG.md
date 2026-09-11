@@ -691,3 +691,25 @@ and the restatement at the top of round 2 should quote that sentence back. Kit c
 tag, sync.
 **Done when:** `scripts/prompt-check.sh` asserts the phrase "in a sentence" in
 `grill-project.md`; a recorded run in the kit PR shows the purpose captured in round 1.
+
+### HK-37 The kit's installer writes CLAUDE.md so Claude Code loads AGENTS.md
+`install.sh` writes `AGENTS.md`, which Codex reads on its own, but Claude Code reads
+`CLAUDE.md`; a new project run from Claude Code has no standing instructions until someone
+adds the one-line file by hand (here it is `@AGENTS.md`). The installer should write
+`CLAUDE.md` containing `@AGENTS.md` when absent and keep an existing one; the README's
+install section says which harness reads which file. Kit change, tag, sync.
+**Done when:** `install.sh --self-test` sees `CLAUDE.md` installed with the `@AGENTS.md`
+line and kept on a second install; `kit_ref` here moves to the tag.
+
+### HK-38 grill-project writes the workflow's toolchain step from the stack table
+The kit's workflow is checkout plus `scripts/check.sh`, with a comment to add language
+setup before it; the check skeleton passes on the empty repository, so the gap only shows
+on the first real ticket, when CI fails for want of uv, Node, a JDK, or Go. The kit should
+carry a setup snippet per stack under `templates/ci/` (the `actions/setup-*` or uv step and
+its cache), `grill-project` should copy the stack's snippet into `.github/workflows/loop.yml`
+before the run line in the same step that writes `scripts/check.sh`, and `prompt-check`
+should assert the prompt names the toolchain step. Kit change, tag, sync.
+**Done when:** `install.sh --self-test` sees a snippet per stack installed under
+`loop/templates/ci/`; `scripts/prompt-check.sh` asserts "toolchain" in `grill-project.md`;
+the kit PR shows one workflow produced from a snippet passing `actionlint` or a YAML parse;
+`kit_ref` here moves to the tag.

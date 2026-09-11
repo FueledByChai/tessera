@@ -159,7 +159,12 @@ noreply address, so it does not bite. Commits from another identity would.
   --supersedes NNNN`. `scripts/decisions.sh index` keeps the index; `--check` runs inside
   `scripts/check.sh`. `/grill-me` reads the index before asking anything, asks at least
   three rounds with the last on proofs and edge cases, stops to write a record when a story
-  implies a decision none covers, and cites the records in every ticket. A prompt cannot be
+  implies a decision none covers, and cites the records in every ticket. A story that
+  touches a screen carries a text wireframe (HK-34: a fenced block at most 80 columns wide
+  naming the panels, tables, and controls in order) that the owner confirms with the draft;
+  the ticket points at it (`Wireframe: BT-nnn`) and its proof matches it, and a canvas or
+  HTML mockup goes under `docs/wireframes/` on request. `/grill-project`'s UI round closes
+  the same way, with the first screen sketched into its decision record. A prompt cannot be
   unit-tested, so `scripts/prompt-check.sh` (also in the check) fails when a prompt no longer
   carries a phrase that states one of its rules, and a prompt change's PR records one real
   run. HK-33 moves the locked product decisions into `docs/decisions/`.
