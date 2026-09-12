@@ -337,7 +337,7 @@ repeat; `docs/LOCAL_UI.md` names the panel.
 
 ## Data sources
 
-### DS-01 The Data page is three views: Inventory, Instrument search, Updates & schedules
+### DS-01 The Data page is three views: Inventory, Instrument search, Updates & schedules — `doing`
 `view === "data"` in `web/app/page.tsx` renders `DataSourcesPanel`, the DATA LIBRARY metrics,
 `DataCoverage`, and `AutomationsWorkspace` in one column. A tab strip under the title selects a
 `dataView` (inventory, instruments, updates) remembered in browser storage; Inventory keeps the

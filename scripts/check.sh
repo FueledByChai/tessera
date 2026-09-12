@@ -7,7 +7,7 @@
 #   scripts/check.sh --quick          skip web and the private checks (the CI engine job);
 #                                     the coverage ratchet still runs
 #   scripts/check.sh --web-only       only the web step (the CI web job); the headless layout,
-#                                     chart, and run form checks skip themselves without a Chromium
+#                                     chart, run form, and data page checks skip themselves without a Chromium
 #   scripts/check.sh --private-only   only the private checks (the deploy loop's post-merge
 #                                     guard, HK-18); fails when no private checkout is there
 #   scripts/check.sh --refresh-baseline
@@ -215,8 +215,8 @@ if [ "$RATCHET" = 1 ]; then
 fi
 
 if [ "$NO_WEB" = 0 ]; then
-  step "web typecheck, lint, theme check, build, layout, chart, and run form checks"
-  (cd web && npm run --silent typecheck && npm run --silent lint && npm run --silent theme-check && npm run --silent build >/dev/null && npm run --silent layout-check && npm run --silent chart-check && npm run --silent run-form-check)
+  step "web typecheck, lint, theme check, build, layout, chart, run form, and data page checks"
+  (cd web && npm run --silent typecheck && npm run --silent lint && npm run --silent theme-check && npm run --silent build >/dev/null && npm run --silent layout-check && npm run --silent chart-check && npm run --silent run-form-check && npm run --silent data-page-check)
 fi
 
 if [ "$QUICK" = 0 ]; then
