@@ -1,0 +1,29 @@
+[
+  {
+    "Code": "AAPL",
+    "Name": "Apple Inc",
+    "Country": "USA",
+    "Exchange": "NASDAQ",
+    "Currency": "USD",
+    "Type": "Common Stock",
+    "Isin": "US0378331005"
+  },
+  {
+    "Code": "SPY",
+    "Name": "SPDR S&P 500 ETF Trust",
+    "Country": "USA",
+    "Exchange": "NYSE ARCA",
+    "Currency": "USD",
+    "Type": "ETF",
+    "Isin": "US78462F1030"
+  },
+  {
+    "Code": "BRK-B",
+    "Name": "Berkshire Hathaway Inc",
+    "Country": "USA",
+    "Exchange": "NYSE",
+    "Currency": "USD",
+    "Type": "Common Stock",
+    "Isin": null
+  }
+]

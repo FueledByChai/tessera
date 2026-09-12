@@ -1,0 +1,38 @@
+[
+  {
+    "Name": "USA Stocks",
+    "Code": "US",
+    "OperatingMIC": "XNAS, XNYS",
+    "Country": "USA",
+    "Currency": "USD",
+    "CountryISO2": "US",
+    "CountryISO3": "USA"
+  },
+  {
+    "Name": "London Exchange",
+    "Code": "LSE",
+    "OperatingMIC": "XLON",
+    "Country": "UK",
+    "Currency": "GBP",
+    "CountryISO2": "GB",
+    "CountryISO3": "GBR"
+  },
+  {
+    "Name": "Toronto Exchange",
+    "Code": "TO",
+    "OperatingMIC": "XTSE",
+    "Country": "Canada",
+    "Currency": "CAD",
+    "CountryISO2": "CA",
+    "CountryISO3": "CAN"
+  },
+  {
+    "Name": "Cryptocurrencies",
+    "Code": "CC",
+    "OperatingMIC": null,
+    "Country": "Unknown",
+    "Currency": "Unknown",
+    "CountryISO2": "",
+    "CountryISO3": ""
+  }
+]
