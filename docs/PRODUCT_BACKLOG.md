@@ -366,7 +366,7 @@ that result without confusing it with my current data inventory.
 
 ### BT-608 — Data workspace information architecture
 
-**Status:** Proposed  
+**Status:** Ready  
 **User story:** As a user, I want inventory, instrument search, and update operations organized clearly
 so broad coverage questions and operational maintenance do not compete on one screen.
 
@@ -377,6 +377,18 @@ so broad coverage questions and operational maintenance do not compete on one sc
 - Instrument search preserves its query and selected instrument when navigating back from another
   workspace.
 - Update actions show their source, scope, estimated work when available, and current state.
+
+**Wireframe:**
+
+```
+DATA   [Inventory]  [Instrument search]  [Updates & schedules]      (tab strip; opens at top)
+
+Inventory:           SRC data sources (cards, BT-1201/1203) . AVL available from provider
+                     (BT-1202) . run coverage folded closed (moves to Run detail, BT-607)
+Instrument search:   search [ IWM      ]
+                     SYMBOL  NAME  VENUE  CLASS  CCY  STATUS  EOD  5M  1M  TICK
+Updates & schedules: JOB updates table . SCH schedules table . add schedule (inline, BT-1207)
+```
 
 ## Epic G: Columnar market-data storage and external volumes
 
@@ -1052,6 +1064,211 @@ EXPANDED (unchanged)                    COLLAPSED (new, 56 px, both modes)
 |     Local Mac · 0      |              |      |
 +------------------------+              +------+
    224 px (216 terminal)                 56 px; active item keeps its highlight
+```
+
+## Epic L: Provider data sources and downloads
+
+The service talks to market-data providers itself (decision 0020): a source is a provider
+account registered from the console (0021), a dataset is what that source keeps current, and
+the download jobs are budgeted, exclusive, and fail closed (0022). EODHD is the first provider.
+
+### BT-1201 — A data source is registered from the console; its credentials stay out of the database
+
+**Status:** Proposed  
+**User story:** As a user of the console, I want to add a provider account (EODHD first) from
+the Data page with no restart so that other people can point their own copy of the application
+at their own account and library.
+
+**Acceptance criteria:**
+
+- Inventory has an Add source inline form (not a modal; the run form is the console's one,
+  decision 0003): provider kind from the adapters compiled in, name, library root folder,
+  catalog folder, API token. Save verifies the token with the provider; a rejected token is
+  refused with the provider's message and nothing is saved.
+- The token is written to a file per source under `data/ui` with mode 0600; the database
+  holds the source and when its token was set and last verified. No API response carries
+  the token or the file's path. The card shows "token set, verified <date>" and Replace.
+- The card appears on the next load of Inventory; the service is not restarted.
+- The card shows name, provider, root, the root volume's used, free, and total space, and a
+  connection state with the time checked: Connected, Credentials rejected, Unreachable.
+- Deleting a source with dataset files on disk is refused; deleting one with none removes
+  the record and its token file; the console never deletes data files.
+- The first EODHD source adopts the existing library in place: its root and catalog folder
+  are today's folders and nothing is re-downloaded.
+
+**Wireframe:**
+
+```
++ SRC  DATA SOURCES                                        [Add source] [Rescan] +
+| EODHD  eodhd  /Volumes/.../eodhd-data  token set, verified 09-11 [Replace]      |
+|        Connected 19:02 . volume 1.21 TB used, 0.79 TB free of 2.00 TB           |
+|        credits 41,430 / 100,000 today, resets 00:00 UTC   reserve [5]%          |
+|        (datasets table, BT-1203)                                  [Add dataset] |
+| ADD SOURCE  kind [EODHD v] name [    ] root [    ] catalog [    ]               |
+|             token [********]                                   [Save] [Cancel] |
++---------------------------------------------------------------------------------+
+```
+
+### BT-1202 — What the provider offers, beside what is on disk
+
+**Status:** Proposed  
+**User story:** As a user, I want to see the exchanges, instrument types, and resolutions my
+provider account offers, with counts, next to what I already hold, so that I can decide what
+to download.
+
+**Acceptance criteria:**
+
+- Under the source cards, an "Available from <source>" panel lists the provider's exchanges:
+  code, name, country, listed count per instrument type (the provider's own type names), the
+  resolutions offered there, and HERE, the number of datasets registered against it. A text
+  filter narrows by code or name; rows with datasets sort first.
+- The exchange list and every fetched symbol list are cached in the catalog database with the
+  time fetched, shown as "listed <time>" (decision 0013). Refresh is an explicit button and a
+  nightly step before the download jobs; an unreachable provider leaves the cached table with
+  an Unreachable note, never an empty one.
+- A symbol list for an exchange with no dataset is fetched once when its row is expanded.
+- Type counts use the provider's names unchanged; the decision 0012 mapping applies only to
+  the inventory segments.
+
+**Wireframe:**
+
+```
++ AVL  AVAILABLE FROM EODHD   listed 09-11 02:00   [Refresh]   filter [        ]  +
+| EXCHANGE NAME             COUNTRY TYPES (listed)                    RES        HERE|
+| US       USA Stocks       USA     Common Stock 17,906 . ETF 5,859 . +9 EOD 5m 1m  2 |
+| CC       Cryptocurrencies -       Currency 3,1xx                    EOD 5m 1m  1 |
+| LSE      London           UK      Common Stock 1,9xx . ETF 1,2xx    EOD 5m     - [+]|
++-----------------------------------------------------------------------------------+
+```
+
+### BT-1203 — Datasets: what a source keeps current, where it is, and how complete it is
+
+**Status:** Proposed  
+**User story:** As a user, I want each thing I keep current to be one row with its folder,
+listed-versus-on-disk counts, latest date, size, and state so that I know what I have and
+where it is.
+
+**Acceptance criteria:**
+
+- Add dataset (inline on the card): exchange from the cached list, types as checkboxes from
+  that exchange's types, resolution from what the provider offers there (EOD, 5m, 1m),
+  from-date, include delisted (default on for EOD), folder (default `<root>/eod`, `5m`, `1m`).
+- Each dataset row: exchange, types, resolution, from, folder, listed (symbols of those types
+  on that exchange in the cached list), on disk (files present for them), latest date and the
+  count current through the latest expected session, size, and a state with the BT-605
+  definitions (Current, Updating, Stale, Partial, Failed, Unknown) plus Unavailable when the
+  folder or its root is missing.
+- Counts, dates, and sizes come from a scan cache with its time shown (decision 0013); Rescan
+  is an explicit per-source action that runs in the background; a failed scan keeps the last.
+- Files under the root that no dataset claims are counted per folder as Uncataloged.
+- Deleting a dataset with files is refused; files are never deleted.
+
+**Wireframe** (inside the source card):
+
+```
+| EXCHANGE TYPES             RES FROM       FOLDER LISTED ON DISK LATEST CURRENT SIZE    STATE   |
+| US       Common Stock, ETF EOD 2000-01-01 eod/   23,765 23,748  09-10  23,700  41.2 GB Current |
+| US       Common Stock, ETF 5m  2020-10-01 5m/    23,765 18,804  09-10  18,790  1.08 TB Partial |
+| CC       Currency          EOD 2015-01-01 eod/    3,110  3,102  09-10   3,100  0.9 GB  Current |
+| FOREX    Currency          EOD 2000-01-01 eod/      150    150  09-10     150  0.1 GB  Current |
+| GBOND    Government bond   EOD 2000-01-01 eod/       40     40  09-10      40  0.0 GB  Current |
+| Uncataloged  1m/  9 files 12.4 GB                scanned 09-11 02:10         [Add dataset] |
+```
+
+### BT-1204 — API credits are shown and every job is budgeted
+
+**Status:** Proposed  
+**User story:** As an operator, I want to see today's provider usage against its limit and
+have jobs stop before the limit so that a nightly never burns the day's calls or fails
+half-way at the provider.
+
+**Acceptance criteria:**
+
+- The card shows requests used today / daily limit and the reset time, read from the provider
+  when Inventory loads and after each job; when unreachable, the last value with its time.
+- A reserve per source, default 5% of the limit, editable on the card.
+- Before starting, a job estimates its calls (EOD: one per session plus one splits call per
+  session plus one per backfill; intraday: windows times five per symbol) and refuses to
+  start when the mandatory part exceeds remaining minus reserve, saying both numbers; the
+  optional part (backfill) stops at the reserve with "stopped at reserve" on the record and
+  resumes on the next run.
+- Every job record shows the calls it used.
+
+### BT-1205 — The native EOD download job
+
+**Status:** Proposed  
+**User story:** As an operator, I want the service itself to bring an EOD dataset up to date
+nightly so that the Python launchd job can be retired and "did it run" has one answer.
+
+**Acceptance criteria:**
+
+- For an EOD dataset the job fetches the exchange's bulk last-day for each session after the
+  dataset's latest date (one call per session) and appends one row per file for the dataset's
+  symbols; missing symbols get their full history from the from-date (backfill), delisted
+  symbols once and never incremented. Every write is part-then-rename.
+- The session's splits list is fetched; each split symbol in the dataset has its whole history
+  refetched and its file replaced, so a file's adjusted closes are on one basis.
+- A bulk day that omits the calendar symbol or has fewer rows than a per-dataset minimum is
+  refused: nothing written, the job Failed with the row count.
+- Running the job again when current writes nothing and reports zero added, zero updated.
+- Refusals: a second job on a source with one running (the running id is named); a folder
+  missing, unwritable, or under an unmounted root (the job never creates it).
+- The catalog folder's `catalog.csv`, `stocks.txt`, and `etfs.txt` are regenerated from the
+  cached listing after the job, in today's columns, so the run form's universes and the
+  instrument index keep working.
+- The job record: state with percent, started, finished, calls, files added, files updated,
+  symbols skipped with reasons, error, and a downloadable log.
+
+### BT-1206 — The native intraday increment job
+
+**Status:** Proposed  
+**User story:** As an operator, I want 5-minute and 1-minute datasets extended nightly by the
+service so that the intraday launchd job can be retired.
+
+**Acceptance criteria:**
+
+- Each existing file is extended from its last timestamp in windows the provider allows for
+  that resolution, five calls per request, then missing symbols are backfilled from the
+  from-date; part-then-rename; budgeted per BT-1204.
+- Files keep today's layout (`Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume`, UTC
+  epoch seconds, one file per symbol).
+- A symbol that returns no rows is skipped with a reason and not retried in that job; a rerun
+  when current writes nothing.
+- The job record is the BT-1205 one.
+
+### BT-1207 — Per-dataset schedules in the service replace the launchd jobs
+
+**Status:** Proposed  
+**User story:** As an operator, I want each dataset's nightly on the Updates & schedules view
+with its last runs so that one scheduler runs the downloads and shows whether they ran.
+
+**Acceptance criteria:**
+
+- Schedules table: dataset, time (PT), days, enabled, last run, last status, the last seven
+  outcomes as marks; Run now and Pause per row; Add schedule inline (dataset, time, days).
+  The kind is `dataset_update` with the dataset id (decision 0001).
+- A due schedule whose source has a job running is skipped with "skipped: job <id> running"
+  as its status, never queued twice.
+- Updates table: jobs newest first (dataset, kind: scheduled, manual, or scan; state with
+  percent; started; calls; added; updated; error; log), capped with Show all.
+- A launchd job is unloaded after its native schedule shows seven clean marks; the steps live
+  in the private runbook, not here.
+- The legacy `data_update` kind, `update_command`, `freshness_file`, and the DATA LIBRARY
+  panel are removed once the EOD schedule replaces them.
+
+**Wireframe:**
+
+```
++ JOB  UPDATES  (12, show all)                                                       +
+| DATASET  KIND      STATE        STARTED      CALLS  ADDED  UPDATED  ERROR         LOG |
+| US EOD   scheduled running 62%  09-11 19:15  1,204      0   11,350  -             [>] |
+| US 5m    scheduled complete     09-10 20:30 94,210     52   18,752  stopped@resv  [>] |
++ SCH  SCHEDULES                                                    [Add schedule]   +
+| DATASET  TIME PT  DAYS      ON  LAST RUN  LAST STATUS    LAST 7                      |
+| US EOD   19:15    mon-fri   x   09-11     queued j-1204  ooooooo  [Run now] [Pause]  |
+| US 5m    20:30    mon-fri   x   09-10     complete       oooo.oo  [Run now] [Pause]  |
+| ADD  dataset [US EOD v] time [19:15] days [mon,tue,wed,thu,fri] [x] enable   [Add]  |
++-------------------------------------------------------------------------------------+
 ```
 
 ## Recommended delivery milestones
