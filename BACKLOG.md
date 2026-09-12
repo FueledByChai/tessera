@@ -116,6 +116,34 @@ terminal's, and make the check hold it. Serves BT-1101.
 1280×800 in either mode for a strategy declaring up to eight parameters, and passes against
 the console and the scratch console.
 
+### UI-08 The console's left menu collapses to an animated icon rail
+Today the sidebar (`web/app/page.tsx`, the `<aside className="sidebar">` in `Home` with
+`navItems` beside it) is a fixed column — 224 px, 216 px in terminal mode (`web/app/globals.css`,
+`.app-shell` and `.app-shell[data-theme="terminal"]`) — rendering a glyph and a label per item,
+with nothing to collapse it. Add a toggle button in the brand row, a `collapsed` state on
+`Home`, and the collapsed styles: a 56 px rail in both display modes, the brand mark and the
+engine dot kept, the labels and the foot's text not rendered, a themed CSS tooltip on hover for
+each nav item plus the brand and the dot, and the active item's amber colour and inset bar kept.
+The width and the label fade animate over 150 ms; the expanded sidebar is pixel-identical to
+today. Serves BT-1103. Wireframe: BT-1103. Decisions: 0019.
+**Done when:** `web/scripts/layout-check.mjs` gains a collapsed pass — it clicks the toggle on
+the strategies page at 1280 and 1440 px in terminal and modern mode and fails unless the sidebar
+measures 56 px, no nav-item label text is visible, the active item still carries its highlight,
+hovering a nav icon surfaces a tooltip whose text is that item's label, and the page body does
+not scroll horizontally; `theme-check.mjs` still passes.
+
+### UI-09 The collapsed left menu is remembered per browser — Blocked by UI-08
+UI-08 gives the sidebar a collapsed state that resets on every page load. Store it in browser
+storage beside the display-mode preference (`window.localStorage`, the `bt-display-mode` read
+and write in `Home`, `web/app/page.tsx`) under `bt-sidebar` with the values `collapsed` and
+`expanded`: read on mount, written on every toggle, so a reload and a new tab keep the rail.
+A fresh browser and unavailable storage both start expanded. Serves BT-1103. Wireframe:
+BT-1103. Decisions: 0019.
+**Done when:** the collapsed pass in `web/scripts/layout-check.mjs` reloads the strategies page
+after collapsing and fails unless the rail is still collapsed, then expands and reloads and
+fails unless it is expanded again; a run with browser storage blocked still renders the
+expanded sidebar.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar
