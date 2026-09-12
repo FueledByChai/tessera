@@ -48,6 +48,9 @@ struct AppState {
     /// Where the EODHD adapter's calls go: the public API unless `TESSERA_EODHD_BASE_URL`
     /// points a scratch console at a stub (the service tests do the same in memory).
     eodhd_base_url: Arc<String>,
+    /// The sources whose scan job is running (DS-05): a second scan on one is refused, and
+    /// the card says `scanning` until the job has written its rows.
+    scans: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -620,6 +623,7 @@ async fn main() -> Result<()> {
             std::env::var("TESSERA_EODHD_BASE_URL")
                 .unwrap_or_else(|_| tessera::provider::eodhd::DEFAULT_BASE_URL.to_owned()),
         ),
+        scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
     };
     import_legacy_reports(&state)?;
     let metrics_state = state.clone();
@@ -757,6 +761,9 @@ fn api_router() -> Router<AppState> {
             "/api/sources/{id}/availability/refresh",
             post(refresh_availability),
         )
+        .route("/api/sources/{id}/datasets", post(create_dataset))
+        .route("/api/sources/{id}/scan", post(scan_source))
+        .route("/api/datasets/{id}", delete(delete_dataset))
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -1011,6 +1018,30 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS provider_refreshes (
              source_id TEXT PRIMARY KEY REFERENCES data_sources(id) ON DELETE CASCADE,
              attempted_at TEXT NOT NULL,
+             error TEXT
+         );
+         CREATE TABLE IF NOT EXISTS datasets (
+             id TEXT PRIMARY KEY,
+             source_id TEXT NOT NULL REFERENCES data_sources(id) ON DELETE CASCADE,
+             exchange TEXT NOT NULL,
+             types_json TEXT NOT NULL,
+             resolution TEXT NOT NULL,
+             from_date TEXT NOT NULL,
+             folder TEXT NOT NULL,
+             include_delisted INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_datasets_source ON datasets(source_id, created_at);
+         CREATE TABLE IF NOT EXISTS dataset_scans (
+             dataset_id TEXT PRIMARY KEY REFERENCES datasets(id) ON DELETE CASCADE,
+             scanned_at TEXT NOT NULL,
+             listed INTEGER NOT NULL,
+             on_disk INTEGER NOT NULL,
+             latest_date TEXT,
+             current_count INTEGER NOT NULL,
+             bytes INTEGER NOT NULL,
+             uncataloged_json TEXT NOT NULL,
+             state TEXT NOT NULL,
              error TEXT
          );",
     )?;
@@ -3924,18 +3955,7 @@ fn first_csv_date(path: &Path) -> Option<String> {
 }
 
 fn last_csv_row_date(path: &Path) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let tail = len.min(4096);
-    file.seek(SeekFrom::Start(len - tail)).ok()?;
-    let mut buf = vec![0u8; tail as usize];
-    file.read_exact(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    text.lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .find_map(csv_row_date)
+    last_csv_row_field(path).and_then(|field| csv_row_date(&field))
 }
 
 fn count_lines(path: &Path) -> usize {
@@ -4471,6 +4491,14 @@ struct SourceCard {
     verify_state: String,
     verify_message: Option<String>,
     created_at: String,
+    /// The datasets registered against the source, each with its last scan (DS-05).
+    datasets: Vec<DatasetRow>,
+    /// Files under the root that no dataset claims, per folder, as the last scan found them.
+    uncataloged: Vec<UncatalogedFolder>,
+    /// When the last scan ran; `None` before one has.
+    scanned_at: Option<String>,
+    /// Whether a scan of the source is running now.
+    scanning: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4606,8 +4634,8 @@ fn load_source_row(state: &AppState, id: &str) -> Result<Option<SourceRow>> {
 }
 
 /// The card for a row: the root's presence and volume figures, and whether its token file
-/// exists, read at the time of the call.
-fn card_of(state: &AppState, row: SourceRow) -> SourceCard {
+/// exists, read at the time of the call; the datasets and the last scan from the catalog.
+fn card_of(state: &AppState, row: SourceRow) -> Result<SourceCard> {
     let root = Path::new(&row.root);
     let root_exists = root.is_dir();
     let volume = if root_exists {
@@ -4617,7 +4645,19 @@ fn card_of(state: &AppState, row: SourceRow) -> SourceCard {
     };
     let token_set = token_path(state, &row.id).is_file();
     let usage = usage_of(&row);
-    SourceCard {
+    let (datasets, (scanned_at, uncataloged)) = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        (
+            load_datasets(&connection, &row.id)?,
+            last_scan_of(&connection, &row.id)?,
+        )
+    };
+    let scanning = state
+        .scans
+        .lock()
+        .expect("scan set poisoned")
+        .contains(&row.id);
+    Ok(SourceCard {
         id: row.id,
         name: row.name,
         kind: row.kind,
@@ -4633,13 +4673,17 @@ fn card_of(state: &AppState, row: SourceRow) -> SourceCard {
         verify_state: row.verify_state,
         verify_message: row.verify_message,
         created_at: row.created_at,
-    }
+        datasets,
+        uncataloged,
+        scanned_at,
+        scanning,
+    })
 }
 
 fn load_source_card(state: &AppState, id: &str) -> Result<SourceCard, ApiError> {
     let row = load_source_row(state, id)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
-    Ok(card_of(state, row))
+    Ok(card_of(state, row)?)
 }
 
 /// statvfs on `path`: the volume's total size, what is used, and what is free to this
@@ -4892,7 +4936,7 @@ async fn list_sources(
     let worker = state.clone();
     let sources = tokio::task::spawn_blocking(move || -> Result<Vec<SourceCard>> {
         let rows = load_source_rows(&worker)?;
-        Ok(rows.into_iter().map(|row| card_of(&worker, row)).collect())
+        rows.into_iter().map(|row| card_of(&worker, row)).collect()
     })
     .await
     .context("sources task failed")??;
@@ -4907,6 +4951,19 @@ async fn create_source(
     Json(request): Json<CreateSourceRequest>,
 ) -> Result<(StatusCode, Json<SourceCard>), ApiError> {
     validate_source_request(&request)?;
+    let root = request.root.trim();
+    if let Some(taken) = load_source_rows(&state)?
+        .into_iter()
+        .find(|row| Path::new(&row.root) == Path::new(root))
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "source {:?} already covers {}; one source per root",
+                taken.name, taken.root
+            ),
+        ));
+    }
     let token = request.token.trim().to_owned();
     let adapter = SourceAdapter::new(&state, &request.kind, &token)?;
     let account = adapter.verify(&token).await.map_err(refused)?;
@@ -5004,24 +5061,39 @@ async fn verify_source(
     Ok(Json(load_source_card(&state, &id)?))
 }
 
-/// Removes the record and its token file. Refused while any file lies under the root: the
-/// console never deletes data files (decision 0022).
+/// Removes the record and its token file. Refused while any file lies under the source's
+/// dataset folders, or under the root while it has no datasets: the console never deletes
+/// data files (decision 0022).
 async fn delete_source(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
     let row = load_source_row(&state, &id)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
-    let root = PathBuf::from(&row.root);
-    let occupied = tokio::task::spawn_blocking(move || holds_files(&root))
-        .await
-        .context("dataset scan failed")?;
-    if occupied {
+    let mut folders: Vec<PathBuf> = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        load_datasets(&connection, &id)?
+            .iter()
+            .map(|dataset| PathBuf::from(&dataset.folder))
+            .collect()
+    };
+    if folders.is_empty() {
+        folders.push(PathBuf::from(&row.root));
+    }
+    let occupied = tokio::task::spawn_blocking(move || {
+        folders
+            .into_iter()
+            .find(|folder| holds_files(folder))
+            .map(|folder| folder.display().to_string())
+    })
+    .await
+    .context("dataset scan failed")?;
+    if let Some(folder) = occupied {
         return Err(api_error(
             StatusCode::CONFLICT,
             format!(
-                "source {:?} still has files under {}; the console never deletes data files",
-                row.name, row.root
+                "source {:?} still has files under {folder}; the console never deletes data files",
+                row.name
             ),
         ));
     }
@@ -5041,10 +5113,13 @@ async fn delete_source(
 // ---------------------------------------------------------------------------
 
 /// What a refresh may ask for: one exchange's listing instead of the listings of every
-/// exchange with a dataset.
+/// exchange with a dataset, and whether to fetch the delisted listing as well (one extra
+/// call per exchange, cached apart); left out, an exchange's delisted listing is fetched
+/// when one of its datasets includes delisted symbols.
 #[derive(Debug, Default, Deserialize)]
 struct RefreshAvailabilityRequest {
     exchange: Option<String>,
+    delisted: Option<bool>,
 }
 
 /// The listed instruments of one of the provider's types, named as the provider names it.
@@ -5067,6 +5142,9 @@ struct AvailableExchange {
     listings_fetched_at: Option<String>,
     listed: u64,
     types: Vec<TypeCount>,
+    /// The delisted listing, when it has been fetched: its time and its count.
+    delisted_fetched_at: Option<String>,
+    delisted: u64,
 }
 
 /// A source's cached availability: what `GET /api/sources/{id}/availability` serves.
@@ -5170,22 +5248,21 @@ fn record_refresh(
     Ok(())
 }
 
-/// The exchanges with a dataset registered against the source: read from the `datasets`
-/// table (DS-05) when it exists, none before it does.
-fn exchanges_with_datasets(connection: &Connection, source_id: &str) -> Result<Vec<String>> {
-    let tables: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'datasets'",
-        [],
-        |row| row.get(0),
+/// The exchanges with a dataset registered against the source, each with whether one of
+/// its datasets includes delisted symbols (so the refresh fetches that listing too).
+fn exchanges_with_datasets(
+    connection: &Connection,
+    source_id: &str,
+) -> Result<Vec<(String, bool)>> {
+    let mut statement = connection.prepare(
+        "SELECT exchange, MAX(include_delisted) FROM datasets
+         WHERE source_id = ?1 GROUP BY exchange ORDER BY exchange",
     )?;
-    if tables == 0 {
-        return Ok(Vec::new());
-    }
-    let mut statement = connection
-        .prepare("SELECT DISTINCT exchange FROM datasets WHERE source_id = ?1 ORDER BY exchange")?;
     let codes = statement
-        .query_map([source_id], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+        .query_map([source_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(codes)
 }
 
@@ -5203,23 +5280,34 @@ fn load_availability(connection: &Connection, source_id: &str) -> Result<Availab
     // exchange -> (listing fetched at, listed, counts by type, largest type first)
     let mut listings: std::collections::HashMap<String, (Option<String>, u64, Vec<TypeCount>)> =
         std::collections::HashMap::new();
+    // exchange -> (delisted listing fetched at, delisted)
+    let mut delisted_listings: std::collections::HashMap<String, (String, u64)> =
+        std::collections::HashMap::new();
     {
         let mut statement = connection.prepare(
-            "SELECT exchange, type, COUNT(*), MIN(fetched_at) FROM provider_listings
-             WHERE source_id = ?1 AND delisted = 0
-             GROUP BY exchange, type ORDER BY exchange, COUNT(*) DESC, type",
+            "SELECT exchange, delisted, type, COUNT(*), MIN(fetched_at) FROM provider_listings
+             WHERE source_id = ?1
+             GROUP BY exchange, delisted, type ORDER BY exchange, delisted, COUNT(*) DESC, type",
         )?;
         let rows = statement.query_map([source_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         for row in rows {
-            let (exchange, kind, count, fetched_at) = row?;
+            let (exchange, delisted, kind, count, fetched_at) = row?;
             let count = u64::try_from(count).unwrap_or(0);
+            if delisted {
+                let entry = delisted_listings
+                    .entry(exchange)
+                    .or_insert_with(|| (fetched_at, 0));
+                entry.1 += count;
+                continue;
+            }
             let entry = listings
                 .entry(exchange)
                 .or_insert_with(|| (None, 0, Vec::new()));
@@ -5251,6 +5339,9 @@ fn load_availability(connection: &Connection, source_id: &str) -> Result<Availab
             fetched_at.get_or_insert_with(|| fetched.clone());
             let (listings_fetched_at, listed, types) =
                 listings.remove(&code).unwrap_or((None, 0, Vec::new()));
+            let (delisted_fetched_at, delisted) = delisted_listings
+                .remove(&code)
+                .map_or((None, 0), |(at, count)| (Some(at), count));
             AvailableExchange {
                 resolutions: serde_json::from_str(&resolutions).unwrap_or_default(),
                 code,
@@ -5260,6 +5351,8 @@ fn load_availability(connection: &Connection, source_id: &str) -> Result<Availab
                 listings_fetched_at,
                 listed,
                 types,
+                delisted_fetched_at,
+                delisted,
             }
         })
         .collect();
@@ -5290,8 +5383,10 @@ async fn availability(
 
 /// Fetches the exchange list and the active listings of every exchange with a dataset, or of
 /// the one exchange the body names (`{"exchange": "US"}`; an empty body means every one),
-/// and caches them stamped with the time. 200 with the table whatever the provider said: a
-/// call that fails leaves the rows fetched before and shows as the `unreachable` note.
+/// plus the delisted listing where `"delisted": true` asks for it or, unasked, where a
+/// dataset of the exchange includes delisted symbols, and caches them stamped with the
+/// time. 200 with the table whatever the provider said: a call that fails leaves the rows
+/// fetched before and shows as the `unreachable` note.
 async fn refresh_availability(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -5315,18 +5410,21 @@ async fn refresh_availability(
             return Ok(Json(load_availability(&connection, &id)?));
         }
     };
-    let wanted: Vec<String> = match request.exchange {
+    let wanted: Vec<(String, bool)> = match request.exchange {
         Some(code) => {
             let code = code.trim().to_owned();
             require_api(
                 exchanges.iter().any(|exchange| exchange.code == code),
                 format!("{} lists no exchange {code:?}", row.name),
             )?;
-            vec![code]
+            vec![(code, request.delisted.unwrap_or(false))]
         }
         None => {
             let connection = state.database.lock().expect("database lock poisoned");
             exchanges_with_datasets(&connection, &id)?
+                .into_iter()
+                .map(|(code, includes)| (code, request.delisted.unwrap_or(includes)))
+                .collect()
         }
     };
     {
@@ -5335,22 +5433,42 @@ async fn refresh_availability(
     }
 
     let mut failure: Option<String> = None;
-    for code in wanted {
-        match adapter.symbols(&code, false).await {
-            Ok(listings) => {
-                let worker = state.clone();
-                let source_id = id.clone();
-                let stamp = attempted_at.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut connection = worker.database.lock().expect("database lock poisoned");
-                    store_listings(&mut connection, &source_id, &code, false, &listings, &stamp)
-                })
-                .await
-                .context("listing store task failed")??;
-            }
-            Err(error) => {
-                failure = Some(format!("{code}: {error}"));
-                break;
+    'exchanges: for (code, with_delisted) in wanted {
+        let lists: &[bool] = if with_delisted {
+            &[false, true]
+        } else {
+            &[false]
+        };
+        for &delisted in lists {
+            match adapter.symbols(&code, delisted).await {
+                Ok(listings) => {
+                    let worker = state.clone();
+                    let source_id = id.clone();
+                    let stamp = attempted_at.clone();
+                    let exchange = code.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut connection =
+                            worker.database.lock().expect("database lock poisoned");
+                        store_listings(
+                            &mut connection,
+                            &source_id,
+                            &exchange,
+                            delisted,
+                            &listings,
+                            &stamp,
+                        )
+                    })
+                    .await
+                    .context("listing store task failed")??;
+                }
+                Err(error) => {
+                    failure = Some(if delisted {
+                        format!("{code} (delisted): {error}")
+                    } else {
+                        format!("{code}: {error}")
+                    });
+                    break 'exchanges;
+                }
             }
         }
     }
@@ -5363,6 +5481,836 @@ async fn refresh_availability(
     .await
     .context("availability task failed")??;
     Ok(Json(response))
+}
+
+// ---------------------------------------------------------------------------
+// Datasets and the scan cache (DS-05, decisions 0012, 0013, 0021): what a source keeps
+// current, where it is, and how complete it is. A dataset is one exchange, a set of the
+// provider's types, a resolution, a from-date, and a folder; its figures (listed against on
+// disk, the latest date, the count current through the latest expected session, bytes) come
+// from a scan that runs in the background on request and writes `dataset_scans`, never from
+// a page load. A scan that cannot judge a dataset keeps its previous figures and says why.
+// ---------------------------------------------------------------------------
+
+/// The share of the listed symbols a dataset must hold files for to count as complete;
+/// under it the state is Partial (a listing always carries a few symbols with no history).
+const COMPLETE_SHARE: f64 = 0.95;
+
+/// The states a scan assigns, as `docs/DATA_SOURCES.md` defines them (BT-605).
+const STATE_CURRENT: &str = "Current";
+const STATE_STALE: &str = "Stale";
+const STATE_PARTIAL: &str = "Partial";
+const STATE_FAILED: &str = "Failed";
+const STATE_UNKNOWN: &str = "Unknown";
+const STATE_UNAVAILABLE: &str = "Unavailable";
+
+/// Loose files directly under the root are counted under this folder name.
+const ROOT_FOLDER: &str = ".";
+
+#[derive(Debug, Deserialize)]
+struct CreateDatasetRequest {
+    exchange: String,
+    types: Vec<String>,
+    resolution: String,
+    from_date: String,
+    /// Absolute, or relative to the source's root; omitted, `<root>/eod` for daily bars and
+    /// `<root>/<resolution>` otherwise.
+    folder: Option<String>,
+    /// Omitted, on for daily bars and off otherwise.
+    include_delisted: Option<bool>,
+}
+
+/// A dataset's figures from its last scan. The state lives on the row beside it.
+#[derive(Debug, Clone, Serialize)]
+struct DatasetScan {
+    scanned_at: String,
+    listed: u64,
+    on_disk: u64,
+    latest_date: Option<String>,
+    current_count: u64,
+    bytes: u64,
+    /// Why the last scan could not judge the dataset; the figures are then the previous
+    /// scan's.
+    error: Option<String>,
+}
+
+/// A dataset as the card shows it: the registration and the last scan.
+#[derive(Debug, Clone, Serialize)]
+struct DatasetRow {
+    id: String,
+    source_id: String,
+    exchange: String,
+    types: Vec<String>,
+    resolution: String,
+    from_date: String,
+    folder: String,
+    include_delisted: bool,
+    created_at: String,
+    /// Current, Updating, Stale, Partial, Failed, Unknown, or Unavailable.
+    state: String,
+    scan: Option<DatasetScan>,
+}
+
+/// Files under the root that no dataset claims, counted per folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UncatalogedFolder {
+    /// The folder's path relative to the root (`.` for files directly under it).
+    folder: String,
+    files: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ScanAccepted {
+    source_id: String,
+    scanning: bool,
+}
+
+const DATASET_COLUMNS: &str = "d.id, d.source_id, d.exchange, d.types_json, d.resolution, \
+     d.from_date, d.folder, d.include_delisted, d.created_at, s.scanned_at, s.listed, \
+     s.on_disk, s.latest_date, s.current_count, s.bytes, s.state, s.error";
+
+fn map_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetRow> {
+    let types_json: String = row.get(3)?;
+    let scanned_at: Option<String> = row.get(9)?;
+    let scan = scanned_at
+        .map(|scanned_at| {
+            Ok::<_, rusqlite::Error>(DatasetScan {
+                scanned_at,
+                listed: row.get::<_, i64>(10)?.max(0) as u64,
+                on_disk: row.get::<_, i64>(11)?.max(0) as u64,
+                latest_date: row.get(12)?,
+                current_count: row.get::<_, i64>(13)?.max(0) as u64,
+                bytes: row.get::<_, i64>(14)?.max(0) as u64,
+                error: row.get(16)?,
+            })
+        })
+        .transpose()?;
+    let state: Option<String> = row.get(15)?;
+    Ok(DatasetRow {
+        id: row.get(0)?,
+        source_id: row.get(1)?,
+        exchange: row.get(2)?,
+        types: serde_json::from_str(&types_json).unwrap_or_default(),
+        resolution: row.get(4)?,
+        from_date: row.get(5)?,
+        folder: row.get(6)?,
+        include_delisted: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
+        state: state.unwrap_or_else(|| STATE_UNKNOWN.to_owned()),
+        scan,
+    })
+}
+
+/// The source's datasets, oldest first, each with its last scan when one has run.
+fn load_datasets(connection: &Connection, source_id: &str) -> Result<Vec<DatasetRow>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {DATASET_COLUMNS} FROM datasets d
+         LEFT JOIN dataset_scans s ON s.dataset_id = d.id
+         WHERE d.source_id = ?1 ORDER BY d.created_at, d.id"
+    ))?;
+    let rows = statement
+        .query_map([source_id], map_dataset)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn load_dataset(connection: &Connection, id: &str) -> Result<Option<DatasetRow>> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT {DATASET_COLUMNS} FROM datasets d
+                 LEFT JOIN dataset_scans s ON s.dataset_id = d.id WHERE d.id = ?1"
+            ),
+            [id],
+            map_dataset,
+        )
+        .optional()?)
+}
+
+/// The symbols a dataset covers: the codes of its types on its exchange in the cached
+/// listing, the delisted ones included when the dataset includes them. Empty when the
+/// listing is not cached.
+fn listed_symbols(connection: &Connection, dataset: &DatasetRow) -> Result<Vec<String>> {
+    if dataset.types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (0..dataset.types.len())
+        .map(|i| format!("?{}", i + 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = connection.prepare(&format!(
+        "SELECT DISTINCT code FROM provider_listings
+         WHERE source_id = ?1 AND exchange = ?2 AND (delisted = 0 OR ?3)
+           AND type IN ({placeholders})
+         ORDER BY code"
+    ))?;
+    let mut values: Vec<&dyn rusqlite::ToSql> = vec![
+        &dataset.source_id,
+        &dataset.exchange,
+        &dataset.include_delisted,
+    ];
+    values.extend(dataset.types.iter().map(|t| t as &dyn rusqlite::ToSql));
+    let codes = statement
+        .query_map(values.as_slice(), |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(codes)
+}
+
+/// The file a listing's bars live in: `<code>.<exchange>.csv`, the provider's symbol form.
+fn symbol_file_name(code: &str, exchange: &str) -> String {
+    format!("{code}.{exchange}.csv")
+}
+
+/// The folder a dataset defaults to under the root: `eod` for daily bars, else the
+/// resolution's own name (`5m`, `1m`, `1h`).
+fn default_dataset_folder(resolution: &str) -> &str {
+    if resolution == "daily" {
+        "eod"
+    } else {
+        resolution
+    }
+}
+
+/// The first field of a bar file's last non-empty row, read from its tail: a date for
+/// daily bars, an epoch second for intraday ones.
+fn last_csv_row_field(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail = len.min(4096);
+    file.seek(SeekFrom::Start(len - tail)).ok()?;
+    let mut buf = vec![0u8; tail as usize];
+    file.read_exact(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let first = line.split(',').next()?.trim();
+            (!first.is_empty()).then(|| first.to_owned())
+        })
+}
+
+/// The latest session a dataset is expected to reach (BT-605): the calendar symbol's last
+/// date for daily bars; for intraday bars that session's close in New York, as the epoch
+/// second a file's last bar must reach (the close less one bar's length).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedSession {
+    Date(NaiveDate),
+    Close { session: NaiveDate, epoch: i64 },
+}
+
+impl ExpectedSession {
+    fn for_resolution(session: NaiveDate, resolution: &str) -> Self {
+        use chrono::TimeZone;
+        let Some(bar_seconds) = bar_seconds(resolution) else {
+            return ExpectedSession::Date(session);
+        };
+        let close = chrono_tz::America::New_York
+            .from_local_datetime(&session.and_time(NaiveTime::from_hms_opt(16, 0, 0).unwrap()))
+            .single()
+            .map(|at| at.timestamp())
+            .unwrap_or(0);
+        ExpectedSession::Close {
+            session,
+            epoch: close - bar_seconds,
+        }
+    }
+
+    /// Whether a file whose last row starts with `field` reaches the expected session.
+    fn reached_by(&self, field: &str) -> bool {
+        let date =
+            csv_row_date(field).and_then(|text| NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok());
+        match self {
+            ExpectedSession::Date(expected) => date.is_some_and(|d| d >= *expected),
+            ExpectedSession::Close { session, epoch } => match field.parse::<i64>() {
+                Ok(last) => last >= *epoch,
+                Err(_) => date.is_some_and(|d| d >= *session),
+            },
+        }
+    }
+}
+
+/// The length of one intraday bar in seconds (`5m`, `1m`, `1h`); `None` for daily bars or a
+/// resolution not in that form.
+fn bar_seconds(resolution: &str) -> Option<i64> {
+    let (digits, unit) = resolution.split_at(resolution.len().checked_sub(1)?);
+    let n: i64 = digits.parse().ok()?;
+    match unit {
+        "m" => Some(n * 60),
+        "h" => Some(n * 3600),
+        _ => None,
+    }
+}
+
+/// The calendar symbol's daily file, looked for in the dataset's own folder, then the
+/// source's daily dataset folders, then the library's `daily_dir`.
+fn calendar_file(state: &AppState, folder: &Path, daily_folders: &[PathBuf]) -> Option<PathBuf> {
+    let name = format!("{}.csv", state.local.data.calendar_symbol);
+    std::iter::once(folder.to_path_buf())
+        .chain(daily_folders.iter().cloned())
+        .chain(std::iter::once(state.local.data.daily_dir.clone()))
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())
+}
+
+/// One dataset's figures from a walk of its folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScanFigures {
+    listed: u64,
+    on_disk: u64,
+    latest_date: Option<String>,
+    current_count: u64,
+    bytes: u64,
+    state: &'static str,
+}
+
+/// Counts the files of `symbols` in `folder` (part files and anything else are not among
+/// them), their bytes, the latest last date, and how many reach `expected`; the state
+/// follows. An error is a folder that cannot be read.
+fn scan_dataset(
+    folder: &Path,
+    exchange: &str,
+    symbols: &[String],
+    expected: Option<ExpectedSession>,
+) -> Result<ScanFigures> {
+    let wanted: std::collections::HashSet<String> = symbols
+        .iter()
+        .map(|code| symbol_file_name(code, exchange))
+        .collect();
+    let entries = fs::read_dir(folder)
+        .with_context(|| format!("read the dataset folder {}", folder.display()))?;
+    let mut on_disk = 0u64;
+    let mut bytes = 0u64;
+    let mut current_count = 0u64;
+    let mut latest_date: Option<String> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !wanted.contains(name) {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_file() {
+            continue;
+        }
+        on_disk += 1;
+        bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if let Some(field) = last_csv_row_field(&entry.path()) {
+            if let Some(date) = csv_row_date(&field)
+                && latest_date
+                    .as_deref()
+                    .is_none_or(|latest| date.as_str() > latest)
+            {
+                latest_date = Some(date);
+            }
+            if expected.is_some_and(|expected| expected.reached_by(&field)) {
+                current_count += 1;
+            }
+        }
+    }
+    let listed = symbols.len() as u64;
+    let state = scan_state(listed, on_disk, current_count, expected.is_some());
+    Ok(ScanFigures {
+        listed,
+        on_disk,
+        latest_date,
+        current_count,
+        bytes,
+        state,
+    })
+}
+
+/// The BT-605 state of a scanned dataset: Unknown with nothing to judge against (no listing
+/// cached, no calendar to set the expected session), Stale when files exist but none reaches
+/// the expected session, Partial when files exist for under `COMPLETE_SHARE` of the listed
+/// symbols, else Current.
+fn scan_state(listed: u64, on_disk: u64, current_count: u64, judged: bool) -> &'static str {
+    if listed == 0 || !judged {
+        STATE_UNKNOWN
+    } else if on_disk > 0 && current_count == 0 {
+        STATE_STALE
+    } else if (on_disk as f64) < COMPLETE_SHARE * listed as f64 {
+        STATE_PARTIAL
+    } else {
+        STATE_CURRENT
+    }
+}
+
+/// Files and bytes under `dir`, symlinks not followed.
+fn count_files(dir: &Path) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_file() {
+                files += 1;
+                bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// The folders under `root` that no claimed folder is at or under, each with its file count
+/// and bytes; loose files directly under a visited folder count under that folder. A folder
+/// with a claimed folder deeper inside is walked, not counted.
+fn uncataloged_folders(root: &Path, claimed: &[PathBuf]) -> Vec<UncatalogedFolder> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut loose_files = 0u64;
+        let mut loose_bytes = 0u64;
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_file() {
+                loose_files += 1;
+                loose_bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if kind.is_dir() {
+                if claimed.iter().any(|c| c == &path) {
+                    continue;
+                }
+                if claimed.iter().any(|c| c.starts_with(&path)) {
+                    pending.push(path);
+                    continue;
+                }
+                let (files, bytes) = count_files(&path);
+                if files > 0 {
+                    found.push(UncatalogedFolder {
+                        folder: relative_to_root(root, &path),
+                        files,
+                        bytes,
+                    });
+                }
+            }
+        }
+        if loose_files > 0 {
+            found.push(UncatalogedFolder {
+                folder: if dir == root {
+                    ROOT_FOLDER.to_owned()
+                } else {
+                    relative_to_root(root, &dir)
+                },
+                files: loose_files,
+                bytes: loose_bytes,
+            });
+        }
+    }
+    found.sort_by(|a, b| a.folder.cmp(&b.folder));
+    found
+}
+
+/// Writes a dataset's figures from a scan that judged it.
+fn store_figures(
+    connection: &Connection,
+    dataset_id: &str,
+    scanned_at: &str,
+    figures: &ScanFigures,
+    uncataloged_json: &str,
+) -> Result<()> {
+    connection.execute(
+        "INSERT OR REPLACE INTO dataset_scans
+         (dataset_id, scanned_at, listed, on_disk, latest_date, current_count, bytes,
+          uncataloged_json, state, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            dataset_id,
+            scanned_at,
+            figures.listed as i64,
+            figures.on_disk as i64,
+            figures.latest_date,
+            figures.current_count as i64,
+            figures.bytes as i64,
+            uncataloged_json,
+            figures.state,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records a scan that could not judge a dataset (its folder missing, or unreadable): the
+/// state and the time move, the previous figures stay; a dataset never scanned gets zeros.
+fn keep_figures(
+    connection: &Connection,
+    dataset_id: &str,
+    scanned_at: &str,
+    state: &str,
+    uncataloged_json: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    let updated = connection.execute(
+        "UPDATE dataset_scans
+         SET scanned_at = ?2, state = ?3, uncataloged_json = ?4, error = ?5
+         WHERE dataset_id = ?1",
+        params![dataset_id, scanned_at, state, uncataloged_json, error],
+    )?;
+    if updated == 0 {
+        connection.execute(
+            "INSERT INTO dataset_scans
+             (dataset_id, scanned_at, listed, on_disk, latest_date, current_count, bytes,
+              uncataloged_json, state, error)
+             VALUES (?1, ?2, 0, 0, NULL, 0, 0, ?3, ?4, ?5)",
+            params![dataset_id, scanned_at, uncataloged_json, state, error],
+        )?;
+    }
+    Ok(())
+}
+
+/// The scan job for one source: reads the datasets and their listings under one short
+/// lock, walks the disk without it, and writes each dataset's row. A dataset whose root or
+/// folder is missing is Unavailable with its previous figures; one whose folder cannot be
+/// read is Failed with them and the reason.
+fn run_scan(state: &AppState, source_id: &str) -> Result<()> {
+    let (row, datasets, listings) = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        let row = connection
+            .query_row(
+                &format!("SELECT {SOURCE_COLUMNS} FROM data_sources WHERE id = ?1"),
+                [source_id],
+                map_source,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no source {source_id:?}"))?;
+        let datasets = load_datasets(&connection, source_id)?;
+        let listings = datasets
+            .iter()
+            .map(|dataset| listed_symbols(&connection, dataset))
+            .collect::<Result<Vec<_>>>()?;
+        (row, datasets, listings)
+    };
+    let root = Path::new(&row.root);
+    let root_exists = root.is_dir();
+    let mut claimed: Vec<PathBuf> = datasets
+        .iter()
+        .map(|dataset| PathBuf::from(&dataset.folder))
+        .collect();
+    claimed.push(PathBuf::from(&row.catalog_dir));
+    let uncataloged = if root_exists {
+        uncataloged_folders(root, &claimed)
+    } else {
+        Vec::new()
+    };
+    let uncataloged_json = serde_json::to_string(&uncataloged)?;
+    let daily_folders: Vec<PathBuf> = datasets
+        .iter()
+        .filter(|dataset| dataset.resolution == "daily")
+        .map(|dataset| PathBuf::from(&dataset.folder))
+        .collect();
+
+    let scanned_at = Utc::now().to_rfc3339();
+    for (dataset, symbols) in datasets.iter().zip(&listings) {
+        let folder = Path::new(&dataset.folder);
+        let outcome = if !root_exists || !folder.is_dir() {
+            Err(None)
+        } else {
+            let expected = calendar_file(state, folder, &daily_folders)
+                .and_then(|path| last_csv_row_date(&path))
+                .and_then(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok())
+                .map(|session| ExpectedSession::for_resolution(session, &dataset.resolution));
+            scan_dataset(folder, &dataset.exchange, symbols, expected)
+                .map_err(|error| Some(format!("{error:#}")))
+        };
+        let connection = state.database.lock().expect("database lock poisoned");
+        match outcome {
+            Ok(figures) => store_figures(
+                &connection,
+                &dataset.id,
+                &scanned_at,
+                &figures,
+                &uncataloged_json,
+            )?,
+            Err(None) => keep_figures(
+                &connection,
+                &dataset.id,
+                &scanned_at,
+                STATE_UNAVAILABLE,
+                &uncataloged_json,
+                None,
+            )?,
+            Err(Some(error)) => keep_figures(
+                &connection,
+                &dataset.id,
+                &scanned_at,
+                STATE_FAILED,
+                &uncataloged_json,
+                Some(&error),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// The card's view of the last scan: when it ran and the Uncataloged folders it found,
+/// from the newest dataset row.
+fn last_scan_of(
+    connection: &Connection,
+    source_id: &str,
+) -> Result<(Option<String>, Vec<UncatalogedFolder>)> {
+    let newest = connection
+        .query_row(
+            "SELECT s.scanned_at, s.uncataloged_json FROM dataset_scans s
+             JOIN datasets d ON d.id = s.dataset_id
+             WHERE d.source_id = ?1 ORDER BY s.scanned_at DESC LIMIT 1",
+            [source_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    Ok(match newest {
+        Some((scanned_at, json)) => (
+            Some(scanned_at),
+            serde_json::from_str(&json).unwrap_or_default(),
+        ),
+        None => (None, Vec::new()),
+    })
+}
+
+/// Whether a dataset holds data files: a file for any of its listed symbols; with no
+/// listing cached, any file in its folder (it cannot tell whose, so it is refused).
+fn dataset_holds_files(folder: &Path, exchange: &str, symbols: &[String]) -> bool {
+    if symbols.is_empty() {
+        return holds_files(folder);
+    }
+    symbols
+        .iter()
+        .any(|code| folder.join(symbol_file_name(code, exchange)).is_file())
+}
+
+fn validate_dataset_request(request: &CreateDatasetRequest) -> Result<()> {
+    if request.exchange.trim().is_empty() {
+        bail!("exchange is required");
+    }
+    if request.types.is_empty() || request.types.iter().any(|t| t.trim().is_empty()) {
+        bail!("at least one type is required");
+    }
+    if request.resolution.trim().is_empty() {
+        bail!("resolution is required");
+    }
+    if NaiveDate::parse_from_str(request.from_date.trim(), "%Y-%m-%d").is_err() {
+        bail!("from_date must be a date (YYYY-MM-DD)");
+    }
+    Ok(())
+}
+
+/// Registers a dataset against the cached availability: the exchange must be in the
+/// source's exchange list, the resolution among what the provider offers there, and every
+/// type in the exchange's cached listing (409 when that listing is not cached yet); a
+/// dataset of the source already covering one of the types on that exchange at that
+/// resolution is 409. 201 with the row, state Unknown until a scan runs.
+async fn create_dataset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<CreateDatasetRequest>,
+) -> Result<(StatusCode, Json<DatasetRow>), ApiError> {
+    let row = load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    validate_dataset_request(&request)?;
+    let exchange = request.exchange.trim().to_owned();
+    let resolution = request.resolution.trim().to_owned();
+    let mut types: Vec<String> = request.types.iter().map(|t| t.trim().to_owned()).collect();
+    types.sort();
+    types.dedup();
+    let from_date = request.from_date.trim().to_owned();
+    let include_delisted = request.include_delisted.unwrap_or(resolution == "daily");
+    let folder = match request.folder.as_deref().map(str::trim) {
+        Some(given) if !given.is_empty() => {
+            let path = Path::new(given);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                Path::new(&row.root).join(path)
+            }
+        }
+        _ => Path::new(&row.root).join(default_dataset_folder(&resolution)),
+    };
+    let folder = folder.display().to_string();
+
+    let now = Utc::now();
+    let dataset_id = format!("dataset-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        let resolutions: Option<String> = connection
+            .query_row(
+                "SELECT resolutions FROM provider_exchanges WHERE source_id = ?1 AND code = ?2",
+                params![id, exchange],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(resolutions) = resolutions else {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{} lists no exchange {exchange:?}; refresh the availability first",
+                    row.name
+                ),
+            ));
+        };
+        let offered: Vec<String> = serde_json::from_str(&resolutions).unwrap_or_default();
+        if !offered.contains(&resolution) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{exchange} offers no {resolution:?} bars; offered: {}",
+                    offered.join(", ")
+                ),
+            ));
+        }
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT type FROM provider_listings
+             WHERE source_id = ?1 AND exchange = ?2 ORDER BY type",
+        )?;
+        let cached: Vec<String> = statement
+            .query_map(params![id, exchange], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if cached.is_empty() {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("the listing of {exchange} is not cached; refresh it first"),
+            ));
+        }
+        if let Some(unknown) = types.iter().find(|t| !cached.contains(t)) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{exchange} lists no type {unknown:?}; cached: {}",
+                    cached.join(", ")
+                ),
+            ));
+        }
+        for existing in load_datasets(&connection, &id)? {
+            if existing.exchange != exchange || existing.resolution != resolution {
+                continue;
+            }
+            if let Some(shared) = types.iter().find(|t| existing.types.contains(t)) {
+                return Err(api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "dataset {} already covers {shared} on {exchange} at {resolution}",
+                        existing.id
+                    ),
+                ));
+            }
+        }
+        connection.execute(
+            "INSERT INTO datasets
+             (id, source_id, exchange, types_json, resolution, from_date, folder,
+              include_delisted, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                dataset_id,
+                id,
+                exchange,
+                serde_json::to_string(&types)?,
+                resolution,
+                from_date,
+                folder,
+                include_delisted,
+                now.to_rfc3339(),
+            ],
+        )?;
+    }
+    let dataset = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        load_dataset(&connection, &dataset_id)?
+            .ok_or_else(|| anyhow::anyhow!("dataset {dataset_id:?} was not recorded"))?
+    };
+    Ok((StatusCode::CREATED, Json(dataset)))
+}
+
+/// Removes a dataset's registration and its scan row. Refused while a file exists for any
+/// of its listed symbols: files are never deleted (decision 0022). 200 with the source card.
+async fn delete_dataset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<SourceCard>, ApiError> {
+    let (dataset, symbols) = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        let dataset = load_dataset(&connection, &id)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no dataset {id:?}")))?;
+        let symbols = listed_symbols(&connection, &dataset)?;
+        (dataset, symbols)
+    };
+    let folder = PathBuf::from(&dataset.folder);
+    let exchange = dataset.exchange.clone();
+    let occupied =
+        tokio::task::spawn_blocking(move || dataset_holds_files(&folder, &exchange, &symbols))
+            .await
+            .context("dataset check failed")?;
+    if occupied {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "dataset {} still has files under {}; the console never deletes data files",
+                dataset.id, dataset.folder
+            ),
+        ));
+    }
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute("DELETE FROM datasets WHERE id = ?1", [&id])?;
+    }
+    Ok(Json(load_source_card(&state, &dataset.source_id)?))
+}
+
+/// Starts the source's scan job in the background: 202 at once, the card says `scanning`
+/// until the job has written every dataset's row. 409 while a scan of the source runs.
+async fn scan_source(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(StatusCode, Json<ScanAccepted>), ApiError> {
+    let row = load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    {
+        let mut scans = state.scans.lock().expect("scan set poisoned");
+        if !scans.insert(id.clone()) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                format!("a scan of source {:?} is already running", row.name),
+            ));
+        }
+    }
+    let worker = state.clone();
+    let source_id = id.clone();
+    tokio::spawn(async move {
+        let inner = worker.clone();
+        let scanned = source_id.clone();
+        match tokio::task::spawn_blocking(move || run_scan(&inner, &scanned)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("scan of source {source_id} failed: {error:#}"),
+            Err(error) => eprintln!("scan of source {source_id} panicked: {error}"),
+        }
+        worker
+            .scans
+            .lock()
+            .expect("scan set poisoned")
+            .remove(&source_id);
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ScanAccepted {
+            source_id: id,
+            scanning: true,
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -8093,8 +9041,8 @@ mod tests {
             json_response(StatusCode::OK, fixture("exchanges-list"))
         }
 
-        /// US answers DS-02's recorded list, LSE two rows of its own, anything else the
-        /// provider's 404.
+        /// US answers DS-02's recorded list, and two delisted rows with `delisted=1`; LSE two
+        /// rows of its own and no delisted ones; anything else the provider's 404.
         async fn stub_symbols(
             State(stub): State<Stub>,
             AxumPath(exchange): AxumPath<String>,
@@ -8103,14 +9051,22 @@ mod tests {
             if let Some(refused) = gate(&stub, &query) {
                 return refused;
             }
-            match exchange.as_str() {
-                "US" => json_response(StatusCode::OK, fixture("exchange-symbol-list-US")),
-                "LSE" => json_response(
+            let delisted = query.iter().any(|(k, v)| k == "delisted" && v == "1");
+            match (exchange.as_str(), delisted) {
+                ("US", false) => json_response(StatusCode::OK, fixture("exchange-symbol-list-US")),
+                ("US", true) => json_response(
+                    StatusCode::OK,
+                    r#"[{"Code":"YHOO","Name":"Yahoo Inc","Type":"Common Stock","Currency":"USD"},
+                        {"Code":"TWTR","Name":"Twitter Inc","Type":"Common Stock","Currency":"USD"}]"#
+                        .to_owned(),
+                ),
+                ("LSE", false) => json_response(
                     StatusCode::OK,
                     r#"[{"Code":"VOD","Name":"Vodafone Group","Type":"Common Stock","Currency":"GBP"},
                         {"Code":"ISF","Name":"iShares Core FTSE 100","Type":"ETF","Currency":"GBP"}]"#
                         .to_owned(),
                 ),
+                ("LSE", true) => json_response(StatusCode::OK, "[]".to_owned()),
                 _ => json_response(
                     StatusCode::NOT_FOUND,
                     r#"{"message":"Unknown exchange"}"#.to_owned(),
@@ -8152,6 +9108,7 @@ mod tests {
                 sdk_manifests: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 data_sources: Arc::new(Mutex::new(None)),
                 eodhd_base_url: Arc::new(eodhd_base_url.to_owned()),
+                scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
             }
         }
 
@@ -8484,6 +9441,8 @@ mod tests {
                 ])
             );
             let us_listed_at = us["listings_fetched_at"].as_str().unwrap().to_owned();
+            assert_eq!(us["delisted"], 0, "{us}");
+            assert!(us["delisted_fetched_at"].is_null(), "{us}");
             let lse = exchanges.iter().find(|e| e["code"] == "LSE").unwrap();
             assert_eq!(lse["country"], "UK");
             assert_eq!(lse["resolutions"], serde_json::json!(["daily", "1h", "5m"]));
@@ -8535,20 +9494,18 @@ mod tests {
             assert_eq!(body["exchanges"], first["exchanges"]);
 
             // Back up, a refresh with no exchange named fetches the listings of the exchanges
-            // with a dataset (DS-05's table, read when it exists) and clears the note; the US
-            // listing stays as it was fetched.
+            // with a dataset (DS-05's table; this one excludes delisted symbols, so only the
+            // active listing is asked for) and clears the note; the US listing stays as it
+            // was fetched.
             down.store(false, Ordering::SeqCst);
             {
                 let connection = state.database.lock().unwrap();
                 connection
-                    .execute_batch(
-                        "CREATE TABLE datasets (id TEXT PRIMARY KEY, source_id TEXT NOT NULL,
-                                                exchange TEXT NOT NULL);",
-                    )
-                    .unwrap();
-                connection
                     .execute(
-                        "INSERT INTO datasets (id, source_id, exchange) VALUES ('d1', ?1, 'LSE')",
+                        "INSERT INTO datasets (id, source_id, exchange, types_json, resolution,
+                                               from_date, folder, include_delisted, created_at)
+                         VALUES ('d1', ?1, 'LSE', '[\"Common Stock\"]', 'daily', '2020-01-01',
+                                 '/nonexistent/tessera-ds04/eod', 0, 't0')",
                         [&id],
                     )
                     .unwrap();
@@ -8568,6 +9525,8 @@ mod tests {
                     { "type": "ETF", "count": 1 }
                 ])
             );
+            assert_eq!(lse["delisted"], 0, "{lse}");
+            assert!(lse["delisted_fetched_at"].is_null(), "{lse}");
             let us = exchanges.iter().find(|e| e["code"] == "US").unwrap();
             assert_eq!(us["listed"], 3);
             assert_eq!(us["listings_fetched_at"], us_listed_at.as_str());
@@ -8579,12 +9538,13 @@ mod tests {
             assert_eq!(status, StatusCode::CONFLICT, "{text}");
             responses.push(("POST refresh no token".into(), text));
 
-            // The cache goes with its source.
+            // The cache goes with its source, and so does the dataset.
             let (status, _, text) = call(client.delete(format!("{api}/api/sources/{id}"))).await;
             assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
             assert_eq!(table_count(&state, "provider_exchanges"), 0);
             assert_eq!(table_count(&state, "provider_listings"), 0);
             assert_eq!(table_count(&state, "provider_refreshes"), 0);
+            assert_eq!(table_count(&state, "datasets"), 0);
             let (status, _, _) = call(client.get(&availability)).await;
             assert_eq!(status, StatusCode::NOT_FOUND);
 
@@ -8596,9 +9556,9 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
         }
 
-        /// The catalog side of DS-04 without a server: the dataset lookup reads DS-05's table
-        /// only once it exists, listings count per type largest first, and an exchange with
-        /// no cached listing has no time and no types.
+        /// The catalog side of DS-04 without a server: the dataset lookup names each exchange
+        /// with a dataset and whether one includes delisted symbols, listings count per type
+        /// largest first, and an exchange with no cached listing has no time and no types.
         #[test]
         fn the_cached_table_counts_each_exchanges_listing_by_type() {
             let mut connection = Connection::open_in_memory().unwrap();
@@ -8617,14 +9577,19 @@ mod tests {
             );
             connection
                 .execute_batch(
-                    "CREATE TABLE datasets (id TEXT PRIMARY KEY, source_id TEXT, exchange TEXT);
-                     INSERT INTO datasets VALUES ('d1', 's1', 'US'), ('d2', 's1', 'LSE'),
-                                                 ('d3', 's1', 'US'), ('d4', 'other', 'CC');",
+                    "INSERT INTO data_sources (id, name, kind, root, catalog_dir, created_at)
+                     VALUES ('other', 'Other', 'eodhd', '/tmp/y', '/tmp/y/catalog', 't0');
+                     INSERT INTO datasets (id, source_id, exchange, types_json, resolution,
+                                           from_date, folder, include_delisted, created_at)
+                     VALUES ('d1', 's1', 'US', '[]', 'daily', '2020-01-01', '/tmp/x/eod', 1, 't0'),
+                            ('d2', 's1', 'LSE', '[]', 'daily', '2020-01-01', '/tmp/x/eod', 0, 't0'),
+                            ('d3', 's1', 'US', '[]', '5m', '2020-01-01', '/tmp/x/5m', 0, 't0'),
+                            ('d4', 'other', 'CC', '[]', 'daily', '2020-01-01', '/tmp/y/eod', 0, 't0');",
                 )
                 .unwrap();
             assert_eq!(
                 exchanges_with_datasets(&connection, "s1").unwrap(),
-                ["LSE", "US"]
+                [("LSE".to_owned(), false), ("US".to_owned(), true)]
             );
 
             let empty = load_availability(&connection, "s1").unwrap();
@@ -8693,9 +9658,17 @@ mod tests {
                 .map(|t| (t.kind.as_str(), t.count))
                 .collect();
             assert_eq!(types, [("Common Stock", 2), ("ETF", 1), ("Fund", 1)]);
+            assert_eq!(
+                (us.delisted, us.delisted_fetched_at.as_deref()),
+                (1, Some("t2"))
+            );
             let lse = &table.exchanges[0];
             assert_eq!((lse.listed, lse.listings_fetched_at.as_deref()), (0, None));
             assert!(lse.types.is_empty());
+            assert_eq!(
+                (lse.delisted, lse.delisted_fetched_at.as_deref()),
+                (0, None)
+            );
 
             // A second fetch of the same listing replaces it; a failed attempt only notes.
             store_listings(
@@ -9068,6 +10041,626 @@ mod tests {
                 assert_eq!(usage.available_calls, 9);
                 assert_eq!(usage.resets_at, "2026-09-13T00:00:00+00:00");
                 assert_eq!(usage.checked_at, "2026-09-12T01:02:03+00:00");
+            }
+        }
+
+        /// DS-05 (decisions 0012, 0013, 0021): a dataset is registered against the cached
+        /// listing, a scan in the background writes its figures and the Uncataloged folders,
+        /// a folder that goes missing leaves the figures with the state Unavailable, and
+        /// neither a dataset nor a source is removed while its files are on disk.
+        mod datasets {
+            use super::*;
+
+            /// A service whose calendar symbol is SPY.US with its daily folder under
+            /// `library`, so a scan's expected session comes from the files the test writes.
+            fn test_state_over(root: &Path, eodhd_base_url: &str, library: &Path) -> AppState {
+                let state = test_state(root, eodhd_base_url);
+                let mut local = LocalConfig::bundled_example(Path::new(env!("CARGO_MANIFEST_DIR")));
+                local.data.calendar_symbol = "SPY.US".to_owned();
+                local.data.daily_dir = library.join("eod");
+                AppState {
+                    local: Arc::new(local),
+                    ..state
+                }
+            }
+
+            /// Polls the cards until no scan of `id` is running and returns its card.
+            async fn settled_card(
+                client: &reqwest::Client,
+                api: &str,
+                id: &str,
+            ) -> serde_json::Value {
+                for _ in 0..200 {
+                    let (status, list, text) = call(client.get(format!("{api}/api/sources"))).await;
+                    assert_eq!(status, StatusCode::OK, "{text}");
+                    let card = list["sources"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|card| card["id"] == id)
+                        .cloned()
+                        .expect("the source is listed");
+                    if card["scanning"] == false {
+                        return card;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the scan of {id} did not finish");
+            }
+
+            fn dataset_count(state: &AppState) -> i64 {
+                table_count(state, "datasets")
+            }
+
+            #[tokio::test]
+            async fn datasets_are_scanned_in_the_background_and_the_figures_outlive_a_missing_folder()
+             {
+                let (eodhd, down) = stub().await;
+                let root = scratch_root("datasets");
+                let library = root.join("library");
+                let eod = library.join("eod");
+                fs::create_dir_all(&eod).unwrap();
+                fs::create_dir_all(library.join("catalog")).unwrap();
+                fs::write(library.join("catalog/catalog.csv"), "Code,Name\nSPY,SPDR\n").unwrap();
+                let state = test_state_over(&root, &eodhd, &library);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+                let secrets_path = root.join("data/ui/secrets").display().to_string();
+                let leaks = [TOKEN, secrets_path.as_str(), "data/ui/secrets"];
+                let mut responses: Vec<(String, String)> = Vec::new();
+
+                let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                    &serde_json::json!({
+                        "kind": "eodhd", "name": "EODHD", "root": library,
+                        "catalog_dir": library.join("catalog"), "token": TOKEN
+                    }),
+                ))
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                responses.push(("POST source".into(), text));
+                let id = card["id"].as_str().unwrap().to_owned();
+                assert_eq!(card["datasets"], serde_json::json!([]));
+                assert_eq!(card["uncataloged"], serde_json::json!([]));
+                assert!(
+                    card["scanned_at"].is_null() && card["scanning"] == false,
+                    "{card}"
+                );
+
+                // A second source over the same root is refused before the provider is asked.
+                down.store(true, Ordering::SeqCst);
+                let (status, _, text) = call(client.post(format!("{api}/api/sources")).json(
+                    &serde_json::json!({
+                        "kind": "eodhd", "name": "Again", "root": format!("{}/", library.display()),
+                        "catalog_dir": library.join("catalog"), "token": TOKEN
+                    }),
+                ))
+                .await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains("EODHD"), "{text}");
+                responses.push(("POST same root".into(), text));
+                down.store(false, Ordering::SeqCst);
+                assert_eq!(source_count(&state), 1);
+
+                // The refresh with the delisted flag caches the two delisted rows apart: the
+                // listing of five symbols the dataset counts against.
+                let availability = format!("{api}/api/sources/{id}/availability");
+                let (status, table, text) = call(
+                    client
+                        .post(format!("{availability}/refresh"))
+                        .json(&serde_json::json!({ "exchange": "US", "delisted": true })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                responses.push(("POST refresh delisted".into(), text));
+                let us = table["exchanges"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["code"] == "US")
+                    .unwrap()
+                    .clone();
+                assert_eq!(us["listed"], 3, "{us}");
+                assert_eq!(us["delisted"], 2, "{us}");
+                assert!(us["delisted_fetched_at"].is_string(), "{us}");
+                assert_eq!(table_count(&state, "provider_listings"), 5);
+
+                // Registration is validated against the cache.
+                let datasets = format!("{api}/api/sources/{id}/datasets");
+                let body = |exchange: &str, types: &[&str], resolution: &str| {
+                    serde_json::json!({
+                        "exchange": exchange, "types": types, "resolution": resolution,
+                        "from_date": "2020-01-01"
+                    })
+                };
+                for (label, request, expected, note) in [
+                    (
+                        "unknown exchange",
+                        body("MARS", &["ETF"], "daily"),
+                        StatusCode::BAD_REQUEST,
+                        "MARS",
+                    ),
+                    (
+                        "resolution not offered",
+                        body("US", &["ETF"], "1s"),
+                        StatusCode::BAD_REQUEST,
+                        "1s",
+                    ),
+                    (
+                        "listing not cached",
+                        body("LSE", &["ETF"], "daily"),
+                        StatusCode::CONFLICT,
+                        "LSE",
+                    ),
+                    (
+                        "unknown type",
+                        body("US", &["Bond"], "daily"),
+                        StatusCode::BAD_REQUEST,
+                        "Bond",
+                    ),
+                    (
+                        "bad date",
+                        serde_json::json!({"exchange": "US", "types": ["ETF"], "resolution": "daily", "from_date": "yesterday"}),
+                        StatusCode::BAD_REQUEST,
+                        "from_date",
+                    ),
+                    (
+                        "no types",
+                        serde_json::json!({"exchange": "US", "types": [], "resolution": "daily", "from_date": "2020-01-01"}),
+                        StatusCode::BAD_REQUEST,
+                        "type",
+                    ),
+                ] {
+                    let (status, _, text) = call(client.post(&datasets).json(&request)).await;
+                    assert_eq!(status, expected, "{label}: {text}");
+                    assert!(text.contains(note), "{label}: {text}");
+                    responses.push((format!("POST dataset {label}"), text));
+                }
+                assert_eq!(dataset_count(&state), 0);
+                let (status, _, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/nope/datasets"))
+                        .json(&body("US", &["ETF"], "daily")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+
+                // A US EOD dataset of both types: the folder defaults to <root>/eod and delisted
+                // symbols are included for daily bars.
+                let (status, dataset, text) = call(client.post(&datasets).json(&body(
+                    "US",
+                    &["ETF", "Common Stock"],
+                    "daily",
+                )))
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                responses.push(("POST dataset".into(), text));
+                let dataset_id = dataset["id"].as_str().unwrap().to_owned();
+                assert_eq!(dataset["source_id"], id.as_str());
+                assert_eq!(dataset["exchange"], "US");
+                assert_eq!(dataset["types"], serde_json::json!(["Common Stock", "ETF"]));
+                assert_eq!(dataset["resolution"], "daily");
+                assert_eq!(dataset["from_date"], "2020-01-01");
+                assert_eq!(dataset["folder"], eod.display().to_string().as_str());
+                assert_eq!(dataset["include_delisted"], true);
+                assert_eq!(dataset["state"], "Unknown");
+                assert!(dataset["scan"].is_null(), "{dataset}");
+
+                // A dataset already covering a type on that exchange and resolution is refused;
+                // the same type at another resolution is not.
+                let (status, _, text) =
+                    call(client.post(&datasets).json(&body("US", &["ETF"], "daily"))).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains(&dataset_id), "{text}");
+                responses.push(("POST dataset overlap".into(), text));
+                let (status, intraday, text) =
+                    call(client.post(&datasets).json(&serde_json::json!({
+                        "exchange": "US", "types": ["ETF"], "resolution": "5m",
+                        "from_date": "2024-01-01", "folder": "bars/5m"
+                    })))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                responses.push(("POST dataset 5m".into(), text));
+                let intraday_id = intraday["id"].as_str().unwrap().to_owned();
+                assert_eq!(
+                    intraday["folder"],
+                    library.join("bars/5m").display().to_string().as_str()
+                );
+                assert_eq!(intraday["include_delisted"], false);
+                assert_eq!(dataset_count(&state), 2);
+
+                // The card lists both, unscanned.
+                let (_, list, text) = call(client.get(format!("{api}/api/sources"))).await;
+                responses.push(("GET sources unscanned".into(), text));
+                let card = &list["sources"][0];
+                assert_eq!(card["datasets"].as_array().unwrap().len(), 2);
+                assert_eq!(card["datasets"][0]["id"], dataset_id.as_str());
+                assert_eq!(card["datasets"][0]["state"], "Unknown");
+                assert!(card["scanned_at"].is_null(), "{card}");
+
+                // Three listed files, one part file, a stray folder, a loose file at the root.
+                let files = [
+                    ("AAPL.US.csv", "Date,Close\n2026-09-10,1\n2026-09-11,2\n"),
+                    (
+                        "SPY.US.csv",
+                        "Date,Close\n2026-09-09,1\n2026-09-10,2\n2026-09-11,3\n",
+                    ),
+                    ("BRK-B.US.csv", "Date,Close\n2026-09-09,1\n2026-09-10,2\n\n"),
+                ];
+                let mut bytes = 0u64;
+                for (name, text) in files {
+                    fs::write(eod.join(name), text).unwrap();
+                    bytes += text.len() as u64;
+                }
+                fs::write(eod.join("YHOO.US.csv.part"), "Date,Close\n2026-09-11,1\n").unwrap();
+                fs::create_dir_all(library.join("stray/sub")).unwrap();
+                fs::write(library.join("stray/a.csv"), "a").unwrap();
+                fs::write(library.join("stray/sub/b.csv"), "bb").unwrap();
+                fs::write(library.join("README.txt"), "notes").unwrap();
+
+                // The scan is accepted at once and runs in the background.
+                let (status, accepted, text) =
+                    call(client.post(format!("{api}/api/sources/{id}/scan"))).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+                responses.push(("POST scan".into(), text));
+                assert_eq!(accepted["source_id"], id.as_str());
+                assert_eq!(accepted["scanning"], true);
+                let (status, _, text) =
+                    call(client.post(format!("{api}/api/sources/nope/scan"))).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+                let card = settled_card(&client, &api, &id).await;
+                responses.push(("GET sources scanned".into(), card.to_string()));
+                let scanned_at = card["scanned_at"].as_str().unwrap().to_owned();
+                let daily = &card["datasets"][0];
+                assert_eq!(daily["state"], "Partial", "{daily}");
+                let scan = &daily["scan"];
+                assert_eq!(scan["listed"], 5, "{scan}");
+                assert_eq!(scan["on_disk"], 3, "{scan}");
+                assert_eq!(scan["latest_date"], "2026-09-11", "{scan}");
+                assert_eq!(scan["current_count"], 2, "{scan}");
+                assert_eq!(scan["bytes"], bytes, "{scan}");
+                assert_eq!(scan["scanned_at"], scanned_at.as_str());
+                assert!(scan["error"].is_null(), "{scan}");
+                assert_eq!(
+                    card["uncataloged"],
+                    serde_json::json!([
+                        { "folder": ".", "files": 1, "bytes": 5 },
+                        { "folder": "stray", "files": 2, "bytes": 3 }
+                    ]),
+                    "{card}"
+                );
+                // The 5m dataset's folder does not exist: Unavailable with nothing counted.
+                let intraday = &card["datasets"][1];
+                assert_eq!(intraday["state"], "Unavailable", "{intraday}");
+                assert_eq!(intraday["scan"]["on_disk"], 0);
+                assert_eq!(intraday["scan"]["scanned_at"], scanned_at.as_str());
+
+                // Neither the dataset nor the source goes while the files are there.
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/datasets/{dataset_id}"))).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains("never deletes"), "{text}");
+                responses.push(("DELETE dataset refused".into(), text));
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/sources/{id}"))).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                responses.push(("DELETE source refused".into(), text));
+                assert_eq!(dataset_count(&state), 2);
+                assert_eq!(source_count(&state), 1);
+
+                // With the folder gone, a rescan says Unavailable and keeps the figures.
+                fs::remove_dir_all(&eod).unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let (status, _, text) =
+                    call(client.post(format!("{api}/api/sources/{id}/scan"))).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+                let card = settled_card(&client, &api, &id).await;
+                responses.push(("GET sources rescanned".into(), card.to_string()));
+                let rescanned_at = card["scanned_at"].as_str().unwrap().to_owned();
+                assert!(rescanned_at > scanned_at, "{rescanned_at} <= {scanned_at}");
+                let daily = &card["datasets"][0];
+                assert_eq!(daily["state"], "Unavailable", "{daily}");
+                let scan = &daily["scan"];
+                assert_eq!(scan["scanned_at"], rescanned_at.as_str());
+                assert_eq!(scan["listed"], 5, "{scan}");
+                assert_eq!(scan["on_disk"], 3, "{scan}");
+                assert_eq!(scan["latest_date"], "2026-09-11", "{scan}");
+                assert_eq!(scan["current_count"], 2, "{scan}");
+                assert_eq!(scan["bytes"], bytes, "{scan}");
+                assert!(scan["error"].is_null(), "{scan}");
+                assert_eq!(card["uncataloged"].as_array().unwrap().len(), 2, "{card}");
+
+                // Without files the dataset goes, and the card comes back without it.
+                let (status, card, text) =
+                    call(client.delete(format!("{api}/api/datasets/{dataset_id}"))).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                responses.push(("DELETE dataset".into(), text));
+                assert_eq!(card["id"], id.as_str());
+                assert_eq!(card["datasets"].as_array().unwrap().len(), 1);
+                assert_eq!(card["datasets"][0]["id"], intraday_id.as_str());
+                assert_eq!(dataset_count(&state), 1);
+                assert_eq!(table_count(&state, "dataset_scans"), 1);
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/datasets/{dataset_id}"))).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+
+                // The source's guard is its dataset folders, not the root: the stray files
+                // do not hold it, and its dataset and scan go with it.
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/sources/{id}"))).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+                assert_eq!(source_count(&state), 0);
+                assert_eq!(dataset_count(&state), 0);
+                assert_eq!(table_count(&state, "dataset_scans"), 0);
+                assert!(
+                    library.join("stray/a.csv").is_file(),
+                    "a data file was deleted"
+                );
+
+                for (label, body) in &responses {
+                    for leak in &leaks {
+                        assert!(!body.contains(leak), "{label} carries {leak:?}: {body}");
+                    }
+                }
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn the_state_follows_the_listing_the_files_and_the_expected_session() {
+                assert_eq!(scan_state(0, 0, 0, true), STATE_UNKNOWN);
+                assert_eq!(scan_state(5, 5, 5, false), STATE_UNKNOWN);
+                assert_eq!(scan_state(5, 0, 0, true), STATE_PARTIAL);
+                assert_eq!(scan_state(5, 3, 2, true), STATE_PARTIAL);
+                assert_eq!(scan_state(5, 3, 0, true), STATE_STALE);
+                assert_eq!(scan_state(100, 94, 90, true), STATE_PARTIAL);
+                assert_eq!(scan_state(100, 95, 1, true), STATE_CURRENT);
+                assert_eq!(scan_state(100, 100, 100, true), STATE_CURRENT);
+                assert_eq!(scan_state(100, 100, 0, true), STATE_STALE);
+            }
+
+            #[test]
+            fn the_expected_session_is_a_date_for_daily_bars_and_the_close_for_intraday() {
+                let session = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+                let daily = ExpectedSession::for_resolution(session, "daily");
+                assert_eq!(daily, ExpectedSession::Date(session));
+                assert!(daily.reached_by("2026-09-11"));
+                assert!(daily.reached_by("2026-09-14"));
+                assert!(!daily.reached_by("2026-09-10"));
+                assert!(!daily.reached_by("Date"));
+
+                // 2026-09-11 16:00 in New York is 20:00 UTC (EDT), epoch 1789156800.
+                let close = 1_789_156_800;
+                let five = ExpectedSession::for_resolution(session, "5m");
+                assert_eq!(
+                    five,
+                    ExpectedSession::Close {
+                        session,
+                        epoch: close - 300
+                    }
+                );
+                assert!(five.reached_by(&(close - 300).to_string()));
+                assert!(!five.reached_by(&(close - 600).to_string()));
+                assert!(
+                    five.reached_by("2026-09-11"),
+                    "a dated row falls back to the session"
+                );
+                assert!(!five.reached_by("2026-09-10"));
+                let hourly = ExpectedSession::for_resolution(session, "1h");
+                assert_eq!(
+                    hourly,
+                    ExpectedSession::Close {
+                        session,
+                        epoch: close - 3600
+                    }
+                );
+                assert_eq!(bar_seconds("1m"), Some(60));
+                assert_eq!(bar_seconds("daily"), None);
+                assert_eq!(bar_seconds(""), None);
+                assert_eq!(default_dataset_folder("daily"), "eod");
+                assert_eq!(default_dataset_folder("5m"), "5m");
+                assert_eq!(symbol_file_name("BRK-B", "US"), "BRK-B.US.csv");
+            }
+
+            #[test]
+            fn the_last_row_field_is_tail_read_past_blank_lines() {
+                let root = scratch_root("tail");
+                fs::create_dir_all(&root).unwrap();
+                let daily = root.join("d.csv");
+                fs::write(&daily, "Date,Close\n2026-09-10,1\n2026-09-11,2\n\n\n").unwrap();
+                assert_eq!(last_csv_row_field(&daily).as_deref(), Some("2026-09-11"));
+                assert_eq!(last_csv_row_date(&daily).as_deref(), Some("2026-09-11"));
+                let intraday = root.join("i.csv");
+                fs::write(&intraday, "Timestamp,Close\n1789156500,1\n").unwrap();
+                assert_eq!(last_csv_row_field(&intraday).as_deref(), Some("1789156500"));
+                assert_eq!(last_csv_row_date(&intraday).as_deref(), Some("2026-09-11"));
+                let empty = root.join("e.csv");
+                fs::write(&empty, "").unwrap();
+                assert_eq!(last_csv_row_field(&empty), None);
+                assert_eq!(last_csv_row_field(&root.join("missing.csv")), None);
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn uncataloged_folders_skip_claimed_ones_and_walk_into_those_above_them() {
+                let root = scratch_root("uncataloged");
+                for dir in ["eod", "us/5m", "us/1m", "stray/sub", "empty", "catalog"] {
+                    fs::create_dir_all(root.join(dir)).unwrap();
+                }
+                fs::write(root.join("eod/SPY.US.csv"), "1").unwrap();
+                fs::write(root.join("us/5m/SPY.US.csv"), "22").unwrap();
+                fs::write(root.join("us/1m/SPY.US.csv"), "333").unwrap();
+                fs::write(root.join("us/notes.txt"), "4444").unwrap();
+                fs::write(root.join("stray/a.csv"), "1").unwrap();
+                fs::write(root.join("stray/sub/b.csv"), "22").unwrap();
+                fs::write(root.join("catalog/catalog.csv"), "c").unwrap();
+                fs::write(root.join("loose.txt"), "55555").unwrap();
+                let claimed = [root.join("eod"), root.join("us/5m"), root.join("catalog")];
+                let found = uncataloged_folders(&root, &claimed);
+                let rows: Vec<(&str, u64, u64)> = found
+                    .iter()
+                    .map(|f| (f.folder.as_str(), f.files, f.bytes))
+                    .collect();
+                assert_eq!(
+                    rows,
+                    [(".", 1, 5), ("stray", 2, 3), ("us", 1, 4), ("us/1m", 1, 3)]
+                );
+                assert!(uncataloged_folders(&root.join("missing"), &claimed).is_empty());
+                assert_eq!(count_files(&root.join("stray")), (2, 3));
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_scan_counts_only_the_listed_files_and_reads_their_last_dates() {
+                let root = scratch_root("scan");
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("AAPL.US.csv"), "Date,Close\n2026-09-11,1\n").unwrap();
+                fs::write(root.join("SPY.US.csv"), "Date,Close\n2026-09-10,1\n").unwrap();
+                fs::write(root.join("SPY.US.csv.part"), "Date,Close\n2026-09-11,1\n").unwrap();
+                fs::write(root.join("ZZZ.US.csv"), "Date,Close\n2026-09-12,1\n").unwrap();
+                let symbols: Vec<String> = ["AAPL", "SPY", "MSFT"].map(String::from).to_vec();
+                let session = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+                let figures =
+                    scan_dataset(&root, "US", &symbols, Some(ExpectedSession::Date(session)))
+                        .unwrap();
+                assert_eq!(
+                    figures,
+                    ScanFigures {
+                        listed: 3,
+                        on_disk: 2,
+                        latest_date: Some("2026-09-11".into()),
+                        current_count: 1,
+                        bytes: 2 * "Date,Close\n2026-09-11,1\n".len() as u64,
+                        state: STATE_PARTIAL,
+                    }
+                );
+                let unjudged = scan_dataset(&root, "US", &symbols, None).unwrap();
+                assert_eq!((unjudged.current_count, unjudged.state), (0, STATE_UNKNOWN));
+                assert!(scan_dataset(&root.join("missing"), "US", &symbols, None).is_err());
+                assert!(dataset_holds_files(&root, "US", &symbols));
+                assert!(!dataset_holds_files(&root, "US", &["MSFT".to_owned()]));
+                assert!(
+                    dataset_holds_files(&root, "US", &[]),
+                    "no listing: any file holds"
+                );
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_scan_that_cannot_judge_keeps_the_previous_figures() {
+                let connection = Connection::open_in_memory().unwrap();
+                migrate(&connection).unwrap();
+                connection
+                    .execute_batch(
+                        "INSERT INTO data_sources (id, name, kind, root, catalog_dir, created_at)
+                         VALUES ('s1', 'EODHD', 'eodhd', '/tmp/x', '/tmp/x/catalog', 't0');
+                         INSERT INTO datasets (id, source_id, exchange, types_json, resolution,
+                                               from_date, folder, include_delisted, created_at)
+                         VALUES ('d1', 's1', 'US', '[\"ETF\"]', 'daily', '2020-01-01',
+                                 '/tmp/x/eod', 1, 't0'),
+                                ('d2', 's1', 'US', '[\"ETF\"]', '5m', '2020-01-01',
+                                 '/tmp/x/5m', 0, 't1');",
+                    )
+                    .unwrap();
+                let figures = ScanFigures {
+                    listed: 5,
+                    on_disk: 3,
+                    latest_date: Some("2026-09-11".into()),
+                    current_count: 2,
+                    bytes: 90,
+                    state: STATE_PARTIAL,
+                };
+                store_figures(&connection, "d1", "t2", &figures, "[]").unwrap();
+                keep_figures(&connection, "d2", "t2", STATE_UNAVAILABLE, "[]", None).unwrap();
+                let rows = load_datasets(&connection, "s1").unwrap();
+                assert_eq!(rows.len(), 2);
+                let d1 = rows[0].scan.as_ref().unwrap();
+                assert_eq!(
+                    (rows[0].state.as_str(), d1.listed, d1.on_disk),
+                    ("Partial", 5, 3)
+                );
+                assert_eq!(d1.latest_date.as_deref(), Some("2026-09-11"));
+                assert_eq!(
+                    (d1.current_count, d1.bytes, d1.scanned_at.as_str()),
+                    (2, 90, "t2")
+                );
+                let d2 = rows[1].scan.as_ref().unwrap();
+                assert_eq!(rows[1].state, "Unavailable");
+                assert_eq!(
+                    (d2.listed, d2.on_disk, d2.bytes, d2.scanned_at.as_str()),
+                    (0, 0, 0, "t2")
+                );
+                assert!(d2.latest_date.is_none() && d2.error.is_none());
+
+                // A later scan that fails keeps d1's figures, moves the time, and says why; the
+                // Uncataloged folders travel with the newest row.
+                let stray = r#"[{"folder":"stray","files":2,"bytes":3}]"#;
+                keep_figures(
+                    &connection,
+                    "d1",
+                    "t3",
+                    STATE_FAILED,
+                    stray,
+                    Some("read the dataset folder: denied"),
+                )
+                .unwrap();
+                let rows = load_datasets(&connection, "s1").unwrap();
+                let d1 = rows[0].scan.as_ref().unwrap();
+                assert_eq!(rows[0].state, "Failed");
+                assert_eq!(
+                    (d1.listed, d1.on_disk, d1.current_count, d1.bytes),
+                    (5, 3, 2, 90)
+                );
+                assert_eq!(d1.latest_date.as_deref(), Some("2026-09-11"));
+                assert_eq!(d1.scanned_at, "t3");
+                assert_eq!(d1.error.as_deref(), Some("read the dataset folder: denied"));
+                let (scanned_at, uncataloged) = last_scan_of(&connection, "s1").unwrap();
+                assert_eq!(scanned_at.as_deref(), Some("t3"));
+                assert_eq!(
+                    uncataloged,
+                    [UncatalogedFolder {
+                        folder: "stray".into(),
+                        files: 2,
+                        bytes: 3
+                    }]
+                );
+                assert_eq!(
+                    last_scan_of(&connection, "nobody").unwrap(),
+                    (None, Vec::new())
+                );
+
+                // A scan that judges again replaces the row whole, error cleared.
+                store_figures(
+                    &connection,
+                    "d1",
+                    "t4",
+                    &ScanFigures {
+                        state: STATE_CURRENT,
+                        ..figures
+                    },
+                    "[]",
+                )
+                .unwrap();
+                let d1 = load_dataset(&connection, "d1").unwrap().unwrap();
+                assert_eq!(d1.state, "Current");
+                assert!(d1.scan.unwrap().error.is_none());
+                assert!(load_dataset(&connection, "d9").unwrap().is_none());
+
+                // The listing a dataset counts against: its types, delisted when included.
+                connection
+                    .execute_batch(
+                        "INSERT INTO provider_listings
+                         (source_id, exchange, code, name, type, currency, delisted, fetched_at)
+                         VALUES ('s1', 'US', 'SPY', '', 'ETF', 'USD', 0, 't'),
+                                ('s1', 'US', 'AAPL', '', 'Common Stock', 'USD', 0, 't'),
+                                ('s1', 'US', 'OLD', '', 'ETF', 'USD', 1, 't'),
+                                ('s1', 'LSE', 'ISF', '', 'ETF', 'GBP', 0, 't');",
+                    )
+                    .unwrap();
+                let rows = load_datasets(&connection, "s1").unwrap();
+                assert_eq!(
+                    listed_symbols(&connection, &rows[0]).unwrap(),
+                    ["OLD", "SPY"]
+                );
+                assert_eq!(listed_symbols(&connection, &rows[1]).unwrap(), ["SPY"]);
             }
         }
     }
