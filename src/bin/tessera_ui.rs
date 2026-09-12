@@ -21,8 +21,9 @@ use tessera::local_config::LocalConfig;
 use tessera::portfolio::{
     CapitalMode, PortfolioComponentConfig, PortfolioConfig, RebalanceMethod, combine_portfolio,
 };
+use tessera::provider::budget::CallBudget;
 use tessera::provider::eodhd::Eodhd;
-use tessera::provider::{Provider, ProviderError};
+use tessera::provider::{Account, Provider, ProviderError};
 use tessera::report::{ReportView, generate_report, load_report_view};
 use tessera::sdk::manifest::Manifest as SdkManifest;
 use tessera::sdk::runner::{
@@ -745,7 +746,10 @@ fn api_router() -> Router<AppState> {
         )
         .route("/api/data/update-eod", post(start_eod_update))
         .route("/api/sources", get(list_sources).post(create_source))
-        .route("/api/sources/{id}", delete(delete_source))
+        .route(
+            "/api/sources/{id}",
+            put(update_source).delete(delete_source),
+        )
         .route("/api/sources/{id}/token", put(replace_token))
         .route("/api/sources/{id}/verify", post(verify_source))
 }
@@ -1015,6 +1019,11 @@ fn migrate(connection: &Connection) -> Result<()> {
         "cost_profile_snapshot_json",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
+    // DS-07: the usage the provider last reported for a source, and when it was asked.
+    ensure_column(connection, "data_sources", "requests_today", "INTEGER")?;
+    ensure_column(connection, "data_sources", "daily_limit", "INTEGER")?;
+    ensure_column(connection, "data_sources", "resets_at", "TEXT")?;
+    ensure_column(connection, "data_sources", "usage_checked_at", "TEXT")?;
     connection.execute_batch("PRAGMA optimize;")?;
     Ok(())
 }
@@ -4320,7 +4329,11 @@ async fn run_eod_update(state: AppState, id: &str) -> Result<()> {
 const PROVIDER_KINDS: &[&str] = &["eodhd"];
 
 /// Default share of the daily limit kept back from jobs (decision 0022).
-const DEFAULT_RESERVE_PCT: f64 = 5.0;
+const DEFAULT_RESERVE_PCT: f64 = tessera::provider::budget::DEFAULT_RESERVE_PCT;
+
+/// How long a source's usage figures stand before `GET /api/sources` asks the provider
+/// again (DS-07); `?refresh=1`, a verify, and a job's end ask regardless.
+const USAGE_CACHE: chrono::Duration = chrono::Duration::seconds(60);
 
 /// A source's connection state, as the card shows it.
 const VERIFY_CONNECTED: &str = "connected";
@@ -4366,6 +4379,23 @@ struct VolumeFigures {
     free_bytes: u64,
 }
 
+/// The usage the provider last reported for a source (DS-07): the card's credits line and
+/// the numbers a job's budget starts from. `None` until the provider has answered once.
+#[derive(Debug, Clone, Serialize)]
+struct SourceUsage {
+    requests_today: u64,
+    daily_limit: u64,
+    /// When the counter resets, RFC 3339 in UTC (EODHD: 00:00 UTC after the counted day).
+    resets_at: String,
+    /// When the provider reported these figures. A later failed check leaves them and this
+    /// time in place: the card shows the last value with its time.
+    checked_at: String,
+    /// The reserve in calls: `reserve_pct` of the limit, rounded up.
+    reserve_calls: u64,
+    /// What a job may still spend: the limit less today's requests and the reserve.
+    available_calls: u64,
+}
+
 /// A source card: everything the console shows. The token and its file's path are not here.
 #[derive(Debug, Clone, Serialize)]
 struct SourceCard {
@@ -4375,6 +4405,7 @@ struct SourceCard {
     root: String,
     catalog_dir: String,
     reserve_pct: f64,
+    usage: Option<SourceUsage>,
     root_exists: bool,
     volume: Option<VolumeFigures>,
     /// Whether a token file exists for the source (a restored catalog may have the row and
@@ -4413,6 +4444,13 @@ struct TokenRequest {
     token: String,
 }
 
+/// `PUT /api/sources/{id}`: the settings a card edits in place (the reserve; the token has
+/// its own endpoint, the name and folders are fixed at registration).
+#[derive(Debug, Deserialize)]
+struct UpdateSourceRequest {
+    reserve_pct: f64,
+}
+
 struct SourceRow {
     id: String,
     name: String,
@@ -4425,10 +4463,15 @@ struct SourceRow {
     verify_state: String,
     verify_message: Option<String>,
     created_at: String,
+    requests_today: Option<u64>,
+    daily_limit: Option<u64>,
+    resets_at: Option<String>,
+    usage_checked_at: Option<String>,
 }
 
 const SOURCE_COLUMNS: &str = "id, name, kind, root, catalog_dir, reserve_pct, token_set_at, \
-     verified_at, verify_state, verify_message, created_at";
+     verified_at, verify_state, verify_message, created_at, requests_today, daily_limit, \
+     resets_at, usage_checked_at";
 
 fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
     Ok(SourceRow {
@@ -4443,7 +4486,46 @@ fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
         verify_state: row.get(8)?,
         verify_message: row.get(9)?,
         created_at: row.get(10)?,
+        requests_today: row.get(11)?,
+        daily_limit: row.get(12)?,
+        resets_at: row.get(13)?,
+        usage_checked_at: row.get(14)?,
     })
+}
+
+/// The budget a job on this source starts from: the provider's last usage report against
+/// the source's reserve. `None` until the provider has reported once, and a job must not
+/// start on none (decision 0022: jobs are governed by the usage the provider reports).
+fn budget_of(row: &SourceRow) -> Option<CallBudget> {
+    Some(CallBudget::with_reserve_pct(
+        row.daily_limit?,
+        row.requests_today?,
+        row.reserve_pct,
+    ))
+}
+
+/// The card's usage record for a row, or `None` before the first report.
+fn usage_of(row: &SourceRow) -> Option<SourceUsage> {
+    let budget = budget_of(row)?;
+    Some(SourceUsage {
+        requests_today: budget.used,
+        daily_limit: budget.limit,
+        resets_at: row.resets_at.clone()?,
+        checked_at: row.usage_checked_at.clone()?,
+        reserve_calls: budget.reserve,
+        available_calls: budget.available(),
+    })
+}
+
+/// Whether a source was checked with the provider within the usage cache window, so a
+/// listing may show what it has instead of asking again.
+fn checked_recently(verified_at: Option<&str>, now: DateTime<Utc>) -> bool {
+    verified_at
+        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+        .is_some_and(|at| {
+            let at = at.with_timezone(&Utc);
+            at <= now && now - at < USAGE_CACHE
+        })
 }
 
 fn load_source_rows(state: &AppState) -> Result<Vec<SourceRow>> {
@@ -4479,6 +4561,7 @@ fn card_of(state: &AppState, row: SourceRow) -> SourceCard {
         None
     };
     let token_set = token_path(state, &row.id).is_file();
+    let usage = usage_of(&row);
     SourceCard {
         id: row.id,
         name: row.name,
@@ -4486,6 +4569,7 @@ fn card_of(state: &AppState, row: SourceRow) -> SourceCard {
         root: row.root,
         catalog_dir: row.catalog_dir,
         reserve_pct: row.reserve_pct,
+        usage,
         root_exists,
         volume,
         token_set,
@@ -4662,13 +4746,94 @@ fn validate_source_request(request: &CreateSourceRequest) -> Result<()> {
     if request.token.trim().is_empty() {
         bail!("token is required");
     }
-    if !(0.0..=100.0).contains(&request.reserve_pct) || request.reserve_pct.is_nan() {
+    validate_reserve_pct(request.reserve_pct)
+}
+
+fn validate_reserve_pct(reserve_pct: f64) -> Result<()> {
+    if !(0.0..=100.0).contains(&reserve_pct) || reserve_pct.is_nan() {
         bail!("reserve_pct must be between 0 and 100");
     }
     Ok(())
 }
 
-async fn list_sources(State(state): State<AppState>) -> Result<Json<SourcesResponse>, ApiError> {
+/// Records what the provider said when asked about the account behind a source's token:
+/// the usage figures with their time on success, or the card state and message on failure,
+/// with `verified_at` the time of the check either way (DS-03's verify and DS-07's usage
+/// refresh are the same `/api/user` call).
+fn record_check(
+    state: &AppState,
+    id: &str,
+    outcome: &Result<Account, ProviderError>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let stamp = now.to_rfc3339();
+    let connection = state.database.lock().expect("database lock poisoned");
+    match outcome {
+        Ok(account) => {
+            connection.execute(
+                "UPDATE data_sources
+                 SET verified_at = ?2, verify_state = ?3, verify_message = NULL,
+                     requests_today = ?4, daily_limit = ?5, resets_at = ?6,
+                     usage_checked_at = ?2
+                 WHERE id = ?1",
+                params![
+                    id,
+                    stamp,
+                    VERIFY_CONNECTED,
+                    account.requests_today,
+                    account.daily_limit,
+                    account.resets_at.to_rfc3339(),
+                ],
+            )?;
+        }
+        Err(error) => {
+            let (verify_state, message) = verify_state_of(error);
+            connection.execute(
+                "UPDATE data_sources SET verified_at = ?2, verify_state = ?3, verify_message = ?4
+                 WHERE id = ?1",
+                params![id, stamp, verify_state, message],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Asks the provider about the account behind source `id` and records the answer
+/// (`record_check`). Unless `force`, a source checked within `USAGE_CACHE` is left as it is.
+/// A source with no token on file is recorded unreachable with that message; the returned
+/// error is only for a catalog failure.
+async fn refresh_source_usage(state: &AppState, row: &SourceRow, force: bool) -> Result<()> {
+    let now = Utc::now();
+    if !force && checked_recently(row.verified_at.as_deref(), now) {
+        return Ok(());
+    }
+    let outcome = match read_token(state, &row.id) {
+        Ok(token) => match SourceAdapter::new(state, &row.kind, &token) {
+            Ok(adapter) => adapter.verify(&token).await,
+            Err(error) => Err(ProviderError::Unreachable(error.to_string())),
+        },
+        Err(error) => Err(ProviderError::Unreachable(error.to_string())),
+    };
+    record_check(state, &row.id, &outcome, now)
+}
+
+/// The cards, each with its usage refreshed from the provider unless checked within the
+/// last minute; `?refresh=1` asks regardless. A provider that cannot be reached leaves the
+/// last figures with their time on the card and its state says so.
+async fn list_sources(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<SourcesResponse>, ApiError> {
+    let force = query
+        .get("refresh")
+        .is_some_and(|v| v == "1" || v == "true");
+    let worker = state.clone();
+    let rows = tokio::task::spawn_blocking(move || load_source_rows(&worker))
+        .await
+        .context("sources task failed")??;
+    for row in &rows {
+        refresh_source_usage(&state, row, force).await?;
+    }
     let worker = state.clone();
     let sources = tokio::task::spawn_blocking(move || -> Result<Vec<SourceCard>> {
         let rows = load_source_rows(&worker)?;
@@ -4689,7 +4854,7 @@ async fn create_source(
     validate_source_request(&request)?;
     let token = request.token.trim().to_owned();
     let adapter = SourceAdapter::new(&state, &request.kind, &token)?;
-    adapter.verify(&token).await.map_err(refused)?;
+    let account = adapter.verify(&token).await.map_err(refused)?;
     let now = Utc::now();
     let id = format!("source-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
     let stamp = now.to_rfc3339();
@@ -4699,8 +4864,9 @@ async fn create_source(
         connection.execute(
             "INSERT INTO data_sources
              (id, name, kind, root, catalog_dir, reserve_pct, token_set_at, verified_at,
-              verify_state, verify_message, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, ?7)",
+              verify_state, verify_message, created_at, requests_today, daily_limit,
+              resets_at, usage_checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, ?7, ?9, ?10, ?11, ?7)",
             params![
                 id,
                 request.name.trim(),
@@ -4710,6 +4876,9 @@ async fn create_source(
                 request.reserve_pct,
                 stamp,
                 VERIFY_CONNECTED,
+                account.requests_today,
+                account.daily_limit,
+                account.resets_at.to_rfc3339(),
             ],
         )
     };
@@ -4733,48 +4902,50 @@ async fn replace_token(
     let token = request.token.trim().to_owned();
     require_api(!token.is_empty(), "token is required")?;
     let adapter = SourceAdapter::new(&state, &row.kind, &token)?;
-    adapter.verify(&token).await.map_err(refused)?;
+    let account = adapter.verify(&token).await.map_err(refused)?;
     write_token(&state, &id, &token)?;
-    let stamp = Utc::now().to_rfc3339();
+    let now = Utc::now();
     {
         let connection = state.database.lock().expect("database lock poisoned");
         connection.execute(
-            "UPDATE data_sources
-             SET token_set_at = ?2, verified_at = ?2, verify_state = ?3, verify_message = NULL
-             WHERE id = ?1",
-            params![id, stamp, VERIFY_CONNECTED],
+            "UPDATE data_sources SET token_set_at = ?2 WHERE id = ?1",
+            params![id, now.to_rfc3339()],
+        )?;
+    }
+    record_check(&state, &id, &Ok(account), now)?;
+    Ok(Json(load_source_card(&state, &id)?))
+}
+
+/// Sets the source's reserve: the share of the daily limit jobs leave untouched (decision
+/// 0022). The card comes back with the reserve in calls recomputed against the last usage.
+async fn update_source(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<UpdateSourceRequest>,
+) -> Result<Json<SourceCard>, ApiError> {
+    load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    validate_reserve_pct(request.reserve_pct)?;
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "UPDATE data_sources SET reserve_pct = ?2 WHERE id = ?1",
+            params![id, request.reserve_pct],
         )?;
     }
     Ok(Json(load_source_card(&state, &id)?))
 }
 
-/// Re-checks the token on file and records the outcome on the card; the response is the
-/// card whatever the provider said, since the check itself succeeded.
+/// Re-checks the token on file and records the outcome on the card, usage included; the
+/// response is the card whatever the provider said, since the check itself succeeded.
 async fn verify_source(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SourceCard>, ApiError> {
     let row = load_source_row(&state, &id)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
-    let token =
-        read_token(&state, &id).map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
-    let adapter = SourceAdapter::new(&state, &row.kind, &token)?;
-    let (verify_state, message) = match adapter.verify(&token).await {
-        Ok(_) => (VERIFY_CONNECTED, None),
-        Err(error) => {
-            let (verify_state, message) = verify_state_of(&error);
-            (verify_state, Some(message))
-        }
-    };
-    let stamp = Utc::now().to_rfc3339();
-    {
-        let connection = state.database.lock().expect("database lock poisoned");
-        connection.execute(
-            "UPDATE data_sources SET verified_at = ?2, verify_state = ?3, verify_message = ?4
-             WHERE id = ?1",
-            params![id, stamp, verify_state, message],
-        )?;
-    }
+    read_token(&state, &id).map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
+    refresh_source_usage(&state, &row, true).await?;
     Ok(Json(load_source_card(&state, &id)?))
 }
 
@@ -7798,6 +7969,322 @@ mod tests {
             assert_eq!(refused(rejected).0, StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(refused(unreachable).0, StatusCode::BAD_GATEWAY);
             assert_eq!(refused(malformed).0, StatusCode::BAD_GATEWAY);
+        }
+
+        /// DS-07 (decision 0022): the card carries the usage the provider reports, refreshed
+        /// by `GET /api/sources` once a minute or on `?refresh=1`; with the provider down the
+        /// last figures stay with their time; `PUT /api/sources/{id}` sets the reserve.
+        mod credits {
+            use super::*;
+            use chrono::TimeZone;
+            use std::sync::atomic::AtomicU64;
+
+            #[derive(Clone)]
+            struct UsageStub {
+                down: Arc<AtomicBool>,
+                requests: Arc<AtomicU64>,
+            }
+
+            /// The DS-02 fixture's `/api/user` with `apiRequests` taken from the counter.
+            async fn stub_user(
+                State(stub): State<UsageStub>,
+                AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+            ) -> Response {
+                if stub.down.load(Ordering::SeqCst) {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")
+                        .into_response();
+                }
+                let token = query
+                    .iter()
+                    .find(|(k, _)| k == "api_token")
+                    .map(|(_, v)| v.as_str());
+                if token != Some(TOKEN) {
+                    return (StatusCode::UNAUTHORIZED, "Unauthenticated").into_response();
+                }
+                let body = fs::read_to_string(format!(
+                    "{}/tests/fixtures/eodhd/user.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .unwrap()
+                .replace(
+                    "\"apiRequests\": 1234",
+                    &format!("\"apiRequests\": {}", stub.requests.load(Ordering::SeqCst)),
+                );
+                (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+            }
+
+            async fn usage_stub() -> (String, Arc<AtomicBool>, Arc<AtomicU64>) {
+                let down = Arc::new(AtomicBool::new(false));
+                let requests = Arc::new(AtomicU64::new(1234));
+                let router =
+                    Router::new()
+                        .route("/api/user", get(stub_user))
+                        .with_state(UsageStub {
+                            down: down.clone(),
+                            requests: requests.clone(),
+                        });
+                (serve(router).await, down, requests)
+            }
+
+            fn usage_calls(state: &AppState, id: &str) -> (Option<u64>, Option<String>) {
+                let row = load_source_row(state, id).unwrap().unwrap();
+                (row.requests_today, row.usage_checked_at)
+            }
+
+            #[tokio::test]
+            async fn the_card_shows_the_providers_usage_and_keeps_the_last_value_while_down() {
+                let (eodhd, down, requests) = usage_stub().await;
+                let root = scratch_root("credits");
+                let library = root.join("library");
+                fs::create_dir_all(&library).unwrap();
+                let state = test_state(&root, &eodhd);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+                let mut responses: Vec<(String, String)> = Vec::new();
+
+                // Registering reads the usage from the same call that verified the token.
+                let response = client
+                    .post(format!("{api}/api/sources"))
+                    .json(&serde_json::json!({
+                        "kind": "eodhd", "name": "EODHD", "root": library,
+                        "catalog_dir": library.join("catalog"), "token": TOKEN
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CREATED);
+                let body = response.text().await.unwrap();
+                let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("POST created".into(), body));
+                let id = card["id"].as_str().unwrap().to_owned();
+                let usage = &card["usage"];
+                assert_eq!(usage["requests_today"], 1234, "{card}");
+                assert_eq!(usage["daily_limit"], 100_000);
+                assert_eq!(usage["resets_at"], "2026-09-12T00:00:00+00:00");
+                assert_eq!(usage["checked_at"], card["verified_at"]);
+                assert_eq!(usage["reserve_calls"], 5_000);
+                assert_eq!(usage["available_calls"], 100_000 - 1_234 - 5_000);
+                let first_checked = usage["checked_at"].as_str().unwrap().to_owned();
+
+                // Within the minute the listing shows what it has; `refresh=1` asks again.
+                requests.store(2_000, Ordering::SeqCst);
+                let body = client
+                    .get(format!("{api}/api/sources"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("GET sources cached".into(), body));
+                assert_eq!(
+                    list["sources"][0]["usage"]["requests_today"], 1234,
+                    "{list}"
+                );
+                assert_eq!(
+                    list["sources"][0]["usage"]["checked_at"],
+                    first_checked.as_str()
+                );
+                let body = client
+                    .get(format!("{api}/api/sources?refresh=1"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("GET sources refreshed".into(), body));
+                let card = &list["sources"][0];
+                assert_eq!(card["usage"]["requests_today"], 2_000, "{card}");
+                assert_eq!(card["usage"]["available_calls"], 100_000 - 2_000 - 5_000);
+                assert_eq!(card["verify_state"], "connected");
+                let refreshed_checked = card["usage"]["checked_at"].as_str().unwrap().to_owned();
+                assert!(refreshed_checked >= first_checked);
+                assert_eq!(
+                    usage_calls(&state, &id),
+                    (Some(2_000), Some(refreshed_checked.clone()))
+                );
+
+                // With the provider down, the card keeps the last figures with their time and
+                // says the provider could not be reached.
+                down.store(true, Ordering::SeqCst);
+                requests.store(3_000, Ordering::SeqCst);
+                let body = client
+                    .get(format!("{api}/api/sources?refresh=1"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("GET sources down".into(), body));
+                let card = &list["sources"][0];
+                assert_eq!(card["usage"]["requests_today"], 2_000, "{card}");
+                assert_eq!(card["usage"]["checked_at"], refreshed_checked.as_str());
+                assert_eq!(card["verify_state"], "unreachable");
+                assert!(
+                    card["verify_message"].as_str().unwrap().contains("503"),
+                    "{card}"
+                );
+                assert!(
+                    card["verified_at"].as_str().unwrap() >= refreshed_checked.as_str(),
+                    "{card}"
+                );
+                // The token endpoint and the verify endpoint keep the figures too.
+                let response = client
+                    .post(format!("{api}/api/sources/{id}/verify"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.text().await.unwrap();
+                let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("POST verify down".into(), body));
+                assert_eq!(card["usage"]["requests_today"], 2_000, "{card}");
+                assert_eq!(card["verify_state"], "unreachable");
+
+                // Back up, a verify brings the figures current.
+                down.store(false, Ordering::SeqCst);
+                let body = client
+                    .post(format!("{api}/api/sources/{id}/verify"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("POST verify up".into(), body));
+                assert_eq!(card["usage"]["requests_today"], 3_000, "{card}");
+                assert_eq!(card["verify_state"], "connected");
+                assert_eq!(card["usage"]["checked_at"], card["verified_at"]);
+
+                // The reserve is set in place and recomputed in calls; out of range is refused.
+                let response = client
+                    .put(format!("{api}/api/sources/{id}"))
+                    .json(&serde_json::json!({ "reserve_pct": 10 }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.text().await.unwrap();
+                let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("PUT reserve".into(), body));
+                assert_eq!(card["reserve_pct"], 10.0);
+                assert_eq!(card["usage"]["reserve_calls"], 10_000);
+                assert_eq!(card["usage"]["available_calls"], 100_000 - 3_000 - 10_000);
+                assert_eq!(card["usage"]["requests_today"], 3_000);
+                for bad in [-1.0, 100.5] {
+                    let response = client
+                        .put(format!("{api}/api/sources/{id}"))
+                        .json(&serde_json::json!({ "reserve_pct": bad }))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+                    responses.push((format!("PUT reserve {bad}"), response.text().await.unwrap()));
+                }
+                let response = client
+                    .put(format!("{api}/api/sources/no-such-source"))
+                    .json(&serde_json::json!({ "reserve_pct": 1 }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                let row = load_source_row(&state, &id).unwrap().unwrap();
+                assert_eq!(row.reserve_pct, 10.0);
+                let budget = budget_of(&row).unwrap();
+                assert_eq!(
+                    (budget.limit, budget.used, budget.reserve),
+                    (100_000, 3_000, 10_000)
+                );
+
+                // A source whose token file is gone is reported, not failed on.
+                fs::remove_file(root.join("data/ui/secrets").join(format!("{id}.token"))).unwrap();
+                let body = client
+                    .get(format!("{api}/api/sources?refresh=1"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+                responses.push(("GET sources no token".into(), body));
+                let card = &list["sources"][0];
+                assert_eq!(card["token_set"], false);
+                assert_eq!(card["verify_state"], "unreachable");
+                assert!(
+                    card["verify_message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no token is set"),
+                    "{card}"
+                );
+                assert_eq!(card["usage"]["requests_today"], 3_000, "{card}");
+
+                let secrets_path = root.join("data/ui/secrets").display().to_string();
+                for (label, body) in &responses {
+                    for leak in [TOKEN, secrets_path.as_str(), "data/ui/secrets"] {
+                        assert!(!body.contains(leak), "{label} carries {leak:?}: {body}");
+                    }
+                }
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_source_is_checked_recently_within_the_cache_window() {
+                let now = Utc.with_ymd_and_hms(2026, 9, 12, 12, 0, 0).unwrap();
+                let at = |seconds: i64| (now - chrono::Duration::seconds(seconds)).to_rfc3339();
+                assert!(checked_recently(Some(&at(0)), now));
+                assert!(checked_recently(Some(&at(59)), now));
+                assert!(!checked_recently(Some(&at(60)), now));
+                assert!(!checked_recently(Some(&at(3_600)), now));
+                assert!(
+                    !checked_recently(Some(&at(-5)), now),
+                    "a check in the future (a clock that went back) is not recent"
+                );
+                assert!(!checked_recently(Some("yesterday"), now));
+                assert!(!checked_recently(None, now));
+            }
+
+            #[test]
+            fn a_row_without_a_usage_report_has_no_budget_and_no_credits_line() {
+                let mut row = SourceRow {
+                    id: "s".into(),
+                    name: "EODHD".into(),
+                    kind: "eodhd".into(),
+                    root: "/lib".into(),
+                    catalog_dir: "/lib/catalog".into(),
+                    reserve_pct: 5.0,
+                    token_set_at: None,
+                    verified_at: None,
+                    verify_state: VERIFY_CONNECTED.into(),
+                    verify_message: None,
+                    created_at: "2026-09-12T00:00:00+00:00".into(),
+                    requests_today: None,
+                    daily_limit: None,
+                    resets_at: None,
+                    usage_checked_at: None,
+                };
+                assert!(budget_of(&row).is_none());
+                assert!(usage_of(&row).is_none());
+                row.requests_today = Some(10);
+                row.daily_limit = Some(20);
+                row.resets_at = Some("2026-09-13T00:00:00+00:00".into());
+                row.usage_checked_at = Some("2026-09-12T01:02:03+00:00".into());
+                let usage = usage_of(&row).unwrap();
+                assert_eq!(
+                    (usage.requests_today, usage.daily_limit, usage.reserve_calls),
+                    (10, 20, 1)
+                );
+                assert_eq!(usage.available_calls, 9);
+                assert_eq!(usage.resets_at, "2026-09-13T00:00:00+00:00");
+                assert_eq!(usage.checked_at, "2026-09-12T01:02:03+00:00");
+            }
         }
     }
 }

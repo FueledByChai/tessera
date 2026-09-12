@@ -97,11 +97,27 @@ HTTP 401 and 403 are `CredentialsRejected` with the provider's `message`; 429 an
 with the status. The download calls (bulk EOD, history, splits, intraday windows) come with
 the tickets that build the native download jobs.
 
+### The call budget (`src/provider/budget.rs`)
+
+Every job obeys one `CallBudget { limit, used, reserve }` built from the usage the provider
+last reported for its source and the source's reserve (decision 0022): `remaining()` is the
+limit less today's requests, `available()` what remains above the reserve, `can_start(n)`
+admits a job whose mandatory calls fit in it (exactly filling it included) and otherwise
+returns a `Refused` naming both numbers (`needs 551 calls, 550 available above the reserve
+of 50`), `charge(n)` counts calls made, and `at_reserve()` is where the optional part of a
+job stops. `Estimate::eod(sessions, backfills)` is two mandatory calls per session (bulk and
+splits) and one optional per backfill; `Estimate::intraday(windows, symbols)` is windows
+times symbols times five, all mandatory. `reserve_calls(limit, pct)` rounds the reserve up
+and caps it at the limit; a limit of zero (an account the provider has not described)
+admits no call and is already at its reserve. The budget never talks to a provider: the
+service refreshes the figures before a job starts and after it ends.
+
 ### Registered sources (`/api/sources`)
 
 A provider account is registered from the console (decision 0021): a row in the catalog's
 `data_sources` table (id, name, kind, root, catalog_dir, reserve_pct, token_set_at,
-verified_at, verify_state, verify_message, created_at) and the token in
+verified_at, verify_state, verify_message, created_at, and the usage the provider last
+reported: requests_today, daily_limit, resets_at, usage_checked_at) and the token in
 `data/ui/secrets/<id>.token`, a file with mode 0600 in a folder the service creates with
 mode 0700. The database never holds the token, and no response, log line, or error message
 carries it or the file's path; a catalog restored from a backup shows its sources with
@@ -109,19 +125,28 @@ carries it or the file's path; a catalog restored from a backup shows its source
 
 | Endpoint | Does | Refuses with |
 |---|---|---|
-| `GET /api/sources` | the cards, plus `kinds`, the provider kinds compiled in (`eodhd`) | |
-| `POST /api/sources` | verifies the token through the kind's adapter, writes the file, inserts the row; 201 with the card | 422 with the provider's message for a rejected token, 502 when the provider could not be asked; nothing saved either way. 400 for an unknown kind, a relative root or catalog folder, an empty name or token, a reserve outside 0 to 100 |
-| `PUT /api/sources/{id}/token` | verifies the new token and replaces the file (written as a part file and renamed, so the old token stays until the new one is on disk) | 422 / 502 as above, the old token untouched |
-| `POST /api/sources/{id}/verify` | re-checks the token on file and records `verified_at`, `verify_state` (`connected`, `credentials_rejected`, `unreachable`), and the provider's message; 200 with the card whatever the provider said | 409 when no token file exists |
+| `GET /api/sources` | the cards, plus `kinds`, the provider kinds compiled in (`eodhd`); each card's usage is refreshed through its adapter unless the source was checked within the last minute, `?refresh=1` asks regardless | a provider that cannot be reached leaves the last figures with their time on the card and sets its state |
+| `POST /api/sources` | verifies the token through the kind's adapter, writes the file, inserts the row with the usage that call reported; 201 with the card | 422 with the provider's message for a rejected token, 502 when the provider could not be asked; nothing saved either way. 400 for an unknown kind, a relative root or catalog folder, an empty name or token, a reserve outside 0 to 100 |
+| `PUT /api/sources/{id}` | sets `reserve_pct`, the share of the daily limit jobs leave untouched (decision 0022, default 5); 200 with the card, the reserve in calls recomputed | 400 outside 0 to 100, 404 for an unknown source |
+| `PUT /api/sources/{id}/token` | verifies the new token and replaces the file (written as a part file and renamed, so the old token stays until the new one is on disk), recording the usage that call reported | 422 / 502 as above, the old token untouched |
+| `POST /api/sources/{id}/verify` | re-checks the token on file and records `verified_at`, `verify_state` (`connected`, `credentials_rejected`, `unreachable`), and the provider's message, plus the usage on success; 200 with the card whatever the provider said | 409 when no token file exists |
 | `DELETE /api/sources/{id}` | removes the row and the token file; 204 | 409 while any regular file lies under the source's root: the console never deletes data files (decision 0022) |
 
 A card also reports `root_exists` and, for a root that is mounted, the volume's
 `total_bytes`, `used_bytes`, and `free_bytes` from statvfs (free is what this process may
-use). The adapter for a card is chosen by its `kind`; `TESSERA_EODHD_BASE_URL` points the
-EODHD adapter at a stub server for a scratch console, and the service test in
-`src/bin/tessera_ui.rs` (`tests::sources`) registers a known placeholder token over the
-DS-02 stub and fails if the token or the secrets path appears in any `/api/sources` or
-`/api/data` response.
+use), and its `usage`: `requests_today`, `daily_limit`, `resets_at` (EODHD reports no reset
+time, so the adapter derives 00:00 UTC after the day the count is for, and the card labels
+it "resets 00:00 UTC"), `checked_at` (when the provider reported these figures; a later
+failed check leaves them and this time in place), `reserve_calls` (`reserve_pct` of the
+limit, rounded up), and `available_calls` (what a job may still spend); `null` until the
+provider has answered once. A verify and a usage refresh are the same `/api/user` call, so
+`verified_at` is the time of the last check either way and `verify_state` says whether it
+succeeded. The adapter for a card is chosen by its `kind`; `TESSERA_EODHD_BASE_URL` points
+the EODHD adapter at a stub server for a scratch console, and the service tests in
+`src/bin/tessera_ui.rs` (`tests::sources`) register a known placeholder token over the
+DS-02 stub and fail if the token or the secrets path appears in any `/api/sources` or
+`/api/data` response, or if the card's usage does not follow the stub's count on
+`?refresh=1` and keep the last figures with their time while the stub answers 503.
 
 ## Environment overrides
 
