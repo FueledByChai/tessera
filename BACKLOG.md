@@ -419,7 +419,7 @@ per dataset, the files for its listed symbols (last date tail-read through
 calendar symbol's last date for daily, the last session's close for intraday), Uncataloged
 files per folder under the root, and the BT-605 state; a failed scan keeps the previous row.
 `GET /api/sources` returns each dataset with its last scan. Serves BT-1203. Decisions: 0012,
-0013, 0021. A second source over the same root is refused (409), and `holds_files` from DS-03 narrows to the source's dataset folders once datasets exist.
+0013, 0021. A second source over the same root is refused (409), and `holds_files` from DS-03 narrows to the source's dataset folders once datasets exist. DS-04's refresh caches active listings only: it gains a `delisted` flag on the body (one extra call per exchange, cached with `delisted = 1`) so a dataset with include delisted can count and backfill them.
 **Done when:** a service test builds a temp root with `eod/` holding files for three listed
 symbols, one `.part`, and a stray folder, registers a US EOD dataset over the stub listing of
 five symbols, scans, and asserts listed 5, on disk 3, the latest date, bytes, the `.part`
@@ -520,6 +520,17 @@ a probe that returns no data removes that resolution from the row. Serves BT-120
 **Done when:** a service test over the stub lets the exchange list claim 1m for LSE, answers the
 1m probe with no data and the 5m probe with rows, and asserts the cached row lists 5m and not 1m
 with a probe time; a second expansion makes no further call.
+
+### DS-13 The usage refresh has a short timeout and runs across sources at once — Blocked by DS-07
+`GET /api/sources` (DS-07) refreshes each source's usage in turn through the adapter's `/api/user`
+call, whose request timeout is the adapter's general 60 s; a provider that hangs rather than
+fails fast holds the Inventory listing for up to a minute per source. The usage call gets its
+own short timeout (5 s) and the refresh runs the sources concurrently (`join_all`), each
+recording `unreachable` on its own; the listing returns as soon as the slowest answers or times
+out. Serves BT-1204. Decisions: 0020.
+**Done when:** a service test registers two sources over two stubs, one of which never
+answers, and asserts `GET /api/sources` returns within 10 s with the answering source
+`connected` and the other `unreachable`, both with their last usage and `checked_at` intact.
 
 ## Housekeeping
 
@@ -1076,3 +1087,14 @@ Serves BT-607. Decisions: 0011.
 **Done when:** `grep -n 'run-2026' web/app/page.tsx` finds nothing, and
 `web/scripts/data-page-check.mjs` opens the coverage fold against the fixture's runs and asserts
 it loaded the newest completed one.
+
+### HK-46 The proof gate counts `#[tokio::test]` as a test line
+`proof_pattern` in `.loop.toml` is `#\[test\]|#\[cfg\(test\)\]`, so a change under `src/`
+proven by an async service test (`#[tokio::test]`, the norm in `src/bin/tessera_ui.rs` since
+DS-03) fails the gate until a plain `#[test]` is added beside it (DS-04 hit this). The pattern
+becomes `#\[(tokio::)?test\]|#\[cfg\(test\)\]` here, and the kit's default and its self-test
+learn the same in `coding-agent-loop`, tagged and synced through `kit_ref` as `AGENTS.md`
+requires.
+**Done when:** `scripts/check.sh --self-test` (the proof gate's) passes a fixture commit whose
+only proof line is `#[tokio::test]`, and `scripts/loop-kit-sync.sh --check` is clean at the new
+`kit_ref`.
