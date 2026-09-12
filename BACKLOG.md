@@ -836,3 +836,19 @@ the engine path from an environment variable the script sets).
 **Done when:** `CARGO_TARGET_DIR=<shared> scripts/scratch-console.sh start --port 8793` from a
 worktree whose own `target/` is empty seeds the strategy catalog and the run; the CI web job,
 which starts the scratch console from the main checkout, is unaffected.
+
+### HK-44 The deploy loop keys on the build it last deployed, not on the pull delta
+`scripts/deploy-local.sh` decides "new" by `origin/main` being ahead of the local `main`
+and reads what to rebuild from the pulled range. On 2026-09-11 a session in the main
+checkout pulled `main` by hand between runs, so four merged tickets (HK-42, HK-33, UI-04,
+UI-06, an engine change among them) were logged as "nothing new" and neither the engine nor
+the bundle was rebuilt or the service restarted; the console stayed on the previous build
+until a deploy by hand. The loop should record the sha it last deployed (`data/ui/deployed`,
+engine and bundle separately) and decide by `main` versus that marker, rebuilding what
+changed between them whether or not it did the pull itself; `--dry-run` says which marker is
+behind. The Project rules add: never pull `main` in the main checkout by hand, and if you
+do, run the loop.
+**Done when:** `scripts/deploy-local.sh --self-test` adds a case where the fixture's `main`
+is advanced by a hand pull before the run and shows the engine rebuilt and the service
+restarted anyway, and a case where the marker matches `main` and nothing is rebuilt;
+`AGENTS.md` carries the rule.
