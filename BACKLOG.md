@@ -1128,3 +1128,21 @@ requires.
 **Done when:** `scripts/check.sh --self-test` (the proof gate's) passes a fixture commit whose
 only proof line is `#[tokio::test]`, and `scripts/loop-kit-sync.sh --check` is clean at the new
 `kit_ref`.
+
+### HK-47 The deploy loop returns from a restart, and a killed loop does not take the console down
+On 2026-09-12 the launchd run of `scripts/deploy-local.sh` that deployed a79c4c4 logged
+"private checks passed" at 10:02 and never "restarted": `restart_service` calls
+`new="$(start_service "$old")"`, and the subshell in `start_service` that launches the console
+(`(cd "$ROOT" && nohup ./target/release/tessera-ui > data/ui/api.log 2>&1 & echo $! > ...)`)
+stayed alive as the console's parent with the command substitution's pipe on its stdout, so
+`$(...)` never returned; the run sat for two hours, launchd started no new run (one instance at
+a time), local main stayed at DS-02 while five engine commits merged, and killing the stuck run
+took the console with it because launchd tears down the job's process group. Two fixes:
+`start_service` launches the console detached from the caller's file descriptors (the subshell
+runs with `>/dev/null 2>&1` and `setsid` or `disown`, the pid file written by the parent), and
+the `--launchd` plist sets `AbandonProcessGroup` so a stopped loop never stops the console.
+`docs/LOOP.md` names both.
+**Done when:** `scripts/deploy-local.sh --self-test` gains a case that runs `start_service`
+against a fake service (a script that sleeps and serves nothing) inside `$(...)` and fails
+unless it returns within five seconds with the pid file written, and asserts the printed
+plist contains `AbandonProcessGroup`.
