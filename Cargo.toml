@@ -26,6 +26,8 @@ chrono-tz = "0.10.4"
 clap = { version = "4.6.1", features = ["derive"] }
 csv = "1.3"
 polars = { version = "0.54.4", default-features = false, features = ["parquet", "dtype-decimal", "dtype-struct", "fmt", "csv"] }
+# statvfs for a registered source's root volume (DS-03); already in the lock as a transitive dependency.
+libc = "0.2"
 rand = "0.9"
 rayon = "1.10"
 # The provider adapters' HTTP client (decision 0020). Already in the lock through polars-io,
