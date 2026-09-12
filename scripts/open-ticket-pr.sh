@@ -23,6 +23,11 @@
 #                                                   it moved (the rules want checks on the exact
 #                                                   result), so CI reruns and auto-merge can fire
 #   scripts/open-ticket-pr.sh <id> --status         the PR's url, state, merge state, and checks
+#   scripts/open-ticket-pr.sh --update-all          rebase every open PR that is behind the
+#                                                   default branch (HK-42): with several agents
+#                                                   working at once, each merge leaves the other
+#                                                   PRs behind, and the rules want checks on the
+#                                                   exact result; the review pass runs this first
 #   scripts/open-ticket-pr.sh <id> --release        delete origin/ticket/<id> after the PR merged
 #                                                   or the claim is abandoned
 #   scripts/open-ticket-pr.sh --self-test           a fixture repo with a stub `gh` proves the
@@ -37,12 +42,13 @@ SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="${LOOP_ROOT:-$SCRIPT_ROOT}"
 CONFIG="$SCRIPT_ROOT/scripts/loop-config.sh"
 ID="${1:-}"
-[ -n "$ID" ] || { echo "usage: scripts/open-ticket-pr.sh <id> [--claim|--status|--update|--release|--body-file f|--draft] | --self-test" >&2; exit 2; }
+[ -n "$ID" ] || { echo "usage: scripts/open-ticket-pr.sh <id> [--claim|--status|--update|--release|--body-file f|--draft] | --update-all | --self-test" >&2; exit 2; }
 shift
 MODE=open
 BODY_FILE=""
 DRAFT=0
 [ "$ID" = "--self-test" ] && MODE=selftest
+[ "$ID" = "--update-all" ] && MODE=updateall
 while [ $# -gt 0 ]; do
   case "$1" in
     --claim) MODE=claim ;;
@@ -153,6 +159,21 @@ run() {
       need_gh
       gh pr update-branch "$BRANCH" --rebase && echo "rebased origin/$BRANCH onto $base; CI reruns and auto-merge fires when green"
       ;;
+    updateall)
+      need_gh
+      # Every open PR into the default branch whose merge state is BEHIND (green or not: a
+      # rebase restarts its checks either way, and a red one is no worse for being current).
+      local behind=0 seen=0 line number branch state
+      while IFS=$'\t' read -r number branch state; do
+        [ -n "$number" ] || continue
+        seen=$((seen + 1))
+        if [ "$state" = "BEHIND" ]; then
+          behind=$((behind + 1))
+          if gh pr update-branch "$number" --rebase; then echo "rebased $branch (#$number) onto $base"; else echo "could not rebase $branch (#$number): resolve by hand" >&2; fi
+        fi
+      done < <(gh pr list --base "$base" --state open --json number,headRefName,mergeStateStatus --jq '.[] | "\(.number)\t\(.headRefName)\t\(.mergeStateStatus)"' 2>/dev/null || true)
+      echo "update-all: $seen open pull request(s), $behind behind $base"
+      ;;
     status)
       need_gh
       gh pr list --head "$BRANCH" --base "$base" --state all --json url,state,title,mergeStateStatus,autoMergeRequest --jq '.[] | "\(.state)\t\(.mergeStateStatus)\tauto-merge \(if .autoMergeRequest then "on" else "off" end)\t\(.url)\t\(.title)"' | head -3
@@ -187,7 +208,7 @@ self_test() {
 echo "$*" >> "$GH_LOG"
 case "$1 $2" in
   "pr create") echo "https://example.invalid/pull/1" ;;
-  "pr list") ;;
+  "pr list") [ -n "${GH_PR_LIST:-}" ] && printf '%b' "$GH_PR_LIST" ;;
 esac
 EOF
   chmod +x "$dir/bin/gh"
@@ -231,6 +252,15 @@ EOF
     : > "$GH_LOG"
     out="$("$me" AA-03)"
     echo "$out" | grep -q '  docs/\*.md: docs/NOTES.md' || { echo "self-test: the pattern should match docs/NOTES.md:"; echo "$out"; exit 1; }
+    # --update-all (HK-42) rebases only the open pull requests that are behind the default
+    # branch, and reports the count.
+    : > "$GH_LOG"
+    out="$(GH_PR_LIST='7\tticket/AA-07\tBEHIND\n8\tticket/AA-08\tCLEAN\n9\tbacklog/notes\tBEHIND\n' "$me" --update-all)"
+    grep -q '^pr update-branch 7 --rebase$' "$GH_LOG" && grep -q '^pr update-branch 9 --rebase$' "$GH_LOG" || { echo "self-test: --update-all should rebase the two PRs behind trunk:"; cat "$GH_LOG"; exit 1; }
+    grep -q '^pr update-branch 8' "$GH_LOG" && { echo "self-test: --update-all must leave a current PR alone:"; cat "$GH_LOG"; exit 1; }
+    echo "$out" | grep -q '^update-all: 3 open pull request(s), 2 behind trunk$' || { echo "self-test: the update-all summary is off:"; echo "$out"; exit 1; }
+    out="$("$me" --update-all)"
+    echo "$out" | grep -q '^update-all: 0 open pull request(s), 0 behind trunk$' || { echo "self-test: no open PRs should be a quiet summary:"; echo "$out"; exit 1; }
     # --release drops the claim.
     "$me" AA-01 --release | grep -q '^released AA-01' || { echo "self-test: release should delete the claim branch"; exit 1; }
     "$me" AA-01 --release | grep -q '^nothing to release' || { echo "self-test: a second release finds nothing"; exit 1; }

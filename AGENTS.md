@@ -30,7 +30,10 @@ below it are this project's own and are what the loop prompts mean when they say
   agents can hold several tickets. After the commit, `scripts/open-ticket-pr.sh <id>` pushes
   the branch and opens the pull request; a green PR up to date with the default branch merges
   on its own, one that touches a review path is labelled `needs-review` and waits for the
-  owner. Never push the default branch. Never force-push. Never rewrite its history.
+  owner. Several agents can run at once: claims keep them on different tickets, and
+  `scripts/open-ticket-pr.sh --update-all` (run first by the review pass) rebases the open
+  pull requests a merge left behind. Never push the default branch. Never force-push. Never
+  rewrite its history.
 - **Commits.** One commit per ticket. The subject starts with the ticket id (`AB-12: ...`); the
   body says what changed and how the done line is proven; the message ends with a
   `Co-Authored-By: <agent> <email>` trailer naming the agent and model that did the work when

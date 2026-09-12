@@ -168,7 +168,11 @@ noreply address, so it does not bite. Commits from another identity would.
 - `/nightly-studies`: the command that runs the registered study configs and appends to the
   research log in the private repo.
 - `/review-prs`: the command that reviews the open pull requests and posts the `Agent review`
-  status each one waits for (see "Reviewing" below).
+  status each one waits for (see "Reviewing" below). It starts with
+  `scripts/open-ticket-pr.sh --update-all` (HK-42), which rebases every open pull request
+  that is behind `main`: with several agents working tickets at once, each merge leaves the
+  others behind, and the ruleset wants green checks on the exact result, so without this a
+  parallel lane stalls until someone runs `--update` by hand.
 - `docs/decisions/`: decision records (HK-31), one numbered file per decision from the kit's
   template (Context, Decision, Alternatives, Consequences, what would show it was wrong),
   never edited in place: a change is a new record with `scripts/decisions.sh new "<title>"
