@@ -498,6 +498,8 @@ type CostProfile = {
   created_at: string;
   builtin: boolean;
 };
+/** One outcome of a schedule (DS-10): when it ran, what came of it, the job it queued. */
+type AutomationRun = { ran_at: string; status: string; job_id?: string | null };
 type AutomationSchedule = {
   id: string;
   name: string;
@@ -508,6 +510,32 @@ type AutomationSchedule = {
   last_run_date?: string;
   last_status?: string;
   created_at: string;
+  /** A `dataset_update` schedule's dataset and its label (`US EOD`). */
+  dataset_id?: string | null;
+  dataset?: string | null;
+  /** The last seven outcomes, oldest first. */
+  runs?: AutomationRun[];
+};
+/** A download job as `GET /api/datasets/jobs` lists it (DS-08, DS-10). */
+type DatasetJob = {
+  id: string;
+  dataset_id: string;
+  source_id: string;
+  exchange: string;
+  resolution: string;
+  kind: string;
+  /** `scheduled` when a schedule queued it, else `manual`. */
+  trigger: string;
+  state: string;
+  percent: number;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  calls: number;
+  added: number;
+  updated: number;
+  error?: string | null;
+  log_path: string;
 };
 type StrategySourceFile = {
   path: string;
@@ -3649,6 +3677,245 @@ function DataUpdatesPanel({
   );
 }
 
+/** How many jobs the Updates table shows before Show all. */
+const JOBS_SHOWN = 12;
+/** How many outcomes a schedule row shows as marks. */
+const SCHEDULE_MARKS = 7;
+/** A run's mark in the terminal style: o complete, ~ queued or running, . skipped, x failed. */
+function runMark(status: string): [string, string] {
+  if (status === "complete") return ["o", "complete"];
+  if (status.startsWith("failed")) return ["x", "failed"];
+  if (status.startsWith("skipped")) return [".", "skipped"];
+  if (status.startsWith("queued")) return ["~", "running"];
+  return ["?", "other"];
+}
+/** "mon-fri" for three or more consecutive days, else the days as listed. */
+function daysLabel(weekdays: string) {
+  const order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+  const days = weekdays.split(",").map((d) => d.trim()).filter(Boolean);
+  const indexes = days.map((d) => order.indexOf(d));
+  const consecutive = indexes.length > 2 && indexes.every((n, i) => n >= 0 && (i === 0 || n === indexes[i - 1] + 1));
+  return consecutive ? `${days[0]}-${days[days.length - 1]}` : days.join(",");
+}
+type ScheduleForm = { dataset_id: string; local_time: string; weekdays: string; enabled: boolean };
+const EMPTY_SCHEDULE_FORM: ScheduleForm = { dataset_id: "", local_time: "19:15", weekdays: "mon,tue,wed,thu,fri", enabled: true };
+
+/** The Updates & schedules view's native tables (DS-10, BT-1207; decisions 0001, 0014): the
+ *  download jobs newest first (`GET /api/datasets/jobs`, twelve then Show all, the log opening
+ *  from the row) over the per-dataset schedules with their last seven outcomes as marks, Run
+ *  now, Pause, and Add schedule as an inline form listing the registered datasets. The legacy
+ *  update command and its schedules stay under these until DS-11 removes them. */
+function DatasetSchedules({
+  schedules,
+  busy,
+  onToggle,
+  onRun,
+  onCreate,
+}: {
+  schedules: AutomationSchedule[];
+  busy: boolean;
+  onToggle: (id: string) => void;
+  onRun: (id: string) => void;
+  onCreate: (request: Record<string, unknown>) => void;
+}) {
+  const [jobs, setJobs] = useState<DatasetJob[] | null>(null);
+  const [jobsError, setJobsError] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const [openLog, setOpenLog] = useState<{ id: string; text: string } | null>(null);
+  const [datasets, setDatasets] = useState<{ id: string; label: string }[]>([]);
+  const [adding, setAdding] = useState(false);
+  const [form, setForm] = useState<ScheduleForm>(EMPTY_SCHEDULE_FORM);
+  const own = schedules.filter((s) => s.kind === "dataset_update");
+  // A run recorded on a schedule means a job may have been queued: list again.
+  const runsKey = own.map((s) => `${s.id}:${s.runs?.length ?? 0}:${s.last_status ?? ""}`).join("|");
+  const loadJobs = useCallback(async () => {
+    try {
+      const response = await fetch(`${API}/datasets/jobs`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiFailure(response));
+      const body: DatasetJob[] = await response.json();
+      if (!Array.isArray(body)) throw new Error("no job list in the answer");
+      setJobs(body);
+      setJobsError("");
+    } catch (failure) {
+      setJobsError(`the service did not answer /api/datasets/jobs (${failure instanceof Error ? failure.message : String(failure)}); an engine from before the jobs listing needs a restart`);
+      setJobs((current) => current ?? []);
+    }
+  }, []);
+  useEffect(() => {
+    void loadJobs();
+  }, [loadJobs, runsKey]);
+  const active = jobs?.some((j) => j.state === "Queued" || j.state === "Running") ?? false;
+  useEffect(() => {
+    const timer = window.setInterval(() => void loadJobs(), active ? 3000 : 15000);
+    return () => window.clearInterval(timer);
+  }, [active, loadJobs]);
+  // The datasets Add schedule offers, read when the form opens.
+  useEffect(() => {
+    if (!adding) return;
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const response = await fetch(`${API}/sources`, { cache: "no-store" });
+        if (!response.ok) return;
+        const body: SourcesResponse = await response.json();
+        if (cancelled || !Array.isArray(body?.sources)) return;
+        setDatasets(body.sources.flatMap((s) => s.datasets.map((d) => ({ id: d.id, label: `${d.exchange} ${resolutionLabel(d.resolution)} · ${s.name}` }))));
+      } catch {
+        // the select stays as it was
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [adding]);
+  const toggleLog = async (id: string) => {
+    if (openLog?.id === id) {
+      setOpenLog(null);
+      return;
+    }
+    try {
+      const response = await fetch(`${API}/datasets/jobs/${encodeURIComponent(id)}/log`, { cache: "no-store" });
+      const text = response.ok ? await response.text() : await apiFailure(response);
+      setOpenLog({ id, text: text.trim() ? text : "(the log is empty; the job has not started writing it)" });
+    } catch (failure) {
+      setOpenLog({ id, text: String(failure) });
+    }
+  };
+  const shown = showAll ? (jobs ?? []) : (jobs ?? []).slice(0, JOBS_SHOWN);
+  const stateOf = (job: DatasetJob) => (job.state === "Running" ? `running ${job.percent}%` : job.state.toLowerCase());
+  const chosenDataset = form.dataset_id || datasets[0]?.id || "";
+  return (
+    <>
+      <section className="panel dataset-jobs-panel">
+        <div className="terminal-panel-title">
+          <span>JOB</span> UPDATES
+          <small>
+            ({jobs ? count(jobs.length) : "…"}
+            {jobs && jobs.length > JOBS_SHOWN ? (
+              <>
+                , <button type="button" className="text-action show-all-jobs" onClick={() => setShowAll((v) => !v)}>{showAll ? `show ${JOBS_SHOWN}` : "show all"}</button>
+              </>
+            ) : null}
+            )
+          </small>
+        </div>
+        {jobsError && <p className="source-error negative-text">{jobsError}</p>}
+        {jobs && jobs.length === 0 ? (
+          <p className="empty-state">no download jobs yet; Run now on a schedule or Update on a dataset queues one</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="dataset-jobs-table">
+              <thead>
+                <tr><th>Dataset</th><th>Kind</th><th>State</th><th>Started</th><th>Calls</th><th>Added</th><th>Updated</th><th>Error</th><th>Log</th></tr>
+              </thead>
+              <tbody>
+                {shown.map((job) => (
+                  <Fragment key={job.id}>
+                    <tr data-job-id={job.id}>
+                      <td className="job-dataset">{job.exchange} {resolutionLabel(job.resolution)}</td>
+                      <td>{job.trigger}</td>
+                      <td className={`job-state state-${job.state.toLowerCase()}`}>{stateOf(job)}</td>
+                      <td>{stampUtc(job.started_at ?? job.created_at)}</td>
+                      <td className="numeric-cell">{count(job.calls)}</td>
+                      <td className="numeric-cell">{count(job.added)}</td>
+                      <td className="numeric-cell">{count(job.updated)}</td>
+                      <td className="job-error">{job.error ?? "-"}</td>
+                      <td className="feature-actions">
+                        <button type="button" className="text-action job-log" onClick={() => void toggleLog(job.id)}>{openLog?.id === job.id ? "close" : "log ›"}</button>
+                      </td>
+                    </tr>
+                    {openLog?.id === job.id && (
+                      <tr className="job-log-row">
+                        <td colSpan={9}><pre>{openLog.text}</pre></td>
+                      </tr>
+                    )}
+                  </Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+      <section className="panel dataset-schedules-panel">
+        <div className="terminal-panel-title">
+          <span>SCH</span> SCHEDULES
+          <small>America/Los_Angeles · runs while the service is up</small>
+          <button type="button" className="text-action add-schedule-toggle" disabled={busy} onClick={() => setAdding((v) => !v)}>{adding ? "Cancel" : "Add schedule"}</button>
+        </div>
+        {own.length === 0 ? (
+          <p className="empty-state">no dataset schedules yet; Add schedule puts a dataset's update on the clock</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="dataset-schedules-table">
+              <thead>
+                <tr><th>Dataset</th><th>Time PT</th><th>Days</th><th>On</th><th>Last run</th><th>Last status</th><th>Last 7</th><th></th></tr>
+              </thead>
+              <tbody>
+                {own.map((s) => {
+                  const runs = (s.runs ?? []).slice(-SCHEDULE_MARKS);
+                  const padded: (AutomationRun | null)[] = [...Array<null>(SCHEDULE_MARKS - runs.length).fill(null), ...runs];
+                  return (
+                    <tr key={s.id} data-schedule-id={s.id}>
+                      <td className="schedule-dataset">{s.dataset ?? s.name}</td>
+                      <td>{s.local_time}</td>
+                      <td>{daysLabel(s.weekdays)}</td>
+                      <td className={s.enabled ? "schedule-on" : "schedule-off"}>{s.enabled ? "x" : "-"}</td>
+                      <td>{shortDate(s.last_run_date)}</td>
+                      <td className="schedule-status">{s.last_status ?? "never run"}</td>
+                      <td className="run-marks">
+                        {padded.map((run, i) => {
+                          const [mark, kind] = run ? runMark(run.status) : ["-", "none"];
+                          return <i key={i} className={`mark-${kind}`} title={run ? `${stampUtc(run.ran_at)} ${run.status}` : "no run"}>{mark}</i>;
+                        })}
+                      </td>
+                      <td className="feature-actions">
+                        <button type="button" className="text-action run-now" disabled={busy} onClick={() => onRun(s.id)}>Run now</button>
+                        <button type="button" className="text-action pause" disabled={busy} onClick={() => onToggle(s.id)}>{s.enabled ? "Pause" : "Enable"}</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {adding && (
+          <form
+            className="field-grid schedule-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              onCreate({ kind: "dataset_update", dataset_id: chosenDataset, local_time: form.local_time, weekdays: form.weekdays, enabled: form.enabled });
+              setForm(EMPTY_SCHEDULE_FORM);
+              setAdding(false);
+            }}
+          >
+            <label className="schedule-dataset-field">
+              <span>Dataset</span>
+              <select name="dataset_id" value={chosenDataset} onChange={(e) => setForm({ ...form, dataset_id: e.target.value })} required>
+                {datasets.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>Time PT</span>
+              <input name="local_time" type="time" value={form.local_time} onChange={(e) => setForm({ ...form, local_time: e.target.value })} required />
+            </label>
+            <label>
+              <span>Days</span>
+              <input name="weekdays" value={form.weekdays} onChange={(e) => setForm({ ...form, weekdays: e.target.value })} pattern="(mon|tue|wed|thu|fri|sat|sun)(,(mon|tue|wed|thu|fri|sat|sun))*" title="days as mon,tue,wed,thu,fri" required />
+            </label>
+            <label className="toggle-label"><input name="enabled" type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /><span>enable</span></label>
+            <div className="form-actions">
+              <button type="submit" className="secondary-action" disabled={busy || !chosenDataset}>Add</button>
+              <small>queues the dataset's job at that time on those days; a source with a job running is skipped, never queued twice</small>
+            </div>
+          </form>
+        )}
+      </section>
+    </>
+  );
+}
+
 /** The Data workspace: a tab strip over three views (decisions 0010, 0014), each opening at the top. */
 function DataWorkspace({
   view,
@@ -3752,9 +4019,16 @@ function DataWorkspace({
       {view === "instruments" && <InstrumentSearchView state={search} onChange={onSearch} />}
       {view === "updates" && (
         <>
+          <DatasetSchedules
+            schedules={schedules}
+            busy={busy}
+            onToggle={onToggleSchedule}
+            onRun={onRunSchedule}
+            onCreate={onCreateSchedule}
+          />
           <DataUpdatesPanel sources={sources} status={status} busy={busy} onRescan={onRescan} onUpdate={onUpdate} />
           <AutomationsWorkspace
-            schedules={schedules}
+            schedules={schedules.filter((s) => s.kind !== "dataset_update")}
             busy={busy}
             onToggle={onToggleSchedule}
             onRun={onRunSchedule}

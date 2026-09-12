@@ -24,8 +24,13 @@
 //      currency, status, EOD, 5m, 1m, tick) and a clicked row is the selection;
 //   3. after opening Studies and coming back, the Data page is still on Instrument search with
 //      the same query, the same rows, and the same selection (BT-608);
-//   4. scrolled to the bottom, switching to Updates & schedules lands at the top and shows the
-//      update command's state and the fixture's schedules;
+//   4. scrolled to the bottom, switching to Updates & schedules lands at the top and shows, above
+//      the legacy update command and its schedules, the native tables (DS-10, BT-1207): the jobs
+//      newest first under the wireframe's nine columns, twelve of them until Show all, the log
+//      opening in a row under its job; the dataset schedules under the wireframe's columns with
+//      seven marks each (o complete, ~ queued, . skipped, x failed, - none), Run now posting a
+//      run and Pause posting a toggle, and Add schedule as an inline form (no dialog) listing
+//      every registered dataset and posting a dataset_update schedule for the one chosen;
 //   5. a fresh page in the same browser storage opens the Data page on the view last chosen.
 // Every other API path proxies to the console at LAYOUT_CONSOLE when one answers and returns
 // 503 otherwise. Needs a Playwright-compatible Chromium like the layout check; without one, or
@@ -98,12 +103,70 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 /** The registered-source API's state for one browser context, reset per display mode. */
 let sources;
 let availability;
+/** The schedules (DS-10): the fixture's, plus what the page adds, runs, and toggles. */
+let automations;
 /** What the page posted, by endpoint, in order. */
 let posted;
 function resetSources() {
   sources = clone(fixture.registered.sources);
   availability = clone(fixture.availability);
-  posted = { sources: [], tokens: [], datasets: [], refreshes: [], scans: [], reserves: [] };
+  automations = clone(fixture.automations);
+  posted = { sources: [], tokens: [], datasets: [], refreshes: [], scans: [], reserves: [], automations: [], runs: [], toggles: [] };
+}
+const DATASET_SCHEDULES = fixture.automations.filter((a) => a.kind === "dataset_update");
+const LEGACY_SCHEDULES = fixture.automations.filter((a) => a.kind !== "dataset_update");
+const JOB_COLUMNS = ["Dataset", "Kind", "State", "Started", "Calls", "Added", "Updated", "Error", "Log"];
+const SCHEDULE_COLUMNS = ["Dataset", "Time PT", "Days", "On", "Last run", "Last status", "Last 7", ""];
+const JOBS_SHOWN = 12;
+const UPDATES_ORDER = ["dataset-jobs-panel", "dataset-schedules-panel", "data-updates-panel", "automation-panel"];
+/** The console's mark for a run's status, and a schedule's seven marks padded on the left. */
+const markOf = (status) => (status === "complete" ? "o" : status.startsWith("failed") ? "x" : status.startsWith("skipped") ? "." : status.startsWith("queued") ? "~" : "?");
+const marksOf = (runs) => `${"-".repeat(Math.max(0, 7 - runs.length))}${runs.slice(-7).map((r) => markOf(r.status)).join("")}`;
+const datasetLabel = (d) => `${d.exchange} ${d.resolution === "daily" ? "EOD" : d.resolution}`;
+/** The schedules API, stateful: a created schedule is listed, Run now appends a run, toggle flips enabled. */
+async function automationsApi(pathname, req) {
+  const method = req.method ?? "GET";
+  if (pathname === "/api/automations") {
+    if (method === "GET") return json(automations);
+    if (method === "POST") {
+      const request = JSON.parse(await readBody(req));
+      posted.automations.push(request);
+      const dataset = sources.flatMap((s) => s.datasets).find((d) => d.id === request.dataset_id);
+      if (request.kind === "dataset_update" && !dataset) return json({ error: `no dataset ${request.dataset_id}` }, 404);
+      const label = dataset ? datasetLabel(dataset) : null;
+      const created = {
+        id: `automation-fixture-${posted.automations.length}`,
+        name: request.name || label,
+        kind: request.kind,
+        enabled: Boolean(request.enabled),
+        local_time: request.local_time,
+        weekdays: request.weekdays,
+        last_run_date: null,
+        last_status: null,
+        created_at: "2026-09-11T20:40:00+00:00",
+        dataset_id: dataset?.id ?? null,
+        dataset: label,
+        runs: [],
+      };
+      automations.push(created);
+      return json(created, 201);
+    }
+  }
+  const match = pathname.match(/^\/api\/automations\/([^/]+)\/(run|toggle)$/);
+  if (!match || method !== "POST") return json({ error: `the fixture does not answer ${method} ${pathname}` }, 405);
+  const schedule = automations.find((a) => a.id === match[1]);
+  if (!schedule) return json({ error: `no schedule ${match[1]}` }, 404);
+  if (match[2] === "toggle") {
+    posted.toggles.push(schedule.id);
+    schedule.enabled = !schedule.enabled;
+  } else {
+    posted.runs.push(schedule.id);
+    const run = { ran_at: "2026-09-11T20:41:00+00:00", status: `queued job-fixture-${posted.runs.length}`, job_id: `job-fixture-${posted.runs.length}` };
+    schedule.runs = [...(schedule.runs ?? []), run].slice(-7);
+    schedule.last_status = run.status;
+    schedule.last_run_date = "2026-09-11";
+  }
+  return json(schedule);
 }
 resetSources();
 const findSource = (id) => sources.find((s) => s.id === id);
@@ -206,9 +269,11 @@ async function sourcesApi(pathname, req) {
 const fixtureApi = async (pathname, req) => {
   if (pathname === "/api/data/sources") return json(fixture.sources);
   if (pathname === "/api/data/status") return json(fixture.status);
-  if (pathname === "/api/automations") return json(fixture.automations);
+  if (pathname.startsWith("/api/automations")) return automationsApi(pathname, req);
   if (pathname === "/api/instruments") return json(searchInstruments(new URL(req.url ?? "/", "http://localhost").searchParams));
   if (pathname.startsWith("/api/sources")) return sourcesApi(pathname, req);
+  if (pathname === "/api/datasets/jobs" && req.method === "GET") return json(fixture.jobs);
+  if (/^\/api\/datasets\/jobs\/[^/]+\/log$/.test(pathname) && req.method === "GET") return { status: 200, type: "text/plain; charset=utf-8", body: fixture.job_log };
   if (pathname.startsWith("/api/datasets/") && req.method === "DELETE") {
     const dataset = pathname.slice("/api/datasets/".length);
     for (const source of sources) source.datasets = source.datasets.filter((d) => d.id !== dataset);
@@ -300,6 +365,31 @@ function readAvailability() {
           fetch: Boolean(tr.querySelector("button.fetch-listing")),
         }))
       : null,
+  };
+}
+/** Runs in the page: the Updates & schedules view's panels in order, its jobs table, its schedules table, and the open log. */
+function readUpdates() {
+  const text = (el) => el?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+  const workspace = document.querySelector(".data-workspace");
+  const known = ["dataset-jobs-panel", "dataset-schedules-panel", "data-updates-panel", "automation-panel"];
+  const jobsTable = document.querySelector("table.dataset-jobs-table");
+  const schedulesTable = document.querySelector("table.dataset-schedules-table");
+  return {
+    panels: workspace ? [...workspace.querySelectorAll(":scope > section")].map((el) => known.find((k) => el.classList.contains(k)) ?? el.className) : null,
+    title: text(document.querySelector(".dataset-jobs-panel .terminal-panel-title")),
+    jobColumns: jobsTable ? [...jobsTable.querySelectorAll("thead th")].map((th) => th.textContent.trim()) : null,
+    jobs: jobsTable ? [...jobsTable.querySelectorAll("tbody tr[data-job-id]")].map((tr) => ({ id: tr.dataset.jobId, cells: [...tr.querySelectorAll("td")].map((td) => text(td)) })) : null,
+    log: text(document.querySelector("tr.job-log-row pre")),
+    scheduleColumns: schedulesTable ? [...schedulesTable.querySelectorAll("thead th")].map((th) => th.textContent.trim()) : null,
+    schedules: schedulesTable
+      ? [...schedulesTable.querySelectorAll("tbody tr[data-schedule-id]")].map((tr) => ({
+          id: tr.dataset.scheduleId,
+          cells: [...tr.querySelectorAll("td")].map((td) => text(td)),
+          marks: [...tr.querySelectorAll(".run-marks i")].map((i) => i.textContent).join(""),
+          buttons: [...tr.querySelectorAll("button")].map((b) => b.textContent.trim()),
+        }))
+      : null,
+    form: Boolean(document.querySelector("form.schedule-form")),
   };
 }
 /** Runs in the page: whether the Data workspace fits the viewport, and which tables or elements do not. */
@@ -601,8 +691,8 @@ try {
       if (updates.scrollY !== 0) fail(`Updates & schedules opened scrolled (scrollY ${updates.scrollY})`);
       if (await page.locator(".data-workspace .instrument-search-view").count()) fail("Updates & schedules still shows the instrument search");
       const schedules = await page.locator(".data-workspace .automation-list article").allTextContents();
-      for (const schedule of fixture.automations) {
-        if (!schedules.some((text) => text.includes(schedule.name))) fail(`Updates & schedules does not list the schedule ${JSON.stringify(schedule.name)}`);
+      for (const schedule of LEGACY_SCHEDULES) {
+        if (!schedules.some((text) => text.includes(schedule.name))) fail(`Updates & schedules does not list the legacy schedule ${JSON.stringify(schedule.name)}`);
       }
       const jobs = await page.locator(".data-updates-panel").textContent().catch(() => null);
       if (jobs == null) fail("Updates & schedules has no updates panel (.data-updates-panel)");
@@ -610,6 +700,109 @@ try {
         if (!jobs.includes(fixture.sources.csv_library.update_command)) fail("the updates panel does not name the update command");
         if (!jobs.includes(fixture.status.update_job.status)) fail(`the updates panel does not show the last update's state ${JSON.stringify(fixture.status.update_job.status)}`);
       }
+
+      // The native tables (DS-10, BT-1207): the jobs newest first under the nine columns,
+      // twelve until Show all, the log opening under its row; the schedules with their seven
+      // marks, Run now, Pause; Add schedule inline listing the registered datasets; all of it
+      // above the legacy panels.
+      await page.locator("table.dataset-jobs-table tbody tr[data-job-id]").first().waitFor({ timeout: 10000 }).catch(() => fail("no jobs table (table.dataset-jobs-table) with rows on Updates & schedules"));
+      await page.locator("table.dataset-schedules-table tbody tr[data-schedule-id]").first().waitFor({ timeout: 10000 }).catch(() => fail("no schedules table (table.dataset-schedules-table) with rows on Updates & schedules"));
+      const native = await page.evaluate(readUpdates);
+      note(`native ${JSON.stringify(native)}`);
+      if (JSON.stringify(native.panels) !== JSON.stringify(UPDATES_ORDER)) fail(`Updates & schedules' panels are ${JSON.stringify(native.panels)}, the wireframe orders them ${JSON.stringify(UPDATES_ORDER)} (the new tables above the legacy panels)`);
+      if (!native.jobColumns) fail("no jobs table");
+      else if (native.jobColumns.join("|") !== JOB_COLUMNS.join("|")) fail(`the jobs table's columns are ${JSON.stringify(native.jobColumns)}, not ${JSON.stringify(JOB_COLUMNS)}`);
+      const capped = Math.min(JOBS_SHOWN, fixture.jobs.length);
+      if ((native.jobs?.length ?? 0) !== capped) fail(`the jobs table lists ${native.jobs?.length ?? 0} rows, the cap is ${capped} of the fixture's ${fixture.jobs.length}`);
+      if (JSON.stringify(native.jobs?.map((j) => j.id)) !== JSON.stringify(fixture.jobs.slice(0, capped).map((j) => j.id))) fail(`the jobs are not the fixture's newest first: ${JSON.stringify(native.jobs?.map((j) => j.id))}`);
+      if (!native.title.includes(`(${fixture.jobs.length}`) || !/show all/i.test(native.title)) fail(`the jobs title reads ${JSON.stringify(native.title)}, not "(${fixture.jobs.length}, show all)"`);
+      const running = native.jobs?.[0]?.cells ?? [];
+      const expectRunning = ["US EOD", "scheduled", "running 62%", "09-12 02:15", "1,204", "0", "11,350", "-"];
+      if (running.slice(0, expectRunning.length).join("|") !== expectRunning.join("|")) fail(`the first job row reads ${JSON.stringify(running)}, not ${JSON.stringify(expectRunning)}`);
+      const failed = native.jobs?.find((j) => j.id === fixture.jobs.find((f) => f.state === "Failed").id);
+      if (!failed?.cells[1].includes("manual") || !failed?.cells[7].includes("not mounted")) fail(`the failed manual job's row reads ${JSON.stringify(failed?.cells)}`);
+      if (fixture.jobs.length > JOBS_SHOWN) {
+        await page.locator(".dataset-jobs-panel button.show-all-jobs").click();
+        await page.waitForTimeout(200);
+        const all = await page.evaluate(readUpdates);
+        if ((all.jobs?.length ?? 0) !== fixture.jobs.length) fail(`after Show all the jobs table lists ${all.jobs?.length ?? 0} rows, the fixture holds ${fixture.jobs.length}`);
+      }
+      await page.locator(`table.dataset-jobs-table tr[data-job-id='${fixture.jobs[0].id}'] button.job-log`).click();
+      await page.locator("tr.job-log-row pre").waitFor({ timeout: 5000 }).catch(() => fail("clicking a job's log opened no log row under it"));
+      const withLog = await page.evaluate(readUpdates);
+      if (!withLog.log.includes(fixture.job_log.split("\n")[0])) fail(`the opened log reads ${JSON.stringify(withLog.log.slice(0, 80))}, not the fixture's log`);
+      if (await page.locator("dialog[open]").count()) fail("the log opened a dialog");
+      if (!native.scheduleColumns) fail("no schedules table");
+      else if (native.scheduleColumns.join("|") !== SCHEDULE_COLUMNS.join("|")) fail(`the schedules table's columns are ${JSON.stringify(native.scheduleColumns)}, not ${JSON.stringify(SCHEDULE_COLUMNS)}`);
+      if ((native.schedules?.length ?? 0) !== DATASET_SCHEDULES.length) fail(`the schedules table lists ${native.schedules?.length ?? 0} rows, the fixture holds ${DATASET_SCHEDULES.length} dataset schedules`);
+      for (const schedule of DATASET_SCHEDULES) {
+        const row = native.schedules?.find((r) => r.id === schedule.id);
+        if (!row) {
+          fail(`no row for the schedule ${schedule.id}`);
+          continue;
+        }
+        const want = marksOf(schedule.runs ?? []);
+        if (row.marks.length !== 7) fail(`the ${schedule.name} row shows ${row.marks.length} marks, not seven`);
+        if (row.marks !== want) fail(`the ${schedule.name} row's marks are ${JSON.stringify(row.marks)}, its runs make ${JSON.stringify(want)}`);
+        if (row.cells[0] !== schedule.dataset) fail(`the ${schedule.name} row names ${JSON.stringify(row.cells[0])}`);
+        if (row.cells[1] !== schedule.local_time) fail(`the ${schedule.name} row's time reads ${JSON.stringify(row.cells[1])}`);
+        if (row.cells[3] !== (schedule.enabled ? "x" : "-")) fail(`the ${schedule.name} row's ON reads ${JSON.stringify(row.cells[3])}`);
+        if (!row.cells[5].includes(schedule.last_status ?? "never run")) fail(`the ${schedule.name} row's status reads ${JSON.stringify(row.cells[5])}`);
+        if (JSON.stringify(row.buttons) !== JSON.stringify(["Run now", schedule.enabled ? "Pause" : "Enable"])) fail(`the ${schedule.name} row's actions are ${JSON.stringify(row.buttons)}`);
+      }
+      const usEod = native.schedules?.find((r) => r.cells[0] === "US EOD");
+      if (usEod && usEod.cells[2] !== "mon-fri") fail(`the US EOD row's days read ${JSON.stringify(usEod.cells[2])}, not mon-fri`);
+      // Run now posts a run for that schedule; Pause posts a toggle and the button flips.
+      const firstSchedule = DATASET_SCHEDULES[0];
+      await page.locator(`tr[data-schedule-id='${firstSchedule.id}'] button.run-now`).click();
+      if (!(await postedCount("runs", 1))) fail("Run now posted nothing");
+      else if (posted.runs[0] !== firstSchedule.id) fail(`Run now posted a run for ${posted.runs[0]}, not ${firstSchedule.id}`);
+      await page.waitForTimeout(300);
+      const afterRun = await page.evaluate(readUpdates);
+      if (!afterRun.schedules?.find((r) => r.id === firstSchedule.id)?.cells[5].includes("queued job-fixture-1")) fail("after Run now the row does not show the run the service answered with");
+      await page.locator(`tr[data-schedule-id='${firstSchedule.id}'] button.pause`).click();
+      if (!(await postedCount("toggles", 1))) fail("Pause posted nothing");
+      else if (posted.toggles[0] !== firstSchedule.id) fail(`Pause posted a toggle for ${posted.toggles[0]}, not ${firstSchedule.id}`);
+      await page.waitForTimeout(300);
+      const afterPause = await page.evaluate(readUpdates);
+      if (!afterPause.schedules?.find((r) => r.id === firstSchedule.id)?.buttons.includes("Enable")) fail("after Pause the row's button does not read Enable");
+      // Add schedule: inline, the datasets from every registered source, the chosen one posted.
+      await page.locator(".dataset-schedules-panel button.add-schedule-toggle").click();
+      const scheduleForm = page.locator("form.schedule-form");
+      await scheduleForm.waitFor({ timeout: 5000 });
+      if (await page.locator("dialog[open]").count()) fail("Add schedule opened a dialog");
+      await scheduleForm.locator("select[name='dataset_id'] option").nth(CONNECTED.datasets.length).waitFor({ state: "attached", timeout: 5000 }).catch(() => fail("Add schedule's dataset select did not fill from the registered sources"));
+      const options = await scheduleForm.locator("select[name='dataset_id'] option").evaluateAll((els) => els.map((el) => [el.value, el.textContent.trim()]));
+      const registered = sources.flatMap((s) => s.datasets.map((d) => d.id));
+      if (JSON.stringify(options.map(([v]) => v)) !== JSON.stringify(registered)) fail(`Add schedule offers the datasets ${JSON.stringify(options.map(([v]) => v))}, the sources register ${JSON.stringify(registered)}`);
+      const eodOption = options.find(([v]) => v === CONNECTED.datasets[0].id);
+      if (!eodOption?.[1].startsWith("US EOD")) fail(`the first dataset's option reads ${JSON.stringify(eodOption?.[1])}, not "US EOD ..."`);
+      const chosen = CONNECTED.datasets[1];
+      await scheduleForm.locator("select[name='dataset_id']").selectOption(chosen.id);
+      await scheduleForm.locator("input[name='local_time']").fill("20:30");
+      await scheduleForm.locator("button[type='submit']").click();
+      if (!(await postedCount("automations", 1))) fail("saving Add schedule posted nothing");
+      else {
+        const body = posted.automations[0];
+        const want = { kind: "dataset_update", dataset_id: chosen.id, local_time: "20:30", weekdays: "mon,tue,wed,thu,fri", enabled: true };
+        if (JSON.stringify(body) !== JSON.stringify(want)) fail(`Add schedule posted ${JSON.stringify(body)}, not ${JSON.stringify(want)}`);
+      }
+      await page.waitForTimeout(300);
+      if (await scheduleForm.count()) fail("the Add schedule form is still open after the save");
+      const afterAdd = await page.evaluate(readUpdates);
+      if ((afterAdd.schedules?.length ?? 0) !== DATASET_SCHEDULES.length + 1) fail(`after Add schedule the table lists ${afterAdd.schedules?.length ?? 0} rows, not ${DATASET_SCHEDULES.length + 1}`);
+      if (!afterAdd.schedules?.some((r) => r.id === "automation-fixture-1" && r.cells[0] === datasetLabel(chosen) && r.marks === "-------")) fail("the schedule just added has no row with its dataset and seven empty marks");
+      // The seeded view fits a 13-inch laptop like Inventory does.
+      for (const width of [1280, 1440]) {
+        await page.setViewportSize({ width, height: 800 });
+        await page.waitForTimeout(200);
+        const fit = await page.evaluate(measureFit);
+        note(`updates ${width}px ${JSON.stringify(fit)}`);
+        if (fit.scrollWidth > fit.innerWidth) fail(`at ${width}px Updates & schedules scrolls horizontally (${fit.scrollWidth}px in a ${fit.innerWidth}px viewport)`);
+        for (const wide of fit.wide) fail(`at ${width}px the ${wide.table} table is ${wide.width}px in a ${wide.wrapper}px wrapper`);
+        for (const past of fit.past) fail(`at ${width}px ${past.element} passes the viewport (right edge ${past.right}px)`);
+      }
+      await page.setViewportSize({ width: 1440, height: 700 });
 
       // 5. A fresh page in the same storage opens the Data page on the last view.
       const fresh = await context.newPage();
@@ -637,5 +830,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `data-page-check: ok (web/fixtures/data-sources.json, terminal and modern; three views each at the top, Inventory's panels in wireframe order with ${fixture.registered.sources.length} source cards (one Credentials rejected, ${CONNECTED.datasets.length} datasets and an Uncataloged folder on the first), the availability table listed 09-11 02:00 with LSE fetched on expand, Add dataset, Replace token, and Add source posted inline with the token nowhere after, ${JSON.stringify(QUERY)} listing ${expectedHits} of ${fixture.instruments.length} instruments with ${PICK} selected and kept across Studies, ${fixture.automations.length} schedules on Updates, the last view remembered; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `data-page-check: ok (web/fixtures/data-sources.json, terminal and modern; three views each at the top, Inventory's panels in wireframe order with ${fixture.registered.sources.length} source cards (one Credentials rejected, ${CONNECTED.datasets.length} datasets and an Uncataloged folder on the first), the availability table listed 09-11 02:00 with LSE fetched on expand, Add dataset, Replace token, and Add source posted inline with the token nowhere after, ${JSON.stringify(QUERY)} listing ${expectedHits} of ${fixture.instruments.length} instruments with ${PICK} selected and kept across Studies, ${fixture.jobs.length} jobs on Updates (${JOBS_SHOWN} then Show all, the log opened from a row) over ${DATASET_SCHEDULES.length} dataset schedules with seven marks each, Run now and Pause posted, Add schedule posted inline for one of ${CONNECTED.datasets.length + 1} registered datasets, ${LEGACY_SCHEDULES.length} legacy schedules under them, the last view remembered; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );
