@@ -748,6 +748,11 @@ fn api_router() -> Router<AppState> {
         .route("/api/sources/{id}", delete(delete_source))
         .route("/api/sources/{id}/token", put(replace_token))
         .route("/api/sources/{id}/verify", post(verify_source))
+        .route("/api/sources/{id}/availability", get(availability))
+        .route(
+            "/api/sources/{id}/availability/refresh",
+            post(refresh_availability),
+        )
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -977,7 +982,33 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_strategy_drafts_updated
          ON strategy_drafts(updated_at DESC);
          CREATE INDEX IF NOT EXISTS idx_strategy_validations_draft_created
-         ON strategy_validations(draft_id, created_at DESC);",
+         ON strategy_validations(draft_id, created_at DESC);
+         CREATE TABLE IF NOT EXISTS provider_exchanges (
+             source_id TEXT NOT NULL REFERENCES data_sources(id) ON DELETE CASCADE,
+             code TEXT NOT NULL,
+             name TEXT NOT NULL,
+             country TEXT NOT NULL,
+             resolutions TEXT NOT NULL,
+             fetched_at TEXT NOT NULL,
+             PRIMARY KEY (source_id, code)
+         );
+         CREATE TABLE IF NOT EXISTS provider_listings (
+             source_id TEXT NOT NULL REFERENCES data_sources(id) ON DELETE CASCADE,
+             exchange TEXT NOT NULL,
+             code TEXT NOT NULL,
+             name TEXT NOT NULL,
+             type TEXT NOT NULL,
+             currency TEXT NOT NULL,
+             delisted INTEGER NOT NULL DEFAULT 0,
+             fetched_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_provider_listings_exchange
+         ON provider_listings(source_id, exchange, delisted);
+         CREATE TABLE IF NOT EXISTS provider_refreshes (
+             source_id TEXT PRIMARY KEY REFERENCES data_sources(id) ON DELETE CASCADE,
+             attempted_at TEXT NOT NULL,
+             error TEXT
+         );",
     )?;
     ensure_column(
         connection,
@@ -4351,9 +4382,33 @@ impl SourceAdapter {
         }
     }
 
+    /// The adapter for a registered source, built from the token on file; 409 when no token
+    /// file exists (a restored catalog), as `verify` answers.
+    fn from_file(state: &AppState, row: &SourceRow) -> Result<Self, ApiError> {
+        let token = read_token(state, &row.id)
+            .map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
+        Ok(SourceAdapter::new(state, &row.kind, &token)?)
+    }
+
     async fn verify(&self, token: &str) -> Result<tessera::provider::Account, ProviderError> {
         match self {
             SourceAdapter::Eodhd(eodhd) => eodhd.verify(token).await,
+        }
+    }
+
+    async fn exchanges(&self) -> Result<Vec<tessera::provider::Exchange>, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.exchanges().await,
+        }
+    }
+
+    async fn symbols(
+        &self,
+        exchange: &str,
+        delisted: bool,
+    ) -> Result<Vec<tessera::provider::Listing>, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.symbols(exchange, delisted).await,
         }
     }
 }
@@ -4805,6 +4860,338 @@ async fn delete_source(
     }
     remove_token(&state, &id)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// The provider's availability (DS-04, decisions 0013 and 0020): a source's exchange list and
+// the listings of its exchanges, cached in the catalog with the time fetched and served with
+// per-type counts. A refresh that fails keeps the rows fetched before and records why as a
+// note, so the console shows a stale table as a visible state, never an empty one.
+// ---------------------------------------------------------------------------
+
+/// What a refresh may ask for: one exchange's listing instead of the listings of every
+/// exchange with a dataset.
+#[derive(Debug, Default, Deserialize)]
+struct RefreshAvailabilityRequest {
+    exchange: Option<String>,
+}
+
+/// The listed instruments of one of the provider's types, named as the provider names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct TypeCount {
+    #[serde(rename = "type")]
+    kind: String,
+    count: u64,
+}
+
+/// One exchange of the cached table, with its active listing counted when that is cached.
+#[derive(Debug, Clone, Serialize)]
+struct AvailableExchange {
+    code: String,
+    name: String,
+    country: String,
+    resolutions: Vec<String>,
+    fetched_at: String,
+    /// When the exchange's listing was fetched; `None` until it has been.
+    listings_fetched_at: Option<String>,
+    listed: u64,
+    types: Vec<TypeCount>,
+}
+
+/// A source's cached availability: what `GET /api/sources/{id}/availability` serves.
+#[derive(Debug, Clone, Serialize)]
+struct AvailabilityResponse {
+    source_id: String,
+    /// When the exchange list was fetched; `None` until a refresh has succeeded.
+    fetched_at: Option<String>,
+    /// When a refresh was last attempted, whether or not it succeeded.
+    refreshed_at: Option<String>,
+    /// Why the last refresh failed, when it did; the rows are then the ones fetched before.
+    unreachable: Option<String>,
+    exchanges: Vec<AvailableExchange>,
+}
+
+/// Replaces the source's exchange rows with `exchanges`, all stamped `fetched_at`.
+fn store_exchanges(
+    connection: &mut Connection,
+    source_id: &str,
+    exchanges: &[tessera::provider::Exchange],
+    fetched_at: &str,
+) -> Result<()> {
+    let tx = connection.transaction()?;
+    tx.execute(
+        "DELETE FROM provider_exchanges WHERE source_id = ?1",
+        [source_id],
+    )?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT OR REPLACE INTO provider_exchanges
+             (source_id, code, name, country, resolutions, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for exchange in exchanges {
+            insert.execute(params![
+                source_id,
+                exchange.code,
+                exchange.name,
+                exchange.country,
+                serde_json::to_string(&exchange.resolutions)?,
+                fetched_at
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replaces the source's cached listing of `exchange` (the active or the delisted one) with
+/// `listings`, all stamped `fetched_at`.
+fn store_listings(
+    connection: &mut Connection,
+    source_id: &str,
+    exchange: &str,
+    delisted: bool,
+    listings: &[tessera::provider::Listing],
+    fetched_at: &str,
+) -> Result<()> {
+    let tx = connection.transaction()?;
+    tx.execute(
+        "DELETE FROM provider_listings
+         WHERE source_id = ?1 AND exchange = ?2 AND delisted = ?3",
+        params![source_id, exchange, delisted],
+    )?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO provider_listings
+             (source_id, exchange, code, name, type, currency, delisted, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for listing in listings {
+            insert.execute(params![
+                source_id,
+                exchange,
+                listing.code,
+                listing.name,
+                listing.kind,
+                listing.currency,
+                delisted,
+                fetched_at
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Records a refresh attempt: its time and, when it failed, why.
+fn record_refresh(
+    connection: &Connection,
+    source_id: &str,
+    attempted_at: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO provider_refreshes (source_id, attempted_at, error) VALUES (?1, ?2, ?3)
+         ON CONFLICT(source_id) DO UPDATE
+         SET attempted_at = excluded.attempted_at, error = excluded.error",
+        params![source_id, attempted_at, error],
+    )?;
+    Ok(())
+}
+
+/// The exchanges with a dataset registered against the source: read from the `datasets`
+/// table (DS-05) when it exists, none before it does.
+fn exchanges_with_datasets(connection: &Connection, source_id: &str) -> Result<Vec<String>> {
+    let tables: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'datasets'",
+        [],
+        |row| row.get(0),
+    )?;
+    if tables == 0 {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT DISTINCT exchange FROM datasets WHERE source_id = ?1 ORDER BY exchange")?;
+    let codes = statement
+        .query_map([source_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(codes)
+}
+
+/// The cached table for a source, each exchange's active listing counted by type.
+fn load_availability(connection: &Connection, source_id: &str) -> Result<AvailabilityResponse> {
+    let (refreshed_at, unreachable) = connection
+        .query_row(
+            "SELECT attempted_at, error FROM provider_refreshes WHERE source_id = ?1",
+            [source_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .map_or((None, None), |(attempted, error)| (Some(attempted), error));
+
+    // exchange -> (listing fetched at, listed, counts by type, largest type first)
+    let mut listings: std::collections::HashMap<String, (Option<String>, u64, Vec<TypeCount>)> =
+        std::collections::HashMap::new();
+    {
+        let mut statement = connection.prepare(
+            "SELECT exchange, type, COUNT(*), MIN(fetched_at) FROM provider_listings
+             WHERE source_id = ?1 AND delisted = 0
+             GROUP BY exchange, type ORDER BY exchange, COUNT(*) DESC, type",
+        )?;
+        let rows = statement.query_map([source_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (exchange, kind, count, fetched_at) = row?;
+            let count = u64::try_from(count).unwrap_or(0);
+            let entry = listings
+                .entry(exchange)
+                .or_insert_with(|| (None, 0, Vec::new()));
+            entry.0.get_or_insert(fetched_at);
+            entry.1 += count;
+            entry.2.push(TypeCount { kind, count });
+        }
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT code, name, country, resolutions, fetched_at FROM provider_exchanges
+         WHERE source_id = ?1 ORDER BY code",
+    )?;
+    let rows = statement
+        .query_map([source_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut fetched_at: Option<String> = None;
+    let exchanges = rows
+        .into_iter()
+        .map(|(code, name, country, resolutions, fetched)| {
+            fetched_at.get_or_insert_with(|| fetched.clone());
+            let (listings_fetched_at, listed, types) =
+                listings.remove(&code).unwrap_or((None, 0, Vec::new()));
+            AvailableExchange {
+                resolutions: serde_json::from_str(&resolutions).unwrap_or_default(),
+                code,
+                name,
+                country,
+                fetched_at: fetched,
+                listings_fetched_at,
+                listed,
+                types,
+            }
+        })
+        .collect();
+    Ok(AvailabilityResponse {
+        source_id: source_id.to_owned(),
+        fetched_at,
+        refreshed_at,
+        unreachable,
+        exchanges,
+    })
+}
+
+async fn availability(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<AvailabilityResponse>, ApiError> {
+    load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    let worker = state.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let connection = worker.database.lock().expect("database lock poisoned");
+        load_availability(&connection, &id)
+    })
+    .await
+    .context("availability task failed")??;
+    Ok(Json(response))
+}
+
+/// Fetches the exchange list and the active listings of every exchange with a dataset, or of
+/// the one exchange the body names (`{"exchange": "US"}`; an empty body means every one),
+/// and caches them stamped with the time. 200 with the table whatever the provider said: a
+/// call that fails leaves the rows fetched before and shows as the `unreachable` note.
+async fn refresh_availability(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: String,
+) -> Result<Json<AvailabilityResponse>, ApiError> {
+    let row = load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    let request: RefreshAvailabilityRequest = if body.trim().is_empty() {
+        RefreshAvailabilityRequest::default()
+    } else {
+        serde_json::from_str(&body).context("read the refresh request")?
+    };
+    let adapter = SourceAdapter::from_file(&state, &row)?;
+    let attempted_at = Utc::now().to_rfc3339();
+
+    let exchanges = match adapter.exchanges().await {
+        Ok(exchanges) => exchanges,
+        Err(error) => {
+            let connection = state.database.lock().expect("database lock poisoned");
+            record_refresh(&connection, &id, &attempted_at, Some(&error.to_string()))?;
+            return Ok(Json(load_availability(&connection, &id)?));
+        }
+    };
+    let wanted: Vec<String> = match request.exchange {
+        Some(code) => {
+            let code = code.trim().to_owned();
+            require_api(
+                exchanges.iter().any(|exchange| exchange.code == code),
+                format!("{} lists no exchange {code:?}", row.name),
+            )?;
+            vec![code]
+        }
+        None => {
+            let connection = state.database.lock().expect("database lock poisoned");
+            exchanges_with_datasets(&connection, &id)?
+        }
+    };
+    {
+        let mut connection = state.database.lock().expect("database lock poisoned");
+        store_exchanges(&mut connection, &id, &exchanges, &attempted_at)?;
+    }
+
+    let mut failure: Option<String> = None;
+    for code in wanted {
+        match adapter.symbols(&code, false).await {
+            Ok(listings) => {
+                let worker = state.clone();
+                let source_id = id.clone();
+                let stamp = attempted_at.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut connection = worker.database.lock().expect("database lock poisoned");
+                    store_listings(&mut connection, &source_id, &code, false, &listings, &stamp)
+                })
+                .await
+                .context("listing store task failed")??;
+            }
+            Err(error) => {
+                failure = Some(format!("{code}: {error}"));
+                break;
+            }
+        }
+    }
+    let worker = state.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let connection = worker.database.lock().expect("database lock poisoned");
+        record_refresh(&connection, &id, &attempted_at, failure.as_deref())?;
+        load_availability(&connection, &id)
+    })
+    .await
+    .context("availability task failed")??;
+    Ok(Json(response))
 }
 
 // ---------------------------------------------------------------------------
@@ -7478,31 +7865,86 @@ mod tests {
             down: Arc<AtomicBool>,
         }
 
-        async fn stub_user(
-            State(stub): State<Stub>,
-            AxumQuery(query): AxumQuery<Vec<(String, String)>>,
-        ) -> Response {
+        /// The stub's refusals before any fixture is served: 503 while it is down, 401 for a
+        /// token it does not know.
+        fn gate(stub: &Stub, query: &[(String, String)]) -> Option<Response> {
             if stub.down.load(Ordering::SeqCst) {
-                return (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").into_response();
+                return Some(
+                    (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").into_response(),
+                );
             }
             let token = query
                 .iter()
                 .find(|(k, _)| k == "api_token")
                 .map(|(_, v)| v.as_str());
             if token != Some(TOKEN) && token != Some(REPLACEMENT) {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    [("content-type", "application/json")],
-                    r#"{"message":"Unauthenticated","code":401}"#,
-                )
-                    .into_response();
+                return Some(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [("content-type", "application/json")],
+                        r#"{"message":"Unauthenticated","code":401}"#,
+                    )
+                        .into_response(),
+                );
             }
-            let body = fs::read_to_string(format!(
-                "{}/tests/fixtures/eodhd/user.json",
+            None
+        }
+
+        fn fixture(name: &str) -> String {
+            fs::read_to_string(format!(
+                "{}/tests/fixtures/eodhd/{name}.json",
                 env!("CARGO_MANIFEST_DIR")
             ))
-            .unwrap();
-            (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+            .unwrap()
+        }
+
+        fn json_response(status: StatusCode, body: String) -> Response {
+            (status, [("content-type", "application/json")], body).into_response()
+        }
+
+        async fn stub_user(
+            State(stub): State<Stub>,
+            AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+        ) -> Response {
+            if let Some(refused) = gate(&stub, &query) {
+                return refused;
+            }
+            json_response(StatusCode::OK, fixture("user"))
+        }
+
+        async fn stub_exchanges(
+            State(stub): State<Stub>,
+            AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+        ) -> Response {
+            if let Some(refused) = gate(&stub, &query) {
+                return refused;
+            }
+            json_response(StatusCode::OK, fixture("exchanges-list"))
+        }
+
+        /// US answers DS-02's recorded list, LSE two rows of its own, anything else the
+        /// provider's 404.
+        async fn stub_symbols(
+            State(stub): State<Stub>,
+            AxumPath(exchange): AxumPath<String>,
+            AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+        ) -> Response {
+            if let Some(refused) = gate(&stub, &query) {
+                return refused;
+            }
+            match exchange.as_str() {
+                "US" => json_response(StatusCode::OK, fixture("exchange-symbol-list-US")),
+                "LSE" => json_response(
+                    StatusCode::OK,
+                    r#"[{"Code":"VOD","Name":"Vodafone Group","Type":"Common Stock","Currency":"GBP"},
+                        {"Code":"ISF","Name":"iShares Core FTSE 100","Type":"ETF","Currency":"GBP"}]"#
+                        .to_owned(),
+                ),
+                _ => json_response(
+                    StatusCode::NOT_FOUND,
+                    r#"{"message":"Unknown exchange"}"#.to_owned(),
+                ),
+            }
         }
 
         async fn serve(router: Router) -> String {
@@ -7512,11 +7954,14 @@ mod tests {
             format!("http://{addr}")
         }
 
-        /// The DS-02 stub's `/api/user`, with a switch that makes it answer 503.
+        /// The DS-02 stub's `/api/user`, `/api/exchanges-list/`, and
+        /// `/api/exchange-symbol-list/{code}`, with a switch that makes every route answer 503.
         async fn stub() -> (String, Arc<AtomicBool>) {
             let down = Arc::new(AtomicBool::new(false));
             let router = Router::new()
                 .route("/api/user", get(stub_user))
+                .route("/api/exchanges-list/", get(stub_exchanges))
+                .route("/api/exchange-symbol-list/{exchange}", get(stub_symbols))
                 .with_state(Stub { down: down.clone() });
             (serve(router).await, down)
         }
@@ -7765,6 +8210,345 @@ mod tests {
                 }
             }
             let _ = fs::remove_dir_all(&root);
+        }
+
+        fn table_count(state: &AppState, table: &str) -> i64 {
+            state
+                .database
+                .lock()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        /// Sends `request` and returns the status, the body parsed as JSON (Null when it is
+        /// not), and the body's text for the leak check.
+        async fn call(request: reqwest::RequestBuilder) -> (StatusCode, serde_json::Value, String) {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let text = response.text().await.unwrap();
+            let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+            (status, value, text)
+        }
+
+        /// DS-04 (decisions 0013, 0020): a source's exchange list and listings are cached in
+        /// the catalog with the time fetched and served with per-type counts; a refresh that
+        /// fails keeps the rows and their time and sets the unreachable note; a refresh with no
+        /// exchange named fetches the listings of the exchanges with datasets; the cache goes
+        /// with its source.
+        #[tokio::test]
+        async fn the_providers_availability_is_cached_and_an_outage_keeps_the_rows() {
+            let (eodhd, down) = stub().await;
+            let root = scratch_root("availability");
+            let library = root.join("library");
+            fs::create_dir_all(&library).unwrap();
+            let state = test_state(&root, &eodhd);
+            let api = serve(api_router().with_state(state.clone())).await;
+            let client = reqwest::Client::new();
+            let secrets_path = root.join("data/ui/secrets").display().to_string();
+            let leaks = [TOKEN, secrets_path.as_str(), "data/ui/secrets"];
+            let mut responses: Vec<(String, String)> = Vec::new();
+
+            let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                &serde_json::json!({
+                    "kind": "eodhd", "name": "EODHD", "root": library,
+                    "catalog_dir": library.join("catalog"), "token": TOKEN
+                }),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{text}");
+            responses.push(("POST source".into(), text));
+            let id = card["id"].as_str().unwrap().to_owned();
+            let availability = format!("{api}/api/sources/{id}/availability");
+
+            // Before any refresh: an empty table, no time, no note.
+            let (status, body, text) = call(client.get(&availability)).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            responses.push(("GET empty".into(), text));
+            assert_eq!(body["source_id"], id.as_str());
+            assert_eq!(body["exchanges"], serde_json::json!([]));
+            assert!(
+                body["fetched_at"].is_null() && body["refreshed_at"].is_null(),
+                "{body}"
+            );
+            assert!(body["unreachable"].is_null(), "{body}");
+            let (status, _, text) =
+                call(client.get(format!("{api}/api/sources/nope/availability"))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+
+            // A refresh naming US caches the four exchanges and the US listing.
+            let (status, first, text) = call(
+                client
+                    .post(format!("{availability}/refresh"))
+                    .json(&serde_json::json!({ "exchange": "US" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            responses.push(("POST refresh US".into(), text));
+            assert!(first["unreachable"].is_null(), "{first}");
+            let fetched_at = first["fetched_at"].as_str().unwrap().to_owned();
+            assert!(first["refreshed_at"].is_string(), "{first}");
+            let exchanges = first["exchanges"].as_array().unwrap();
+            let codes: Vec<&str> = exchanges
+                .iter()
+                .map(|e| e["code"].as_str().unwrap())
+                .collect();
+            assert_eq!(codes, ["CC", "LSE", "TO", "US"]);
+            let us = exchanges.iter().find(|e| e["code"] == "US").unwrap();
+            assert_eq!(us["name"], "USA Stocks");
+            assert_eq!(us["country"], "USA");
+            assert_eq!(
+                us["resolutions"],
+                serde_json::json!(["daily", "1h", "5m", "1m"])
+            );
+            assert_eq!(us["fetched_at"], fetched_at.as_str());
+            assert_eq!(us["listed"], 3);
+            assert_eq!(
+                us["types"],
+                serde_json::json!([
+                    { "type": "Common Stock", "count": 2 },
+                    { "type": "ETF", "count": 1 }
+                ])
+            );
+            let us_listed_at = us["listings_fetched_at"].as_str().unwrap().to_owned();
+            let lse = exchanges.iter().find(|e| e["code"] == "LSE").unwrap();
+            assert_eq!(lse["country"], "UK");
+            assert_eq!(lse["resolutions"], serde_json::json!(["daily", "1h", "5m"]));
+            assert_eq!(lse["listed"], 0);
+            assert_eq!(lse["types"], serde_json::json!([]));
+            assert!(lse["listings_fetched_at"].is_null(), "{lse}");
+            assert_eq!(table_count(&state, "provider_exchanges"), 4);
+            assert_eq!(table_count(&state, "provider_listings"), 3);
+
+            // The read serves exactly what the refresh answered.
+            let (status, body, text) = call(client.get(&availability)).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            responses.push(("GET cached".into(), text));
+            assert_eq!(body, first);
+
+            // An exchange the provider does not list is refused; the cache is untouched.
+            let (status, _, text) = call(
+                client
+                    .post(format!("{availability}/refresh"))
+                    .json(&serde_json::json!({ "exchange": "MARS" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+            assert!(text.contains("MARS"), "{text}");
+            responses.push(("POST refresh unknown".into(), text));
+            let (_, body, _) = call(client.get(&availability)).await;
+            assert_eq!(body, first);
+
+            // With the provider down, a refresh keeps the rows and their time and sets the note.
+            down.store(true, Ordering::SeqCst);
+            let (status, body, text) = call(
+                client
+                    .post(format!("{availability}/refresh"))
+                    .json(&serde_json::json!({ "exchange": "US" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            responses.push(("POST refresh down".into(), text));
+            assert_eq!(body["exchanges"], first["exchanges"]);
+            assert_eq!(body["fetched_at"], fetched_at.as_str());
+            assert_ne!(body["refreshed_at"], first["refreshed_at"]);
+            let note = body["unreachable"].as_str().unwrap_or_default();
+            assert!(note.contains("503"), "{body}");
+            assert_eq!(table_count(&state, "provider_exchanges"), 4);
+            assert_eq!(table_count(&state, "provider_listings"), 3);
+            let (_, body, text) = call(client.get(&availability)).await;
+            responses.push(("GET down".into(), text));
+            assert_eq!(body["unreachable"], note);
+            assert_eq!(body["exchanges"], first["exchanges"]);
+
+            // Back up, a refresh with no exchange named fetches the listings of the exchanges
+            // with a dataset (DS-05's table, read when it exists) and clears the note; the US
+            // listing stays as it was fetched.
+            down.store(false, Ordering::SeqCst);
+            {
+                let connection = state.database.lock().unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TABLE datasets (id TEXT PRIMARY KEY, source_id TEXT NOT NULL,
+                                                exchange TEXT NOT NULL);",
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO datasets (id, source_id, exchange) VALUES ('d1', ?1, 'LSE')",
+                        [&id],
+                    )
+                    .unwrap();
+            }
+            let (status, body, text) = call(client.post(format!("{availability}/refresh"))).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            responses.push(("POST refresh datasets".into(), text));
+            assert!(body["unreachable"].is_null(), "{body}");
+            assert_ne!(body["fetched_at"], fetched_at.as_str());
+            let exchanges = body["exchanges"].as_array().unwrap();
+            let lse = exchanges.iter().find(|e| e["code"] == "LSE").unwrap();
+            assert_eq!(lse["listed"], 2);
+            assert_eq!(
+                lse["types"],
+                serde_json::json!([
+                    { "type": "Common Stock", "count": 1 },
+                    { "type": "ETF", "count": 1 }
+                ])
+            );
+            let us = exchanges.iter().find(|e| e["code"] == "US").unwrap();
+            assert_eq!(us["listed"], 3);
+            assert_eq!(us["listings_fetched_at"], us_listed_at.as_str());
+            assert_eq!(table_count(&state, "provider_listings"), 5);
+
+            // Without a token file the refresh is refused, as verify is.
+            fs::remove_file(root.join(format!("data/ui/secrets/{id}.token"))).unwrap();
+            let (status, _, text) = call(client.post(format!("{availability}/refresh"))).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{text}");
+            responses.push(("POST refresh no token".into(), text));
+
+            // The cache goes with its source.
+            let (status, _, text) = call(client.delete(format!("{api}/api/sources/{id}"))).await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+            assert_eq!(table_count(&state, "provider_exchanges"), 0);
+            assert_eq!(table_count(&state, "provider_listings"), 0);
+            assert_eq!(table_count(&state, "provider_refreshes"), 0);
+            let (status, _, _) = call(client.get(&availability)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+
+            for (label, body) in &responses {
+                for leak in &leaks {
+                    assert!(!body.contains(leak), "{label} carries {leak:?}: {body}");
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// The catalog side of DS-04 without a server: the dataset lookup reads DS-05's table
+        /// only once it exists, listings count per type largest first, and an exchange with
+        /// no cached listing has no time and no types.
+        #[test]
+        fn the_cached_table_counts_each_exchanges_listing_by_type() {
+            let mut connection = Connection::open_in_memory().unwrap();
+            migrate(&connection).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO data_sources (id, name, kind, root, catalog_dir, created_at)
+                     VALUES ('s1', 'EODHD', 'eodhd', '/tmp/x', '/tmp/x/catalog', 't0')",
+                    [],
+                )
+                .unwrap();
+            assert!(
+                exchanges_with_datasets(&connection, "s1")
+                    .unwrap()
+                    .is_empty()
+            );
+            connection
+                .execute_batch(
+                    "CREATE TABLE datasets (id TEXT PRIMARY KEY, source_id TEXT, exchange TEXT);
+                     INSERT INTO datasets VALUES ('d1', 's1', 'US'), ('d2', 's1', 'LSE'),
+                                                 ('d3', 's1', 'US'), ('d4', 'other', 'CC');",
+                )
+                .unwrap();
+            assert_eq!(
+                exchanges_with_datasets(&connection, "s1").unwrap(),
+                ["LSE", "US"]
+            );
+
+            let empty = load_availability(&connection, "s1").unwrap();
+            assert!(empty.exchanges.is_empty() && empty.fetched_at.is_none());
+            assert!(empty.refreshed_at.is_none() && empty.unreachable.is_none());
+
+            let exchange = |code: &str, country: &str| tessera::provider::Exchange {
+                code: code.into(),
+                name: format!("{code} name"),
+                country: country.into(),
+                resolutions: vec!["daily".into()],
+            };
+            let listing = |code: &str, kind: &str| tessera::provider::Listing {
+                code: code.into(),
+                name: String::new(),
+                kind: kind.into(),
+                currency: "USD".into(),
+            };
+            store_exchanges(
+                &mut connection,
+                "s1",
+                &[exchange("US", "USA"), exchange("LSE", "UK")],
+                "t1",
+            )
+            .unwrap();
+            store_listings(
+                &mut connection,
+                "s1",
+                "US",
+                false,
+                &[
+                    listing("A", "ETF"),
+                    listing("B", "Common Stock"),
+                    listing("C", "Common Stock"),
+                    listing("D", "Fund"),
+                ],
+                "t2",
+            )
+            .unwrap();
+            // A delisted listing is cached apart and not counted with the active one.
+            store_listings(
+                &mut connection,
+                "s1",
+                "US",
+                true,
+                &[listing("Z", "ETF")],
+                "t2",
+            )
+            .unwrap();
+            record_refresh(&connection, "s1", "t3", None).unwrap();
+
+            let table = load_availability(&connection, "s1").unwrap();
+            assert_eq!(table.fetched_at.as_deref(), Some("t1"));
+            assert_eq!(table.refreshed_at.as_deref(), Some("t3"));
+            assert!(table.unreachable.is_none());
+            let codes: Vec<&str> = table.exchanges.iter().map(|e| e.code.as_str()).collect();
+            assert_eq!(codes, ["LSE", "US"]);
+            let us = &table.exchanges[1];
+            assert_eq!(
+                (us.listed, us.listings_fetched_at.as_deref()),
+                (4, Some("t2"))
+            );
+            let types: Vec<(&str, u64)> = us
+                .types
+                .iter()
+                .map(|t| (t.kind.as_str(), t.count))
+                .collect();
+            assert_eq!(types, [("Common Stock", 2), ("ETF", 1), ("Fund", 1)]);
+            let lse = &table.exchanges[0];
+            assert_eq!((lse.listed, lse.listings_fetched_at.as_deref()), (0, None));
+            assert!(lse.types.is_empty());
+
+            // A second fetch of the same listing replaces it; a failed attempt only notes.
+            store_listings(
+                &mut connection,
+                "s1",
+                "US",
+                false,
+                &[listing("A", "ETF")],
+                "t4",
+            )
+            .unwrap();
+            record_refresh(&connection, "s1", "t5", Some("US: provider unreachable")).unwrap();
+            let table = load_availability(&connection, "s1").unwrap();
+            let us = &table.exchanges[1];
+            assert_eq!(
+                (us.listed, us.listings_fetched_at.as_deref()),
+                (1, Some("t4"))
+            );
+            assert_eq!(table.refreshed_at.as_deref(), Some("t5"));
+            assert_eq!(
+                table.unreachable.as_deref(),
+                Some("US: provider unreachable")
+            );
+            assert_eq!(table.fetched_at.as_deref(), Some("t1"));
         }
 
         #[test]

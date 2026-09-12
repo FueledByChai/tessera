@@ -123,11 +123,36 @@ EODHD adapter at a stub server for a scratch console, and the service test in
 DS-02 stub and fails if the token or the secrets path appears in any `/api/sources` or
 `/api/data` response.
 
+### Availability (`/api/sources/{id}/availability`)
+
+What a source's provider offers is cached in the catalog with the time it was fetched
+(decision 0013) and served from there; nothing calls the provider on a page load. Two
+tables hold it: `provider_exchanges` (source_id, code, name, country, resolutions as a
+JSON list, fetched_at) and `provider_listings` (source_id, exchange, code, name, type,
+currency, delisted, fetched_at), with `provider_refreshes` (source_id, attempted_at,
+error) recording the last refresh attempt. A refresh fetches the exchange list and then
+the active listing of every exchange with a dataset registered against the source (the
+`datasets` table, once it exists), or of the one exchange the body names; a provider call
+that fails leaves every row fetched before in place, its time included, and records the
+failure as the table's `unreachable` note, so the console shows a stale table with a note,
+never an empty one. The tables go with their source when it is deleted.
+
+| Endpoint | Does | Refuses with |
+|---|---|---|
+| `GET /api/sources/{id}/availability` | the cached table: `fetched_at` (the exchange list's), `refreshed_at` (the last attempt), `unreachable` (why it failed, else null), and `exchanges`, each with code, name, country, resolutions, `fetched_at`, `listings_fetched_at` (null until its listing is cached), `listed`, and `types`, the active listing counted per type under the provider's own type names, largest first | 404 for an unknown source |
+| `POST /api/sources/{id}/availability/refresh` | fetches the exchange list and the listings (`{"exchange": "US"}` names one; an empty body means every exchange with a dataset), caches them, and answers 200 with the table whatever the provider said | 409 when no token file exists; 400 for an exchange the provider does not list, the cache untouched |
+
+The service test in `src/bin/tessera_ui.rs` (`tests::sources`) refreshes over the DS-02 stub,
+asserts the four exchange rows and the US type counts, then makes the stub answer 503 and
+asserts the rows and `fetched_at` unchanged with the note set.
+
 ## Environment overrides
 
 `TESSERA_DATA_ROOT` (a folder holding `eod/`, `5m/`, `1m/`, `catalog/`), `TESSERA_ENGINE`,
 `TESSERA_STRATEGY_DIRS`, and `TESSERA_MEMORY_BUDGET_GB` override `local.toml`. With no `local.toml`
-the console reads the synthetic dataset under `examples/data`.
+the console reads the synthetic dataset under `examples/data`. `TESSERA_EODHD_BASE_URL` points
+the EODHD adapter of every registered source at another base URL (a stub server for a scratch
+console) instead of `https://eodhd.com`.
 
 ## Adding a source
 
