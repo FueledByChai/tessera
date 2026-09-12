@@ -59,6 +59,16 @@ impl Estimate {
         }
     }
 
+    /// The intraday job as it runs (decision 0022): the windows that extend the files that
+    /// exist are mandatory, the windows that backfill the symbols without one are optional,
+    /// each at the intraday cost.
+    pub fn intraday_windows(increment_windows: u64, backfill_windows: u64) -> Self {
+        Estimate {
+            mandatory: increment_windows.saturating_mul(INTRADAY_CALL_COST),
+            optional: backfill_windows.saturating_mul(INTRADAY_CALL_COST),
+        }
+    }
+
     pub fn total(&self) -> u64 {
         self.mandatory.saturating_add(self.optional)
     }
@@ -245,6 +255,12 @@ mod tests {
         assert_eq!((eod.mandatory, eod.optional, eod.total()), (6, 40, 46));
         let intraday = Estimate::intraday(4, 25);
         assert_eq!((intraday.mandatory, intraday.optional), (500, 0));
+        let windows = Estimate::intraday_windows(3, 2);
+        assert_eq!(
+            (windows.mandatory, windows.optional, windows.total()),
+            (15, 10, 25)
+        );
+        assert_eq!(Estimate::intraday_windows(u64::MAX, 0).mandatory, u64::MAX);
         assert_eq!(Estimate::eod(u64::MAX, 1).mandatory, u64::MAX);
         assert_eq!(Estimate::eod(u64::MAX, 1).total(), u64::MAX);
         let budget = CallBudget::new(100_000, 99_600, 5_000);

@@ -1,6 +1,7 @@
 //! The EODHD adapter (decision 0020): the user, exchanges-list, and exchange-symbol-list
-//! endpoints, and the download endpoints the EOD job uses (eod-bulk-last-day for bars and
-//! for splits, eod for one symbol's history), over reqwest with rustls.
+//! endpoints, and the download endpoints the jobs use (eod-bulk-last-day for bars and for
+//! splits, eod for one symbol's history, intraday for one symbol's bars in a window), over
+//! reqwest with rustls.
 //!
 //! Every call sends the token as the `api_token` query parameter and asks for `fmt=json`
 //! (the list endpoints answer CSV without it). The base URL is configurable so tests run
@@ -16,7 +17,9 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::{Account, Bar, BulkBar, Exchange, Listing, Provider, ProviderError, Split};
+use super::{
+    Account, Bar, BulkBar, Exchange, IntradayBar, Listing, Provider, ProviderError, Split,
+};
 
 /// Where the public API lives; a stub server replaces it in tests.
 pub const DEFAULT_BASE_URL: &str = "https://eodhd.com";
@@ -25,6 +28,21 @@ pub const DEFAULT_BASE_URL: &str = "https://eodhd.com";
 const COMMON_RESOLUTIONS: [&str; 3] = ["daily", "1h", "5m"];
 /// Exchanges with 1-minute intraday history as well.
 const ONE_MINUTE_EXCHANGES: [&str; 3] = ["US", "FOREX", "CC"];
+
+/// The intraday intervals EODHD serves, by the engine's resolution name, with the longest
+/// span in days one request may cover (the API's own limits: 120 days of 1-minute bars,
+/// 600 of 5-minute, 7200 of hourly).
+const INTRADAY_INTERVALS: [(&str, &str, u32); 3] =
+    [("1m", "1m", 120), ("5m", "5m", 600), ("1h", "1h", 7200)];
+
+/// The provider's interval name and window for `resolution`; `None` for a resolution it
+/// has no intraday bars at (daily included).
+fn intraday_interval(resolution: &str) -> Option<(&'static str, u32)> {
+    INTRADAY_INTERVALS
+        .iter()
+        .find(|(name, _, _)| *name == resolution)
+        .map(|(_, interval, days)| (*interval, *days))
+}
 
 /// An EODHD account: a base URL, the token the listing calls use, and an HTTP client.
 #[derive(Debug, Clone)]
@@ -270,10 +288,45 @@ struct SplitRow {
     split: String,
 }
 
+/// A bar as the intraday endpoint writes it: the start as UTC epoch seconds, the offset
+/// (zero), the same instant as text, the prints, and the volume. A row missing its
+/// timestamp or a price is dropped by the caller; the text is not read (the file derives
+/// its own from the timestamp).
+#[derive(Deserialize)]
+struct IntradayRow {
+    timestamp: Option<i64>,
+    #[serde(default)]
+    gmtoffset: Option<i64>,
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    #[serde(default)]
+    volume: Option<f64>,
+}
+
+impl IntradayRow {
+    fn bar(&self) -> Option<IntradayBar> {
+        Some(IntradayBar {
+            timestamp: self.timestamp?,
+            gmtoffset: self.gmtoffset.unwrap_or(0),
+            open: self.open?,
+            high: self.high?,
+            low: self.low?,
+            close: self.close?,
+            volume: self.volume.unwrap_or(0.0),
+        })
+    }
+}
+
 /// The bars of `rows` in the order given, rows with a missing price or an unreadable date
 /// left out.
 fn bars_of(rows: Vec<BarRow>) -> Vec<Bar> {
     rows.iter().filter_map(BarRow::bar).collect()
+}
+
+fn intraday_bars_of(rows: Vec<IntradayRow>) -> Vec<IntradayBar> {
+    rows.iter().filter_map(IntradayRow::bar).collect()
 }
 
 fn bulk_bars_of(rows: Vec<BulkRow>) -> Vec<BulkBar> {
@@ -363,6 +416,39 @@ impl Provider for Eodhd {
             .await?;
         splits_of(rows)
     }
+
+    fn intraday_window_days(&self, resolution: &str) -> Option<u32> {
+        intraday_interval(resolution).map(|(_, days)| days)
+    }
+
+    async fn intraday(
+        &self,
+        symbol: &str,
+        resolution: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<IntradayBar>, ProviderError> {
+        let Some((interval, _)) = intraday_interval(resolution) else {
+            return Err(ProviderError::Malformed(format!(
+                "no intraday bars at {resolution:?}; the intervals are 1m, 5m, and 1h"
+            )));
+        };
+        let path = format!("/api/intraday/{symbol}");
+        let from = from.timestamp().to_string();
+        let to = to.timestamp().to_string();
+        let rows: Vec<IntradayRow> = self
+            .get_json(
+                &path,
+                &self.token,
+                &[
+                    ("interval", interval),
+                    ("from", from.as_str()),
+                    ("to", to.as_str()),
+                ],
+            )
+            .await?;
+        Ok(intraday_bars_of(rows))
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +507,37 @@ mod tests {
         assert_eq!(message_of(&long, StatusCode::BAD_GATEWAY).len(), 120);
         assert_eq!(message_of("  ", StatusCode::BAD_GATEWAY), "Bad Gateway");
         assert_eq!(scrub("nothing", ""), "nothing");
+    }
+
+    #[test]
+    fn intraday_intervals_carry_the_providers_window_and_daily_has_none() {
+        assert_eq!(intraday_interval("1m"), Some(("1m", 120)));
+        assert_eq!(intraday_interval("5m"), Some(("5m", 600)));
+        assert_eq!(intraday_interval("1h"), Some(("1h", 7200)));
+        assert_eq!(intraday_interval("daily"), None);
+        assert_eq!(intraday_interval("15m"), None);
+        let adapter = Eodhd::new("http://127.0.0.1:1", "t");
+        assert_eq!(adapter.intraday_window_days("5m"), Some(600));
+        assert_eq!(adapter.intraday_window_days("1m"), Some(120));
+        assert_eq!(adapter.intraday_window_days("daily"), None);
+    }
+
+    #[test]
+    fn intraday_rows_drop_a_missing_timestamp_or_price_and_read_a_missing_volume_as_zero() {
+        let rows: Vec<IntradayRow> = serde_json::from_str(
+            r#"[{"timestamp":1704205800,"gmtoffset":0,"datetime":"2024-01-02 14:30:00","open":277.4155,"high":277.6767,"low":277.3743,"close":277.6451,"volume":11881},
+                {"timestamp":null,"gmtoffset":0,"datetime":"2024-01-02 14:35:00","open":1,"high":2,"low":0.5,"close":1.5,"volume":100},
+                {"timestamp":1704206400,"gmtoffset":0,"datetime":"2024-01-02 14:40:00","open":1,"high":2,"low":0.5,"close":null,"volume":100},
+                {"timestamp":1704206700,"open":1,"high":2,"low":0.5,"close":1.5}]"#,
+        )
+        .unwrap();
+        let bars = intraday_bars_of(rows);
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].timestamp, 1_704_205_800);
+        assert_eq!((bars[0].gmtoffset, bars[0].volume), (0, 11_881.0));
+        assert_eq!(bars[0].close, 277.6451);
+        assert_eq!(bars[1].timestamp, 1_704_206_700);
+        assert_eq!((bars[1].gmtoffset, bars[1].volume), (0, 0.0));
     }
 
     #[test]

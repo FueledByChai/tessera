@@ -26,6 +26,7 @@ use tessera::provider::eodhd::Eodhd;
 use tessera::provider::jobs::eod::{
     self as eod_job, DEFAULT_MIN_BULK_ROWS, DatasetSymbol, EodJobInput, JobState, Skipped,
 };
+use tessera::provider::jobs::intraday::{self as intraday_job, IntradayJobInput};
 use tessera::provider::{Account, Listing, Provider, ProviderError};
 use tessera::report::{ReportView, generate_report, load_report_view};
 use tessera::sdk::manifest::Manifest as SdkManifest;
@@ -4724,6 +4725,24 @@ impl Provider for SourceAdapter {
             SourceAdapter::Eodhd(eodhd) => eodhd.splits(exchange, date).await,
         }
     }
+
+    fn intraday_window_days(&self, resolution: &str) -> Option<u32> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.intraday_window_days(resolution),
+        }
+    }
+
+    async fn intraday(
+        &self,
+        symbol: &str,
+        resolution: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<tessera::provider::IntradayBar>, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.intraday(symbol, resolution, from, to).await,
+        }
+    }
 }
 
 /// The root volume's figures from statvfs, in bytes.
@@ -6646,15 +6665,69 @@ async fn scan_source(
 }
 
 // ---------------------------------------------------------------------------
-// The native EOD download job (DS-08, BT-1205; decisions 0020 and 0022). The job itself is
-// `tessera::provider::jobs::eod`, run over the source's adapter; the service maps the
-// dataset and its cached listing onto the job's input, keeps one job per source, refuses a
-// folder before any call, records progress and the outcome in `dataset_jobs`, writes the
-// log under data/ui/logs/, and, after the job, refreshes the source's usage and rescans it.
+// The native download jobs (DS-08, BT-1205 and DS-09, BT-1206; decisions 0020 and 0022).
+// The jobs themselves are `tessera::provider::jobs::eod` for a daily dataset and
+// `tessera::provider::jobs::intraday` for an intraday one, run over the source's adapter;
+// the service maps the dataset and its cached listing onto the job's input, keeps one job
+// per source, refuses a folder before any call, records progress and the outcome in
+// `dataset_jobs`, writes the log under data/ui/logs/, and, after the job, refreshes the
+// source's usage and rescans it.
 // ---------------------------------------------------------------------------
 
 /// The job kind `dataset_jobs.kind` names for a daily dataset's update.
 const JOB_KIND_EOD: &str = "eod";
+/// The job kind for an intraday dataset's update (5m, 1m, or whatever else the provider
+/// serves in windows).
+const JOB_KIND_INTRADAY: &str = "intraday";
+
+/// The job kind a dataset's update runs: the EOD job for daily bars, the intraday job for
+/// every other resolution (the provider refuses one it has no intraday bars at).
+fn job_kind_for(resolution: &str) -> &'static str {
+    if resolution == "daily" {
+        JOB_KIND_EOD
+    } else {
+        JOB_KIND_INTRADAY
+    }
+}
+
+/// What either job reports, as the record keeps it.
+struct JobOutcome {
+    state: JobState,
+    estimate: Option<Estimate>,
+    calls: u64,
+    added: u64,
+    updated: u64,
+    skipped: Vec<Skipped>,
+    error: Option<String>,
+}
+
+impl From<eod_job::Outcome> for JobOutcome {
+    fn from(outcome: eod_job::Outcome) -> Self {
+        JobOutcome {
+            state: outcome.state,
+            estimate: outcome.estimate,
+            calls: outcome.calls,
+            added: outcome.added,
+            updated: outcome.updated,
+            skipped: outcome.skipped,
+            error: outcome.error,
+        }
+    }
+}
+
+impl From<intraday_job::Outcome> for JobOutcome {
+    fn from(outcome: intraday_job::Outcome) -> Self {
+        JobOutcome {
+            state: outcome.state,
+            estimate: outcome.estimate,
+            calls: outcome.calls,
+            added: outcome.added,
+            updated: outcome.updated,
+            skipped: outcome.skipped,
+            error: outcome.error,
+        }
+    }
+}
 
 /// A download job as the console shows it.
 #[derive(Debug, Clone, Serialize)]
@@ -6889,7 +6962,8 @@ fn today_in_new_york() -> NaiveDate {
 /// (naming it), for a root that is not mounted or a folder that is missing, not a folder, or
 /// not writable (the job never creates it), and when no token is on file; then, after the
 /// source's usage is refreshed, with 409 when the provider has not reported usage (a job
-/// is governed by it, decision 0022). Only daily datasets have a job yet.
+/// is governed by it, decision 0022). A daily dataset gets the EOD job, any other
+/// resolution the intraday job (DS-09), 400 when the provider serves no intraday bars at it.
 async fn start_dataset_update(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -6899,15 +6973,7 @@ async fn start_dataset_update(
         load_dataset(&connection, &id)?
             .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no dataset {id:?}")))?
     };
-    if dataset.resolution != "daily" {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "the EOD job updates daily datasets; {} datasets have no job yet",
-                dataset.resolution
-            ),
-        ));
-    }
+    let kind = job_kind_for(&dataset.resolution);
     let row = load_source_row(&state, &dataset.source_id)?.ok_or_else(|| {
         api_error(
             StatusCode::NOT_FOUND,
@@ -6938,6 +7004,15 @@ async fn start_dataset_update(
     eod_job::check_folder(Path::new(&dataset.folder))
         .map_err(|refusal| api_error(StatusCode::CONFLICT, refusal))?;
     let adapter = SourceAdapter::from_file(&state, &row)?;
+    if kind == JOB_KIND_INTRADAY && adapter.intraday_window_days(&dataset.resolution).is_none() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "source {:?} serves no intraday bars at {}; the intraday job has nothing to fetch",
+                row.name, dataset.resolution
+            ),
+        ));
+    }
 
     refresh_source_usage(&state, &row, true).await?;
     let row = load_source_row(&state, &row.id)?
@@ -6978,7 +7053,7 @@ async fn start_dataset_update(
             params![
                 job_id,
                 dataset.id,
-                JOB_KIND_EOD,
+                kind,
                 JobState::Queued.as_str(),
                 now.to_rfc3339(),
                 log_path
@@ -7025,7 +7100,7 @@ fn record_job_progress(state: &AppState, job_id: &str, progress: eod_job::Progre
 fn record_job_outcome(
     state: &AppState,
     job_id: &str,
-    outcome: &eod_job::Outcome,
+    outcome: &JobOutcome,
     finished_at: &str,
 ) -> Result<()> {
     let connection = state.database.lock().expect("database lock poisoned");
@@ -7114,7 +7189,8 @@ async fn run_dataset_job(
 }
 
 /// Marks the job running, builds the job's input from the dataset and its cached listing,
-/// opens the log, and runs the job with progress written to the row as it moves.
+/// opens the log, and runs the job of the dataset's kind with progress written to the row
+/// as it moves.
 async fn execute_dataset_job(
     state: &AppState,
     job_id: &str,
@@ -7122,7 +7198,7 @@ async fn execute_dataset_job(
     source: &SourceRow,
     adapter: &SourceAdapter,
     mut budget: CallBudget,
-) -> Result<eod_job::Outcome> {
+) -> Result<JobOutcome> {
     {
         let connection = state.database.lock().expect("database lock poisoned");
         connection.execute(
@@ -7139,17 +7215,6 @@ async fn execute_dataset_job(
     };
     let from_date = NaiveDate::parse_from_str(&dataset.from_date, "%Y-%m-%d")
         .with_context(|| format!("from_date {:?} is not a date", dataset.from_date))?;
-    let input = EodJobInput {
-        exchange: dataset.exchange.clone(),
-        folder: PathBuf::from(&dataset.folder),
-        catalog_dir: PathBuf::from(&source.catalog_dir),
-        from_date,
-        through: today_in_new_york(),
-        min_bulk_rows: dataset.min_bulk_rows,
-        calendar_code: calendar_code_for(&state.local.data.calendar_symbol, &dataset.exchange),
-        symbols,
-        catalog,
-    };
     let log_path = state.root.join(format!("data/ui/logs/{job_id}.log"));
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).context("create the log folder")?;
@@ -7167,7 +7232,37 @@ async fn execute_dataset_job(
             last_written = Some((std::time::Instant::now(), progress.percent));
         }
     };
-    Ok(eod_job::run(adapter, &input, &mut budget, &mut log, &mut on_progress).await)
+    if job_kind_for(&dataset.resolution) == JOB_KIND_INTRADAY {
+        let input = IntradayJobInput {
+            exchange: dataset.exchange.clone(),
+            resolution: dataset.resolution.clone(),
+            folder: PathBuf::from(&dataset.folder),
+            from_date,
+            through: Utc::now(),
+            symbols,
+        };
+        return Ok(
+            intraday_job::run(adapter, &input, &mut budget, &mut log, &mut on_progress)
+                .await
+                .into(),
+        );
+    }
+    let input = EodJobInput {
+        exchange: dataset.exchange.clone(),
+        folder: PathBuf::from(&dataset.folder),
+        catalog_dir: PathBuf::from(&source.catalog_dir),
+        from_date,
+        through: today_in_new_york(),
+        min_bulk_rows: dataset.min_bulk_rows,
+        calendar_code: calendar_code_for(&state.local.data.calendar_symbol, &dataset.exchange),
+        symbols,
+        catalog,
+    };
+    Ok(
+        eod_job::run(adapter, &input, &mut budget, &mut log, &mut on_progress)
+            .await
+            .into(),
+    )
 }
 
 async fn get_dataset_job(
@@ -11053,6 +11148,50 @@ mod tests {
                 }
             }
 
+            /// The DS-09 intraday endpoint: SPY answers the bar at `from` (the one a file
+            /// already holds) and the next one, AAPL two bars an hour into any window,
+            /// BRK-B none, any other symbol the provider's 404; every call is counted.
+            async fn stub_intraday(
+                State(stub): State<JobStub>,
+                AxumPath(symbol): AxumPath<String>,
+                AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+            ) -> Response {
+                stub.calls.fetch_add(1, Ordering::SeqCst);
+                let param = |name: &str| -> i64 {
+                    query
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .and_then(|(_, v)| v.parse().ok())
+                        .unwrap_or(0)
+                };
+                let from = param("from");
+                let interval = query
+                    .iter()
+                    .find(|(k, _)| k == "interval")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                assert_eq!(interval, "5m", "the dataset's resolution is the interval");
+                let bar = |ts: i64, close: f64| {
+                    serde_json::json!({
+                        "timestamp": ts, "gmtoffset": 0, "datetime": "x",
+                        "open": close - 1.0, "high": close + 1.0, "low": close - 2.0,
+                        "close": close, "volume": 100
+                    })
+                };
+                let rows = match symbol.as_str() {
+                    "SPY.US" => vec![bar(from, 500.0), bar(from + 300, 501.0)],
+                    "AAPL.US" => vec![bar(from + 3_600, 230.0), bar(from + 3_900, 231.0)],
+                    "BRK-B.US" => Vec::new(),
+                    _ => {
+                        return json_response(
+                            StatusCode::NOT_FOUND,
+                            r#"{"message":"Symbol not found"}"#.to_owned(),
+                        );
+                    }
+                };
+                json_response(StatusCode::OK, serde_json::to_string(&rows).unwrap())
+            }
+
             /// The DS-02 stub with the download endpoints merged in.
             async fn job_stub() -> (String, JobStub) {
                 let jobs = JobStub {
@@ -11070,6 +11209,7 @@ mod tests {
                         Router::new()
                             .route("/api/eod-bulk-last-day/{exchange}", get(stub_bulk))
                             .route("/api/eod/{symbol}", get(stub_history))
+                            .route("/api/intraday/{symbol}", get(stub_intraday))
                             .with_state(jobs.clone()),
                     );
                 (serve(router).await, jobs)
@@ -11120,6 +11260,29 @@ mod tests {
                     ));
                 }
                 text
+            }
+
+            #[test]
+            fn a_daily_dataset_gets_the_eod_job_and_every_other_resolution_the_intraday_one() {
+                assert_eq!(job_kind_for("daily"), "eod");
+                assert_eq!(job_kind_for("5m"), "intraday");
+                assert_eq!(job_kind_for("1m"), "intraday");
+                assert_eq!(job_kind_for("1h"), "intraday");
+                let outcome: JobOutcome = intraday_job::Outcome {
+                    state: JobState::Complete,
+                    estimate: Some(Estimate::intraday_windows(2, 1)),
+                    calls: 15,
+                    requests: 3,
+                    added: 1,
+                    updated: 2,
+                    skipped: Vec::new(),
+                    error: None,
+                    backfills_left: 0,
+                }
+                .into();
+                assert_eq!(outcome.state, JobState::Complete);
+                assert_eq!((outcome.calls, outcome.added, outcome.updated), (15, 1, 2));
+                assert_eq!(outcome.estimate, Some(Estimate::intraday_windows(2, 1)));
             }
 
             #[test]
@@ -11641,6 +11804,128 @@ mod tests {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            /// DS-09 (decisions 0020, 0022): `POST /api/datasets/{id}/update` on a 5m
+            /// dataset queues the intraday job (kind `intraday`), which extends the seeded
+            /// SPY file from its last bar in the intraday layout, backfills AAPL from the
+            /// from-date, skips BRK-B with the provider's empty answer as the reason, and
+            /// leaves no part file; the record carries the calls at five a request and the
+            /// card shows it as the dataset's last job.
+            #[tokio::test]
+            async fn a_5m_datasets_update_routes_to_the_intraday_job() {
+                let (eodhd, jobs) = job_stub().await;
+                let root = scratch_root("intraday-jobs");
+                let library = root.join("library");
+                let five = library.join("5m");
+                fs::create_dir_all(&five).unwrap();
+                fs::create_dir_all(library.join("catalog")).unwrap();
+                let now = Utc::now().timestamp();
+                let last = now - 3_600 - (now % 300);
+                let header = intraday_job::INTRADAY_HEADER;
+                let seeded = format!(
+                    "{header}\n{},0,x,499,501,498,499,100\n{last},0,x,499,501,498,500,100\n",
+                    last - 300
+                );
+                fs::write(five.join("SPY.US.csv"), &seeded).unwrap();
+                let state = test_state_over(&root, &eodhd, &library);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+
+                let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                    &serde_json::json!({
+                        "kind": "eodhd", "name": "EODHD", "root": library,
+                        "catalog_dir": library.join("catalog"), "token": TOKEN
+                    }),
+                ))
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                let id = card["id"].as_str().unwrap().to_owned();
+                let (status, _, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/{id}/availability/refresh"))
+                        .json(&serde_json::json!({ "exchange": "US", "delisted": false })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                let (status, dataset, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/{id}/datasets"))
+                        .json(&serde_json::json!({
+                            "exchange": "US", "types": ["Common Stock", "ETF"],
+                            "resolution": "5m",
+                            "from_date": Utc::now().date_naive().to_string()
+                        })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                assert_eq!(dataset["folder"], five.display().to_string().as_str());
+                let dataset_id = dataset["id"].as_str().unwrap().to_owned();
+
+                let calls_before = jobs.calls.load(Ordering::SeqCst);
+                let (status, job, text) =
+                    call(client.post(format!("{api}/api/datasets/{dataset_id}/update"))).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+                assert_eq!(job["kind"], "intraday", "{job}");
+                assert_eq!(job["state"], "Queued");
+                assert!(!text.contains(TOKEN));
+                let job_id = job["id"].as_str().unwrap().to_owned();
+                let job = finished_job(&client, &api, &job_id).await;
+                assert_eq!(job["state"], "Complete", "{job}");
+                assert_eq!(job["kind"], "intraday");
+                assert_eq!(job["percent"], 100);
+                assert_eq!(job["updated"], 1, "{job}");
+                assert_eq!(job["added"], 1, "{job}");
+                // SPY's one window, AAPL's one, BRK-B's one: three requests at five calls.
+                assert_eq!(job["calls"], 15, "{job}");
+                assert_eq!(job["estimate"]["mandatory"], 5, "{job}");
+                assert_eq!(job["estimate"]["optional"], 10, "{job}");
+                assert_eq!(job["skipped"].as_array().unwrap().len(), 1, "{job}");
+                assert_eq!(job["skipped"][0]["symbol"], "BRK-B.US");
+                assert!(
+                    job["skipped"][0]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no bars from the provider"),
+                    "{job}"
+                );
+                assert!(job["error"].is_null(), "{job}");
+                assert_eq!(jobs.calls.load(Ordering::SeqCst) - calls_before, 3);
+
+                let spy = fs::read_to_string(five.join("SPY.US.csv")).unwrap();
+                assert!(spy.starts_with(&seeded), "{spy}");
+                let lines: Vec<&str> = spy.lines().collect();
+                assert_eq!(lines.len(), 4, "{spy}");
+                let datetime = DateTime::from_timestamp(last + 300, 0)
+                    .unwrap()
+                    .format("%Y-%m-%d %H:%M:%S");
+                assert_eq!(
+                    lines[3],
+                    format!("{},0,{datetime},500,502,499,501,100", last + 300)
+                );
+                let aapl = fs::read_to_string(five.join("AAPL.US.csv")).unwrap();
+                let lines: Vec<&str> = aapl.lines().collect();
+                assert_eq!(lines[0], header);
+                assert_eq!(lines.len(), 3, "{aapl}");
+                assert!(lines[1].ends_with(",229,231,228,230,100"), "{aapl}");
+                assert!(!five.join("BRK-B.US.csv").exists());
+                for entry in fs::read_dir(&five).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    assert!(!name.ends_with(".part"), "part file left: {name}");
+                }
+                let log =
+                    fs::read_to_string(root.join(format!("data/ui/logs/{job_id}.log"))).unwrap();
+                assert!(log.contains("at 5m"), "{log}");
+                assert!(log.contains("complete: 3 requests (15 calls)"), "{log}");
+                assert!(!log.contains(TOKEN));
+
+                let card = rescanned_card(&client, &api, &id).await;
+                let intraday = &card["datasets"][0];
+                assert_eq!(intraday["resolution"], "5m");
+                assert_eq!(intraday["last_job"]["id"], job_id.as_str());
+                assert_eq!(intraday["last_job"]["kind"], "intraday");
+                assert_eq!(intraday["scan"]["on_disk"], 2, "{intraday}");
                 let _ = fs::remove_dir_all(&root);
             }
 
