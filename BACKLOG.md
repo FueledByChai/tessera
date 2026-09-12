@@ -144,6 +144,18 @@ after collapsing and fails unless the rail is still collapsed, then expands and 
 fails unless it is expanded again; a run with browser storage blocked still renders the
 expanded sidebar.
 
+### UI-10 The dialog fit check covers choice and boolean parameters — Blocked by UI-07
+UI-07's rule that the Configure run dialog shows its whole form at 1280x800 for up to eight
+parameters was proven with numeric parameters, which take one 92 px track each; a `choice`
+parameter takes two tracks and a `bool` its own control, so eight parameters with several of
+those wrap the Parameters grid to a second row and the dialog scrolls inside itself.
+`web/scripts/layout-check.mjs`'s eight-parameter fixture strategy gets two `choice` parameters
+and one `bool` among the eight, and the dialog's rules (`web/app/globals.css`, `SdkForm` in
+`web/app/page.tsx`) adapt until it fits at both widths in both modes, or the bound in
+`docs/LOCAL_UI.md` is restated in tracks rather than parameters. Serves BT-1101. Decisions: 0003.
+**Done when:** `web/scripts/layout-check.mjs` measures the mixed eight-parameter fixture at 1280
+and 1440 px in both display modes and fails when the dialog's rows scroll inside it.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar
@@ -337,7 +349,7 @@ repeat; `docs/LOCAL_UI.md` names the panel.
 
 ## Data sources
 
-### DS-01 The Data page is three views: Inventory, Instrument search, Updates & schedules — `doing`
+### DS-01 The Data page is three views: Inventory, Instrument search, Updates & schedules
 `view === "data"` in `web/app/page.tsx` renders `DataSourcesPanel`, the DATA LIBRARY metrics,
 `DataCoverage`, and `AutomationsWorkspace` in one column. A tab strip under the title selects a
 `dataView` (inventory, instruments, updates) remembered in browser storage; Inventory keeps the
@@ -391,7 +403,7 @@ Tables `provider_exchanges` (source_id, code, name, country, resolutions, fetche
 every exchange with a dataset (or the one named in the body); `GET
 /api/sources/{id}/availability` returns the cached table with per-type counts, `fetched_at`,
 and an unreachable note when the last refresh failed, keeping the previous rows. Serves
-BT-1202. Decisions: 0013, 0020.
+BT-1202. Decisions: 0013, 0020. The `SourceAdapter` enum from DS-03 forwards `exchanges` and `symbols` and gains a helper that builds the adapter from the token on file; the environment-overrides paragraph of `docs/DATA_SOURCES.md` lists `TESSERA_EODHD_BASE_URL`.
 **Done when:** a service test seeds a source over the stub, refreshes, and asserts the
 exchange rows and the US type counts; makes the stub return 503, refreshes again, and asserts
 the rows and `fetched_at` are unchanged with the note set.
@@ -407,7 +419,7 @@ per dataset, the files for its listed symbols (last date tail-read through
 calendar symbol's last date for daily, the last session's close for intraday), Uncataloged
 files per folder under the root, and the BT-605 state; a failed scan keeps the previous row.
 `GET /api/sources` returns each dataset with its last scan. Serves BT-1203. Decisions: 0012,
-0013, 0021.
+0013, 0021. A second source over the same root is refused (409), and `holds_files` from DS-03 narrows to the source's dataset folders once datasets exist.
 **Done when:** a service test builds a temp root with `eod/` holding files for three listed
 symbols, one `.part`, and a stray folder, registers a US EOD dataset over the stub listing of
 five symbols, scans, and asserts listed 5, on disk 3, the latest date, bytes, the `.part`
@@ -423,7 +435,7 @@ name, root, catalog, token as a password field); Replace token; Rescan per sourc
 "Available from <source>" panel with filter, expand-to-fetch, and Refresh. The token field is
 cleared after save and never rendered again. `docs/LOCAL_UI.md` and `docs/DATA_SOURCES.md`
 describe registering a source and adding a dataset. Serves BT-1201, BT-1202, BT-1203.
-Wireframes: BT-1201, BT-1202, BT-1203. Decisions: 0003, 0014, 0021.
+Wireframes: BT-1201, BT-1202, BT-1203. Decisions: 0003, 0014, 0021. Add source pre-fills root and catalog from `/api/data/sources` so the first EODHD source adopts the existing library (BT-1201's last criterion); the library metrics tile shows the freshness time as a date and time, not the raw ISO string, so it fits at 1280 px.
 **Done when:** `web/fixtures/data-sources.json` seeds two sources (one Credentials rejected),
 five datasets, an Uncataloged folder, and the US and LSE availability rows;
 `web/scripts/data-page-check.mjs` fails unless the panels appear in wireframe order, the
@@ -437,7 +449,7 @@ path; `web/scripts/layout-check.mjs` passes at 1280 and 1440 px.
 requests today, daily limit, resets at, and when usage was checked, refreshed by `GET
 /api/sources` (through the adapter, cached for a minute) and after every job; `PUT
 /api/sources/{id}` sets `reserve_pct`. The card renders used / limit, the reset time, and the
-reserve field. Serves BT-1204. Decisions: 0022.
+reserve field. Serves BT-1204. Decisions: 0022. EODHD returns no reset time: the adapter derives 00:00 UTC after the usage date, and the card labels it "resets 00:00 UTC".
 **Done when:** unit tests in `budget.rs` cover `can_start` at the boundary, `charge` past the
 reserve, and a limit of zero; a service test asserts `GET /api/sources` shows the stub's usage
 and, with the stub down, the last value with its time; `data-page-check.mjs` asserts the
@@ -495,6 +507,19 @@ Serves BT-1207. Decisions: 0001, 0021.
 **Done when:** `grep` finds none of the removed keys under `src/`, `web/app/`, `docs/`, or
 `local.example.toml`; the config tests in `local_config.rs` pass without them;
 `data-page-check.mjs` no longer expects the panel. No new test: removal only.
+
+### DS-12 Exchange resolutions come from the provider, not from a table in the adapter — Blocked by DS-04
+DS-02's EODHD adapter fills each exchange's resolutions from a table written from EODHD's public
+docs (daily, 1h, and 5m everywhere; 1m for US, FOREX, and CC), because the exchanges-list
+endpoint says nothing about intraday coverage. The availability panel then shows resolutions the
+account may not have. When an exchange row is expanded or a dataset is added against it, the
+service probes each intraday resolution once (one call per resolution, charged to the budget of
+DS-07) and stores what the provider actually served in `provider_exchanges`, with the probe time;
+a probe that returns no data removes that resolution from the row. Serves BT-1202. Decisions:
+0020, 0022.
+**Done when:** a service test over the stub lets the exchange list claim 1m for LSE, answers the
+1m probe with no data and the 5m probe with rows, and asserts the cached row lists 5m and not 1m
+with a probe time; a second expansion makes no further call.
 
 ## Housekeeping
 
@@ -1041,3 +1066,13 @@ do, run the loop.
 is advanced by a hand pull before the run and shows the engine rebuilt and the service
 restarted anyway, and a case where the marker matches `main` and nothing is rebuilt;
 `AGENTS.md` carries the rule.
+
+### HK-45 The coverage fold loads the newest completed run with no run id in the code
+`openCoverage` in `web/app/page.tsx` (from DS-01, inherited from the old `openData`) prefers a
+hard-coded run id from the owner's private catalog before falling back to the newest completed
+run; a private run id has no place in the public repo (AGENTS.md, Layout), and the fold should
+simply take the newest completed run from `/api/runs`. Remove the literal and the preference.
+Serves BT-607. Decisions: 0011.
+**Done when:** `grep -n 'run-2026' web/app/page.tsx` finds nothing, and
+`web/scripts/data-page-check.mjs` opens the coverage fold against the fixture's runs and asserts
+it loaded the newest completed one.
