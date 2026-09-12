@@ -21,9 +21,12 @@ use tessera::local_config::LocalConfig;
 use tessera::portfolio::{
     CapitalMode, PortfolioComponentConfig, PortfolioConfig, RebalanceMethod, combine_portfolio,
 };
-use tessera::provider::budget::CallBudget;
+use tessera::provider::budget::{CallBudget, Estimate};
 use tessera::provider::eodhd::Eodhd;
-use tessera::provider::{Account, Provider, ProviderError};
+use tessera::provider::jobs::eod::{
+    self as eod_job, DEFAULT_MIN_BULK_ROWS, DatasetSymbol, EodJobInput, JobState, Skipped,
+};
+use tessera::provider::{Account, Listing, Provider, ProviderError};
 use tessera::report::{ReportView, generate_report, load_report_view};
 use tessera::sdk::manifest::Manifest as SdkManifest;
 use tessera::sdk::runner::{
@@ -51,6 +54,17 @@ struct AppState {
     /// The sources whose scan job is running (DS-05): a second scan on one is refused, and
     /// the card says `scanning` until the job has written its rows.
     scans: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The download job running per source (DS-08, decision 0022: one job per source at a
+    /// time), keyed by source id; a second is refused naming it, and its dataset shows
+    /// `Updating` until it ends.
+    dataset_jobs: Arc<Mutex<std::collections::HashMap<String, RunningJob>>>,
+}
+
+/// The job holding a source's per-source lock.
+#[derive(Debug, Clone)]
+struct RunningJob {
+    id: String,
+    dataset_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -624,6 +638,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tessera::provider::eodhd::DEFAULT_BASE_URL.to_owned()),
         ),
         scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        dataset_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     import_legacy_reports(&state)?;
     let metrics_state = state.clone();
@@ -764,6 +779,9 @@ fn api_router() -> Router<AppState> {
         .route("/api/sources/{id}/datasets", post(create_dataset))
         .route("/api/sources/{id}/scan", post(scan_source))
         .route("/api/datasets/{id}", delete(delete_dataset))
+        .route("/api/datasets/{id}/update", post(start_dataset_update))
+        .route("/api/datasets/jobs/{id}", get(get_dataset_job))
+        .route("/api/datasets/jobs/{id}/log", get(get_dataset_job_log))
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -1043,7 +1061,26 @@ fn migrate(connection: &Connection) -> Result<()> {
              uncataloged_json TEXT NOT NULL,
              state TEXT NOT NULL,
              error TEXT
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS dataset_jobs (
+             id TEXT PRIMARY KEY,
+             dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+             kind TEXT NOT NULL,
+             state TEXT NOT NULL,
+             percent INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL,
+             started_at TEXT,
+             finished_at TEXT,
+             calls INTEGER NOT NULL DEFAULT 0,
+             added INTEGER NOT NULL DEFAULT 0,
+             updated INTEGER NOT NULL DEFAULT 0,
+             skipped_json TEXT NOT NULL DEFAULT '[]',
+             estimate_json TEXT,
+             error TEXT,
+             log_path TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_dataset_jobs_dataset_created
+         ON dataset_jobs(dataset_id, created_at DESC);",
     )?;
     ensure_column(
         connection,
@@ -1086,6 +1123,26 @@ fn migrate(connection: &Connection) -> Result<()> {
     ensure_column(connection, "data_sources", "daily_limit", "INTEGER")?;
     ensure_column(connection, "data_sources", "resets_at", "TEXT")?;
     ensure_column(connection, "data_sources", "usage_checked_at", "TEXT")?;
+    // DS-08: the row count a bulk day must reach for a dataset, and the listing's country
+    // and venue, which the regenerated catalog.csv carries.
+    ensure_column(
+        connection,
+        "datasets",
+        "min_bulk_rows",
+        &format!("INTEGER NOT NULL DEFAULT {DEFAULT_MIN_BULK_ROWS}"),
+    )?;
+    ensure_column(
+        connection,
+        "provider_listings",
+        "country",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        connection,
+        "provider_listings",
+        "venue",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     connection.execute_batch("PRAGMA optimize;")?;
     Ok(())
 }
@@ -1504,6 +1561,12 @@ fn recover_incomplete_jobs(connection: &Connection) -> Result<()> {
         "UPDATE strategy_validations SET status='failed', finished_at=?1,
          error='Local service restarted before validation finished; the draft source was preserved.'
          WHERE status IN ('queued', 'running')",
+        [&finished_at],
+    )?;
+    connection.execute(
+        "UPDATE dataset_jobs SET state='Failed', finished_at=?1,
+         error='Local service restarted before this download job finished; every file it wrote is whole, and the next run continues from the files.'
+         WHERE state IN ('Queued', 'Running')",
         [&finished_at],
     )?;
     Ok(())
@@ -4422,7 +4485,11 @@ impl SourceAdapter {
             .map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
         Ok(SourceAdapter::new(state, &row.kind, &token)?)
     }
+}
 
+/// The enum is itself a `Provider`, so the jobs in the library crate run over it as they
+/// run over any adapter.
+impl Provider for SourceAdapter {
     async fn verify(&self, token: &str) -> Result<tessera::provider::Account, ProviderError> {
         match self {
             SourceAdapter::Eodhd(eodhd) => eodhd.verify(token).await,
@@ -4442,6 +4509,36 @@ impl SourceAdapter {
     ) -> Result<Vec<tessera::provider::Listing>, ProviderError> {
         match self {
             SourceAdapter::Eodhd(eodhd) => eodhd.symbols(exchange, delisted).await,
+        }
+    }
+
+    async fn bulk_eod(
+        &self,
+        exchange: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<tessera::provider::BulkBar>, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.bulk_eod(exchange, date).await,
+        }
+    }
+
+    async fn eod_history(
+        &self,
+        symbol: &str,
+        from: NaiveDate,
+    ) -> Result<Vec<tessera::provider::Bar>, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.eod_history(symbol, from).await,
+        }
+    }
+
+    async fn splits(
+        &self,
+        exchange: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<tessera::provider::Split>, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.splits(exchange, date).await,
         }
     }
 }
@@ -5070,6 +5167,15 @@ async fn delete_source(
 ) -> Result<StatusCode, ApiError> {
     let row = load_source_row(&state, &id)?
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    if let Some(running) = running_job_on(&state, &id) {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "job {} is running on source {:?}; wait for it to finish",
+                running.id, row.name
+            ),
+        ));
+    }
     let mut folders: Vec<PathBuf> = {
         let connection = state.database.lock().expect("database lock poisoned");
         load_datasets(&connection, &id)?
@@ -5212,8 +5318,9 @@ fn store_listings(
     {
         let mut insert = tx.prepare(
             "INSERT INTO provider_listings
-             (source_id, exchange, code, name, type, currency, delisted, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (source_id, exchange, code, name, type, currency, delisted, fetched_at,
+              country, venue)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for listing in listings {
             insert.execute(params![
@@ -5224,7 +5331,9 @@ fn store_listings(
                 listing.kind,
                 listing.currency,
                 delisted,
-                fetched_at
+                fetched_at,
+                listing.country,
+                listing.venue
             ])?;
         }
     }
@@ -5498,6 +5607,7 @@ const COMPLETE_SHARE: f64 = 0.95;
 
 /// The states a scan assigns, as `docs/DATA_SOURCES.md` defines them (BT-605).
 const STATE_CURRENT: &str = "Current";
+const STATE_UPDATING: &str = "Updating";
 const STATE_STALE: &str = "Stale";
 const STATE_PARTIAL: &str = "Partial";
 const STATE_FAILED: &str = "Failed";
@@ -5518,6 +5628,9 @@ struct CreateDatasetRequest {
     folder: Option<String>,
     /// Omitted, on for daily bars and off otherwise.
     include_delisted: Option<bool>,
+    /// The row count a bulk day must reach before the EOD job accepts it (DS-08, decision
+    /// 0022); omitted, 10,000, a US session's order of magnitude.
+    min_bulk_rows: Option<u64>,
 }
 
 /// A dataset's figures from its last scan. The state lives on the row beside it.
@@ -5545,10 +5658,14 @@ struct DatasetRow {
     from_date: String,
     folder: String,
     include_delisted: bool,
+    /// A bulk day under this many rows is refused by the EOD job.
+    min_bulk_rows: u64,
     created_at: String,
     /// Current, Updating, Stale, Partial, Failed, Unknown, or Unavailable.
     state: String,
     scan: Option<DatasetScan>,
+    /// The newest download job on the dataset (DS-08); `None` before one has been queued.
+    last_job: Option<DatasetJobRecord>,
 }
 
 /// Files under the root that no dataset claims, counted per folder.
@@ -5568,7 +5685,7 @@ struct ScanAccepted {
 
 const DATASET_COLUMNS: &str = "d.id, d.source_id, d.exchange, d.types_json, d.resolution, \
      d.from_date, d.folder, d.include_delisted, d.created_at, s.scanned_at, s.listed, \
-     s.on_disk, s.latest_date, s.current_count, s.bytes, s.state, s.error";
+     s.on_disk, s.latest_date, s.current_count, s.bytes, s.state, s.error, d.min_bulk_rows";
 
 fn map_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetRow> {
     let types_json: String = row.get(3)?;
@@ -5596,27 +5713,47 @@ fn map_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetRow> {
         from_date: row.get(5)?,
         folder: row.get(6)?,
         include_delisted: row.get::<_, i64>(7)? != 0,
+        min_bulk_rows: row.get::<_, i64>(17)?.max(0) as u64,
         created_at: row.get(8)?,
         state: state.unwrap_or_else(|| STATE_UNKNOWN.to_owned()),
         scan,
+        last_job: None,
     })
 }
 
-/// The source's datasets, oldest first, each with its last scan when one has run.
+/// Attaches each dataset's newest download job; a dataset whose job is queued or running
+/// shows `Updating` whatever its last scan said (BT-605).
+fn attach_last_jobs(connection: &Connection, datasets: &mut [DatasetRow]) -> Result<()> {
+    for dataset in datasets {
+        dataset.last_job = last_job_of(connection, &dataset.id)?;
+        if dataset
+            .last_job
+            .as_ref()
+            .is_some_and(|job| job.state == "Queued" || job.state == "Running")
+        {
+            dataset.state = STATE_UPDATING.to_owned();
+        }
+    }
+    Ok(())
+}
+
+/// The source's datasets, oldest first, each with its last scan when one has run and its
+/// newest job.
 fn load_datasets(connection: &Connection, source_id: &str) -> Result<Vec<DatasetRow>> {
     let mut statement = connection.prepare(&format!(
         "SELECT {DATASET_COLUMNS} FROM datasets d
          LEFT JOIN dataset_scans s ON s.dataset_id = d.id
          WHERE d.source_id = ?1 ORDER BY d.created_at, d.id"
     ))?;
-    let rows = statement
+    let mut rows = statement
         .query_map([source_id], map_dataset)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    attach_last_jobs(connection, &mut rows)?;
     Ok(rows)
 }
 
 fn load_dataset(connection: &Connection, id: &str) -> Result<Option<DatasetRow>> {
-    Ok(connection
+    let row = connection
         .query_row(
             &format!(
                 "SELECT {DATASET_COLUMNS} FROM datasets d
@@ -5625,7 +5762,10 @@ fn load_dataset(connection: &Connection, id: &str) -> Result<Option<DatasetRow>>
             [id],
             map_dataset,
         )
-        .optional()?)
+        .optional()?;
+    let mut rows: Vec<DatasetRow> = row.into_iter().collect();
+    attach_last_jobs(connection, &mut rows)?;
+    Ok(rows.pop())
 }
 
 /// The symbols a dataset covers: the codes of its types on its exchange in the cached
@@ -6213,8 +6353,8 @@ async fn create_dataset(
         connection.execute(
             "INSERT INTO datasets
              (id, source_id, exchange, types_json, resolution, from_date, folder,
-              include_delisted, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              include_delisted, created_at, min_bulk_rows)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 dataset_id,
                 id,
@@ -6225,6 +6365,7 @@ async fn create_dataset(
                 folder,
                 include_delisted,
                 now.to_rfc3339(),
+                request.min_bulk_rows.unwrap_or(DEFAULT_MIN_BULK_ROWS) as i64,
             ],
         )?;
     }
@@ -6249,6 +6390,14 @@ async fn delete_dataset(
         let symbols = listed_symbols(&connection, &dataset)?;
         (dataset, symbols)
     };
+    if let Some(running) = running_job_on(&state, &dataset.source_id)
+        && running.dataset_id == dataset.id
+    {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!("job {} is running on dataset {}", running.id, dataset.id),
+        ));
+    }
     let folder = PathBuf::from(&dataset.folder);
     let exchange = dataset.exchange.clone();
     let occupied =
@@ -6311,6 +6460,525 @@ async fn scan_source(
             scanning: true,
         }),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// The native EOD download job (DS-08, BT-1205; decisions 0020 and 0022). The job itself is
+// `tessera::provider::jobs::eod`, run over the source's adapter; the service maps the
+// dataset and its cached listing onto the job's input, keeps one job per source, refuses a
+// folder before any call, records progress and the outcome in `dataset_jobs`, writes the
+// log under data/ui/logs/, and, after the job, refreshes the source's usage and rescans it.
+// ---------------------------------------------------------------------------
+
+/// The job kind `dataset_jobs.kind` names for a daily dataset's update.
+const JOB_KIND_EOD: &str = "eod";
+
+/// A download job as the console shows it.
+#[derive(Debug, Clone, Serialize)]
+struct DatasetJobRecord {
+    id: String,
+    dataset_id: String,
+    source_id: String,
+    kind: String,
+    /// Queued, Running, Complete, or Failed.
+    state: String,
+    percent: u8,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    calls: u64,
+    /// Files created by the backfill.
+    added: u64,
+    /// Files appended to or replaced.
+    updated: u64,
+    /// Symbols the job did not bring current, each with its reason.
+    skipped: Vec<Skipped>,
+    /// The call estimate the budget judged; `None` when the job was refused before one.
+    estimate: Option<Estimate>,
+    error: Option<String>,
+    /// Relative to the service root; `GET /api/datasets/jobs/{id}/log` serves it.
+    log_path: String,
+}
+
+const DATASET_JOB_COLUMNS: &str = "j.id, j.dataset_id, d.source_id, j.kind, j.state, \
+     j.percent, j.created_at, j.started_at, j.finished_at, j.calls, j.added, j.updated, \
+     j.skipped_json, j.estimate_json, j.error, j.log_path";
+
+fn map_dataset_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetJobRecord> {
+    let skipped_json: String = row.get(12)?;
+    let estimate_json: Option<String> = row.get(13)?;
+    Ok(DatasetJobRecord {
+        id: row.get(0)?,
+        dataset_id: row.get(1)?,
+        source_id: row.get(2)?,
+        kind: row.get(3)?,
+        state: row.get(4)?,
+        percent: row.get::<_, i64>(5)?.clamp(0, 100) as u8,
+        created_at: row.get(6)?,
+        started_at: row.get(7)?,
+        finished_at: row.get(8)?,
+        calls: row.get::<_, i64>(9)?.max(0) as u64,
+        added: row.get::<_, i64>(10)?.max(0) as u64,
+        updated: row.get::<_, i64>(11)?.max(0) as u64,
+        skipped: serde_json::from_str(&skipped_json).unwrap_or_default(),
+        estimate: estimate_json.and_then(|text| serde_json::from_str(&text).ok()),
+        error: row.get(14)?,
+        log_path: row.get(15)?,
+    })
+}
+
+fn load_dataset_job(connection: &Connection, id: &str) -> Result<Option<DatasetJobRecord>> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT {DATASET_JOB_COLUMNS} FROM dataset_jobs j
+                 JOIN datasets d ON d.id = j.dataset_id WHERE j.id = ?1"
+            ),
+            [id],
+            map_dataset_job,
+        )
+        .optional()?)
+}
+
+/// The newest job on a dataset.
+fn last_job_of(connection: &Connection, dataset_id: &str) -> Result<Option<DatasetJobRecord>> {
+    Ok(connection
+        .query_row(
+            &format!(
+                "SELECT {DATASET_JOB_COLUMNS} FROM dataset_jobs j
+                 JOIN datasets d ON d.id = j.dataset_id
+                 WHERE j.dataset_id = ?1 ORDER BY j.created_at DESC, j.id DESC LIMIT 1"
+            ),
+            [dataset_id],
+            map_dataset_job,
+        )
+        .optional()?)
+}
+
+/// The job holding the source's lock, if one runs.
+fn running_job_on(state: &AppState, source_id: &str) -> Option<RunningJob> {
+    state
+        .dataset_jobs
+        .lock()
+        .expect("job set poisoned")
+        .get(source_id)
+        .cloned()
+}
+
+/// The dataset's symbols with their listings: the rows of its types on its exchange, the
+/// delisted ones when the dataset includes them, one per code (the active row first when a
+/// code is in both lists).
+fn dataset_symbols(connection: &Connection, dataset: &DatasetRow) -> Result<Vec<DatasetSymbol>> {
+    if dataset.types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (0..dataset.types.len())
+        .map(|i| format!("?{}", i + 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = connection.prepare(&format!(
+        "SELECT code, name, type, currency, country, venue, delisted FROM provider_listings
+         WHERE source_id = ?1 AND exchange = ?2 AND (delisted = 0 OR ?3)
+           AND type IN ({placeholders})
+         ORDER BY code, delisted"
+    ))?;
+    let mut values: Vec<&dyn rusqlite::ToSql> = vec![
+        &dataset.source_id,
+        &dataset.exchange,
+        &dataset.include_delisted,
+    ];
+    values.extend(dataset.types.iter().map(|t| t as &dyn rusqlite::ToSql));
+    let rows = statement
+        .query_map(values.as_slice(), |row| {
+            Ok(DatasetSymbol {
+                listing: Listing {
+                    code: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    currency: row.get(3)?,
+                    country: row.get(4)?,
+                    venue: row.get(5)?,
+                },
+                delisted: row.get::<_, i64>(6)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut symbols: Vec<DatasetSymbol> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if symbols
+            .last()
+            .is_none_or(|last| last.listing.code != row.listing.code)
+        {
+            symbols.push(row);
+        }
+    }
+    Ok(symbols)
+}
+
+/// The exchange's active listing, every type: what the catalog files are regenerated from.
+fn exchange_listing(
+    connection: &Connection,
+    source_id: &str,
+    exchange: &str,
+) -> Result<Vec<Listing>> {
+    let mut statement = connection.prepare(
+        "SELECT code, name, type, currency, country, venue FROM provider_listings
+         WHERE source_id = ?1 AND exchange = ?2 AND delisted = 0 ORDER BY code",
+    )?;
+    let rows = statement
+        .query_map(params![source_id, exchange], |row| {
+            Ok(Listing {
+                code: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                currency: row.get(3)?,
+                country: row.get(4)?,
+                venue: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The calendar symbol's code when it is listed on `exchange` (`SPY.US` on `US` is `SPY`);
+/// `None` on another exchange, where a bulk day cannot be checked for it.
+fn calendar_code_for(calendar_symbol: &str, exchange: &str) -> Option<String> {
+    let (code, suffix) = calendar_symbol.rsplit_once('.')?;
+    (suffix == exchange && !code.is_empty()).then(|| code.to_owned())
+}
+
+/// The last session a run fetches: today in New York, where the exchanges the console
+/// serves close; a session the provider has not published yet answers with no bars and is
+/// skipped, so asking a day early costs one call and nothing else.
+fn today_in_new_york() -> NaiveDate {
+    Utc::now()
+        .with_timezone(&chrono_tz::America::New_York)
+        .date_naive()
+}
+
+/// Queues the dataset's download job: 202 with the record, the job running in the
+/// background. Refused, before any provider call, with 409 while a job runs on the source
+/// (naming it), for a root that is not mounted or a folder that is missing, not a folder, or
+/// not writable (the job never creates it), and when no token is on file; then, after the
+/// source's usage is refreshed, with 409 when the provider has not reported usage (a job
+/// is governed by it, decision 0022). Only daily datasets have a job yet.
+async fn start_dataset_update(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<(StatusCode, Json<DatasetJobRecord>), ApiError> {
+    let dataset = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        load_dataset(&connection, &id)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no dataset {id:?}")))?
+    };
+    if dataset.resolution != "daily" {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the EOD job updates daily datasets; {} datasets have no job yet",
+                dataset.resolution
+            ),
+        ));
+    }
+    let row = load_source_row(&state, &dataset.source_id)?.ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("no source {:?}", dataset.source_id),
+        )
+    })?;
+    let busy = |running: RunningJob| {
+        api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "job {} is running on source {:?} (dataset {}); one job per source at a time",
+                running.id, row.name, running.dataset_id
+            ),
+        )
+    };
+    if let Some(running) = running_job_on(&state, &row.id) {
+        return Err(busy(running));
+    }
+    if !Path::new(&row.root).is_dir() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "root {} is not mounted; the job never creates a folder",
+                row.root
+            ),
+        ));
+    }
+    eod_job::check_folder(Path::new(&dataset.folder))
+        .map_err(|refusal| api_error(StatusCode::CONFLICT, refusal))?;
+    let adapter = SourceAdapter::from_file(&state, &row)?;
+
+    refresh_source_usage(&state, &row, true).await?;
+    let row = load_source_row(&state, &row.id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {:?}", row.id)))?;
+    let Some(budget) = budget_of(&row) else {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "the provider has not reported usage for source {:?} ({}); a job starts only \
+                 from reported usage",
+                row.name,
+                row.verify_message.as_deref().unwrap_or("not verified")
+            ),
+        ));
+    };
+
+    let now = Utc::now();
+    let job_id = format!("job-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
+    let log_path = format!("data/ui/logs/{job_id}.log");
+    {
+        let mut jobs = state.dataset_jobs.lock().expect("job set poisoned");
+        if let Some(running) = jobs.get(&row.id) {
+            return Err(busy(running.clone()));
+        }
+        jobs.insert(
+            row.id.clone(),
+            RunningJob {
+                id: job_id.clone(),
+                dataset_id: dataset.id.clone(),
+            },
+        );
+    }
+    let inserted = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "INSERT INTO dataset_jobs (id, dataset_id, kind, state, created_at, log_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                job_id,
+                dataset.id,
+                JOB_KIND_EOD,
+                JobState::Queued.as_str(),
+                now.to_rfc3339(),
+                log_path
+            ],
+        )
+    };
+    if let Err(error) = inserted {
+        state
+            .dataset_jobs
+            .lock()
+            .expect("job set poisoned")
+            .remove(&row.id);
+        return Err(anyhow::Error::from(error).context("record the job").into());
+    }
+    let worker = state.clone();
+    let worker_id = job_id.clone();
+    tokio::spawn(async move {
+        run_dataset_job(worker, worker_id, dataset, row, adapter, budget).await;
+    });
+    let record = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        load_dataset_job(&connection, &job_id)?
+            .ok_or_else(|| anyhow::anyhow!("job {job_id:?} was not recorded"))?
+    };
+    Ok((StatusCode::ACCEPTED, Json(record)))
+}
+
+/// Writes a job's progress figures.
+fn record_job_progress(state: &AppState, job_id: &str, progress: eod_job::Progress) {
+    let connection = state.database.lock().expect("database lock poisoned");
+    let _ = connection.execute(
+        "UPDATE dataset_jobs SET percent = ?2, calls = ?3, added = ?4, updated = ?5 WHERE id = ?1",
+        params![
+            job_id,
+            progress.percent as i64,
+            progress.calls as i64,
+            progress.added as i64,
+            progress.updated as i64
+        ],
+    );
+}
+
+/// Marks a job finished with its outcome.
+fn record_job_outcome(
+    state: &AppState,
+    job_id: &str,
+    outcome: &eod_job::Outcome,
+    finished_at: &str,
+) -> Result<()> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    connection.execute(
+        "UPDATE dataset_jobs
+         SET state = ?2, finished_at = ?3, calls = ?4, added = ?5, updated = ?6,
+             skipped_json = ?7, estimate_json = ?8, error = ?9,
+             percent = CASE WHEN ?2 = 'Complete' THEN 100 ELSE percent END
+         WHERE id = ?1",
+        params![
+            job_id,
+            outcome.state.as_str(),
+            finished_at,
+            outcome.calls as i64,
+            outcome.added as i64,
+            outcome.updated as i64,
+            serde_json::to_string(&outcome.skipped)?,
+            outcome
+                .estimate
+                .map(|estimate| serde_json::to_string(&estimate))
+                .transpose()?,
+            outcome.error,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Runs the job over the adapter and records it; a failure of the service's own steps
+/// (reading the listing, opening the log) is the job's error. Whatever happened, the
+/// source's usage is refreshed from the provider, the source is rescanned so the dataset's
+/// figures follow the files, and the source's lock is released last.
+async fn run_dataset_job(
+    state: AppState,
+    job_id: String,
+    dataset: DatasetRow,
+    source: SourceRow,
+    adapter: SourceAdapter,
+    budget: CallBudget,
+) {
+    let outcome = execute_dataset_job(&state, &job_id, &dataset, &source, &adapter, budget).await;
+    let finished_at = Utc::now().to_rfc3339();
+    let recorded = match outcome {
+        Ok(outcome) => record_job_outcome(&state, &job_id, &outcome, &finished_at),
+        Err(error) => {
+            let connection = state.database.lock().expect("database lock poisoned");
+            connection
+                .execute(
+                    "UPDATE dataset_jobs SET state = 'Failed', finished_at = ?2, error = ?3
+                     WHERE id = ?1",
+                    params![job_id, finished_at, format!("{error:#}")],
+                )
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        }
+    };
+    if let Err(error) = recorded {
+        eprintln!("job {job_id} could not be recorded: {error:#}");
+    }
+    if let Err(error) = refresh_source_usage(&state, &source, true).await {
+        eprintln!("usage refresh after job {job_id} failed: {error:#}");
+    }
+    let rescan = state
+        .scans
+        .lock()
+        .expect("scan set poisoned")
+        .insert(source.id.clone());
+    if rescan {
+        let inner = state.clone();
+        let source_id = source.id.clone();
+        match tokio::task::spawn_blocking(move || run_scan(&inner, &source_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("scan after job {job_id} failed: {error:#}"),
+            Err(error) => eprintln!("scan after job {job_id} panicked: {error}"),
+        }
+        state
+            .scans
+            .lock()
+            .expect("scan set poisoned")
+            .remove(&source.id);
+    }
+    state
+        .dataset_jobs
+        .lock()
+        .expect("job set poisoned")
+        .remove(&source.id);
+}
+
+/// Marks the job running, builds the job's input from the dataset and its cached listing,
+/// opens the log, and runs the job with progress written to the row as it moves.
+async fn execute_dataset_job(
+    state: &AppState,
+    job_id: &str,
+    dataset: &DatasetRow,
+    source: &SourceRow,
+    adapter: &SourceAdapter,
+    mut budget: CallBudget,
+) -> Result<eod_job::Outcome> {
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "UPDATE dataset_jobs SET state = ?2, started_at = ?3 WHERE id = ?1",
+            params![job_id, JobState::Running.as_str(), Utc::now().to_rfc3339()],
+        )?;
+    }
+    let (symbols, catalog) = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        (
+            dataset_symbols(&connection, dataset)?,
+            exchange_listing(&connection, &dataset.source_id, &dataset.exchange)?,
+        )
+    };
+    let from_date = NaiveDate::parse_from_str(&dataset.from_date, "%Y-%m-%d")
+        .with_context(|| format!("from_date {:?} is not a date", dataset.from_date))?;
+    let input = EodJobInput {
+        exchange: dataset.exchange.clone(),
+        folder: PathBuf::from(&dataset.folder),
+        catalog_dir: PathBuf::from(&source.catalog_dir),
+        from_date,
+        through: today_in_new_york(),
+        min_bulk_rows: dataset.min_bulk_rows,
+        calendar_code: calendar_code_for(&state.local.data.calendar_symbol, &dataset.exchange),
+        symbols,
+        catalog,
+    };
+    let log_path = state.root.join(format!("data/ui/logs/{job_id}.log"));
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).context("create the log folder")?;
+    }
+    let mut log = fs::File::create(&log_path).context("open the job log")?;
+    let progress_state = state.clone();
+    let progress_id = job_id.to_owned();
+    let mut last_written: Option<(std::time::Instant, u8)> = None;
+    let mut on_progress = move |progress: eod_job::Progress| {
+        let due = last_written.is_none_or(|(at, percent)| {
+            percent != progress.percent || at.elapsed() >= std::time::Duration::from_secs(1)
+        });
+        if due {
+            record_job_progress(&progress_state, &progress_id, progress);
+            last_written = Some((std::time::Instant::now(), progress.percent));
+        }
+    };
+    Ok(eod_job::run(adapter, &input, &mut budget, &mut log, &mut on_progress).await)
+}
+
+async fn get_dataset_job(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<DatasetJobRecord>, ApiError> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    let record = load_dataset_job(&connection, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no job {id:?}")))?;
+    Ok(Json(record))
+}
+
+/// The job's log as a text download; empty while the job has not started writing it.
+async fn get_dataset_job_log(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<axum::response::Response, ApiError> {
+    let record = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        load_dataset_job(&connection, &id)?
+            .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no job {id:?}")))?
+    };
+    let text = fs::read_to_string(state.root.join(&record.log_path)).unwrap_or_default();
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&format!("attachment; filename=\"{}.log\"", record.id))
+                    .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+            ),
+        ],
+        text,
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -9109,6 +9777,7 @@ mod tests {
                 data_sources: Arc::new(Mutex::new(None)),
                 eodhd_base_url: Arc::new(eodhd_base_url.to_owned()),
                 scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                dataset_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             }
         }
 
@@ -9607,6 +10276,8 @@ mod tests {
                 name: String::new(),
                 kind: kind.into(),
                 currency: "USD".into(),
+                country: String::new(),
+                venue: String::new(),
             };
             store_exchanges(
                 &mut connection,
@@ -10090,6 +10761,416 @@ mod tests {
 
             fn dataset_count(state: &AppState) -> i64 {
                 table_count(state, "datasets")
+            }
+
+            /// The DS-08 download endpoints beside the DS-02 stub: bulk bars for the two
+            /// sessions after the seeded files (the recorded fixture with its date moved),
+            /// an empty list for any other date, no splits, YHOO's history and none for
+            /// TWTR, 404 for any other symbol; every call is counted, and while `hold` is
+            /// set a bulk call waits, so a test can see the job running.
+            #[derive(Clone)]
+            struct JobStub {
+                hold: Arc<AtomicBool>,
+                calls: Arc<std::sync::atomic::AtomicU64>,
+            }
+
+            const JOB_SESSIONS: [&str; 2] = ["2026-09-10", "2026-09-11"];
+
+            async fn stub_bulk(
+                State(stub): State<JobStub>,
+                AxumPath(exchange): AxumPath<String>,
+                AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+            ) -> Response {
+                stub.calls.fetch_add(1, Ordering::SeqCst);
+                while stub.hold.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                let param = |name: &str| {
+                    query
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                };
+                let date = param("date");
+                if exchange != "US"
+                    || param("type") == "splits"
+                    || !JOB_SESSIONS.contains(&date.as_str())
+                {
+                    return json_response(StatusCode::OK, "[]".to_owned());
+                }
+                json_response(
+                    StatusCode::OK,
+                    fixture("eod-bulk-last-day-US").replace("2026-09-11", &date),
+                )
+            }
+
+            async fn stub_history(
+                State(stub): State<JobStub>,
+                AxumPath(symbol): AxumPath<String>,
+            ) -> Response {
+                stub.calls.fetch_add(1, Ordering::SeqCst);
+                match symbol.as_str() {
+                    "YHOO.US" => json_response(
+                        StatusCode::OK,
+                        r#"[{"date":"2020-01-02","open":30,"high":31,"low":29,"close":30.5,"adjusted_close":30.5,"volume":100},
+                            {"date":"2020-01-03","open":30.5,"high":32,"low":30,"close":31,"adjusted_close":31,"volume":120}]"#
+                            .to_owned(),
+                    ),
+                    "TWTR.US" => json_response(StatusCode::OK, "[]".to_owned()),
+                    _ => json_response(
+                        StatusCode::NOT_FOUND,
+                        r#"{"message":"Symbol not found"}"#.to_owned(),
+                    ),
+                }
+            }
+
+            /// The DS-02 stub with the download endpoints merged in.
+            async fn job_stub() -> (String, JobStub) {
+                let jobs = JobStub {
+                    hold: Arc::new(AtomicBool::new(false)),
+                    calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                };
+                let router = Router::new()
+                    .route("/api/user", get(stub_user))
+                    .route("/api/exchanges-list/", get(stub_exchanges))
+                    .route("/api/exchange-symbol-list/{exchange}", get(stub_symbols))
+                    .with_state(Stub {
+                        down: Arc::new(AtomicBool::new(false)),
+                    })
+                    .merge(
+                        Router::new()
+                            .route("/api/eod-bulk-last-day/{exchange}", get(stub_bulk))
+                            .route("/api/eod/{symbol}", get(stub_history))
+                            .with_state(jobs.clone()),
+                    );
+                (serve(router).await, jobs)
+            }
+
+            /// Polls a job until it is Complete or Failed.
+            async fn finished_job(
+                client: &reqwest::Client,
+                api: &str,
+                id: &str,
+            ) -> serde_json::Value {
+                for _ in 0..400 {
+                    let (status, job, text) =
+                        call(client.get(format!("{api}/api/datasets/jobs/{id}"))).await;
+                    assert_eq!(status, StatusCode::OK, "{text}");
+                    if job["state"] == "Complete" || job["state"] == "Failed" {
+                        return job;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("job {id} did not finish");
+            }
+
+            /// Polls the cards until the source's rescan after a job has written its rows.
+            async fn rescanned_card(
+                client: &reqwest::Client,
+                api: &str,
+                id: &str,
+            ) -> serde_json::Value {
+                for _ in 0..400 {
+                    let card = settled_card(client, api, id).await;
+                    if card["scanned_at"].is_string() {
+                        return card;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                panic!("the source {id} was not rescanned");
+            }
+
+            fn seeded_daily(dates: &[&str]) -> String {
+                let mut text = "Date,Open,High,Low,Close,Adjusted_close,Volume\n".to_owned();
+                for (i, date) in dates.iter().enumerate() {
+                    text.push_str(&format!(
+                        "{date},{0},{1},{2},{0},{0},1000\n",
+                        100 + i,
+                        101 + i,
+                        99 + i
+                    ));
+                }
+                text
+            }
+
+            #[test]
+            fn the_calendar_code_is_the_symbol_on_its_own_exchange_only() {
+                assert_eq!(calendar_code_for("SPY.US", "US").as_deref(), Some("SPY"));
+                assert_eq!(calendar_code_for("SPY.US", "LSE"), None);
+                assert_eq!(
+                    calendar_code_for("BRK-B.US", "US").as_deref(),
+                    Some("BRK-B")
+                );
+                assert_eq!(calendar_code_for("SPY", "US"), None);
+                assert_eq!(calendar_code_for(".US", "US"), None);
+                let today = today_in_new_york();
+                let utc = Utc::now().date_naive();
+                assert!(today == utc || today == utc.pred_opt().unwrap());
+            }
+
+            /// DS-08 (decisions 0020, 0022): `POST /api/datasets/{id}/update` queues the EOD
+            /// job over the stub; while it runs the dataset says Updating and a second POST
+            /// on the source is 409 naming the job; when it ends the files carry the two
+            /// sessions, the delisted symbol with a history is backfilled and the one
+            /// without is skipped with its reason, the catalog files are regenerated from
+            /// the cached listing, the log downloads, the source's usage is refreshed, and
+            /// the source is rescanned. A removed folder or an unmounted root is 409 before
+            /// any call.
+            #[tokio::test]
+            async fn a_datasets_update_runs_the_eod_job_in_the_background_and_refuses_a_second() {
+                let (eodhd, jobs) = job_stub().await;
+                let root = scratch_root("jobs");
+                let library = root.join("library");
+                let eod = library.join("eod");
+                let catalog = library.join("catalog");
+                fs::create_dir_all(&eod).unwrap();
+                fs::create_dir_all(&catalog).unwrap();
+                fs::write(catalog.join("stocks.txt"), "STALE.US\n").unwrap();
+                let seed_dates = ["2026-09-08", "2026-09-09"];
+                for code in ["AAPL", "SPY", "BRK-B"] {
+                    fs::write(
+                        eod.join(format!("{code}.US.csv")),
+                        seeded_daily(&seed_dates),
+                    )
+                    .unwrap();
+                }
+                let state = test_state_over(&root, &eodhd, &library);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+                let secrets_path = root.join("data/ui/secrets").display().to_string();
+                let leaks = [TOKEN, secrets_path.as_str(), "data/ui/secrets"];
+                let mut responses: Vec<(String, String)> = Vec::new();
+
+                let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                    &serde_json::json!({
+                        "kind": "eodhd", "name": "EODHD", "root": library,
+                        "catalog_dir": catalog, "token": TOKEN
+                    }),
+                ))
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                responses.push(("POST source".into(), text));
+                let id = card["id"].as_str().unwrap().to_owned();
+                let (status, _, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/{id}/availability/refresh"))
+                        .json(&serde_json::json!({ "exchange": "US", "delisted": true })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                let (status, dataset, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/{id}/datasets"))
+                        .json(&serde_json::json!({
+                            "exchange": "US", "types": ["Common Stock", "ETF"],
+                            "resolution": "daily", "from_date": "2020-01-01",
+                            "min_bulk_rows": 3
+                        })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                responses.push(("POST dataset".into(), text));
+                let dataset_id = dataset["id"].as_str().unwrap().to_owned();
+                assert_eq!(dataset["min_bulk_rows"], 3);
+                assert!(dataset["last_job"].is_null(), "{dataset}");
+                let (status, intraday, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/{id}/datasets"))
+                        .json(&serde_json::json!({
+                            "exchange": "US", "types": ["ETF"], "resolution": "5m",
+                            "from_date": "2024-01-01"
+                        })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                assert_eq!(intraday["min_bulk_rows"], DEFAULT_MIN_BULK_ROWS);
+                let intraday_id = intraday["id"].as_str().unwrap().to_owned();
+
+                // The job is queued at once and the stub holds its first bulk call.
+                jobs.hold.store(true, Ordering::SeqCst);
+                let update = format!("{api}/api/datasets/{dataset_id}/update");
+                let (status, job, text) = call(client.post(&update)).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+                responses.push(("POST update".into(), text));
+                let job_id = job["id"].as_str().unwrap().to_owned();
+                assert!(job_id.starts_with("job-"), "{job}");
+                assert_eq!(job["dataset_id"], dataset_id.as_str());
+                assert_eq!(job["source_id"], id.as_str());
+                assert_eq!(job["kind"], "eod");
+                assert_eq!(job["state"], "Queued");
+                assert_eq!(job["percent"], 0);
+                assert_eq!(job["calls"], 0);
+                assert_eq!(job["skipped"], serde_json::json!([]));
+                assert!(job["finished_at"].is_null(), "{job}");
+                assert_eq!(
+                    job["log_path"],
+                    format!("data/ui/logs/{job_id}.log").as_str()
+                );
+
+                // A second job on the source is refused naming the running one, whichever
+                // dataset it is for; the dataset says Updating meanwhile.
+                let (status, _, text) = call(client.post(&update)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains(&job_id), "{text}");
+                responses.push(("POST update while running".into(), text));
+                let (status, _, text) =
+                    call(client.post(format!("{api}/api/datasets/{intraday_id}/update"))).await;
+                assert!(
+                    status == StatusCode::CONFLICT || status == StatusCode::BAD_REQUEST,
+                    "{text}"
+                );
+                let (_, list, text) = call(client.get(format!("{api}/api/sources"))).await;
+                responses.push(("GET sources updating".into(), text));
+                let running = &list["sources"][0]["datasets"][0];
+                assert_eq!(running["state"], "Updating", "{running}");
+                assert_eq!(running["last_job"]["id"], job_id.as_str());
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/datasets/{dataset_id}"))).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains(&job_id), "{text}");
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/sources/{id}"))).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains(&job_id), "{text}");
+
+                jobs.hold.store(false, Ordering::SeqCst);
+                let job = finished_job(&client, &api, &job_id).await;
+                responses.push(("GET job".into(), job.to_string()));
+                assert_eq!(job["state"], "Complete", "{job}");
+                assert_eq!(job["percent"], 100);
+                assert_eq!(job["added"], 1, "{job}");
+                assert_eq!(job["updated"], 3, "{job}");
+                assert!(job["calls"].as_u64().unwrap() >= 5, "{job}");
+                assert_eq!(job["skipped"].as_array().unwrap().len(), 1, "{job}");
+                assert_eq!(job["skipped"][0]["symbol"], "TWTR.US");
+                assert!(
+                    job["skipped"][0]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no history"),
+                    "{job}"
+                );
+                assert!(job["estimate"]["mandatory"].as_u64().unwrap() >= 4, "{job}");
+                assert_eq!(job["estimate"]["optional"], 2);
+                assert!(job["error"].is_null(), "{job}");
+                assert!(job["started_at"].is_string() && job["finished_at"].is_string());
+                let finished_at = job["finished_at"].as_str().unwrap().to_owned();
+                let calls_after_job = jobs.calls.load(Ordering::SeqCst);
+                assert!(calls_after_job >= 5, "{calls_after_job}");
+
+                // The files: two sessions on the three, YHOO backfilled, TWTR absent.
+                for code in ["AAPL", "SPY", "BRK-B"] {
+                    let text = fs::read_to_string(eod.join(format!("{code}.US.csv"))).unwrap();
+                    let lines: Vec<&str> = text.lines().collect();
+                    assert_eq!(lines.len(), 5, "{code}:\n{text}");
+                    assert!(lines[3].starts_with("2026-09-10,"), "{text}");
+                    assert!(lines[4].starts_with("2026-09-11,"), "{text}");
+                }
+                let yhoo = fs::read_to_string(eod.join("YHOO.US.csv")).unwrap();
+                assert_eq!(
+                    yhoo,
+                    "Date,Open,High,Low,Close,Adjusted_close,Volume\n\
+                     2020-01-02,30,31,29,30.5,30.5,100\n2020-01-03,30.5,32,30,31,31,120\n"
+                );
+                assert!(!eod.join("TWTR.US.csv").exists());
+                for entry in fs::read_dir(&eod).unwrap().flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    assert!(!name.ends_with(".part"), "part file left: {name}");
+                }
+                // The catalog files come from the cached listing, in today's columns.
+                assert_eq!(
+                    fs::read_to_string(catalog.join("catalog.csv")).unwrap(),
+                    "Code,Name,Country,Exchange,Currency,Type\n\
+                     AAPL,Apple Inc,USA,NASDAQ,USD,Common Stock\n\
+                     BRK-B,Berkshire Hathaway Inc,USA,NYSE,USD,Common Stock\n\
+                     SPY,SPDR S&P 500 ETF Trust,USA,NYSE ARCA,USD,ETF\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(catalog.join("stocks.txt")).unwrap(),
+                    "AAPL.US\nBRK-B.US\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(catalog.join("etfs.txt")).unwrap(),
+                    "SPY.US\n"
+                );
+
+                // The log downloads from under data/ui/, never from the dataset folder.
+                let response = client
+                    .get(format!("{api}/api/datasets/jobs/{job_id}/log"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let disposition = response
+                    .headers()
+                    .get("content-disposition")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                assert!(disposition.contains("attachment"), "{disposition}");
+                let log = response.text().await.unwrap();
+                assert!(log.contains("complete:"), "{log}");
+                assert!(log.contains("backfilled"), "{log}");
+                responses.push(("GET log".into(), log));
+                assert!(root.join(format!("data/ui/logs/{job_id}.log")).is_file());
+                assert!(!eod.join(format!("{job_id}.log")).exists());
+                let (status, _, text) =
+                    call(client.get(format!("{api}/api/datasets/jobs/nope"))).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+
+                // After the job the usage was asked again and the source rescanned.
+                let row = load_source_row(&state, &id).unwrap().unwrap();
+                assert!(
+                    row.usage_checked_at.as_deref().unwrap() >= finished_at.as_str(),
+                    "{:?} < {finished_at}",
+                    row.usage_checked_at
+                );
+                let card = rescanned_card(&client, &api, &id).await;
+                responses.push(("GET sources rescanned".into(), card.to_string()));
+                let daily = &card["datasets"][0];
+                assert_eq!(daily["last_job"]["id"], job_id.as_str());
+                assert_eq!(daily["last_job"]["state"], "Complete");
+                assert_eq!(daily["state"], "Partial", "{daily}");
+                assert_eq!(daily["scan"]["on_disk"], 4, "{daily}");
+                assert_eq!(daily["scan"]["latest_date"], "2026-09-11");
+                assert_eq!(daily["scan"]["current_count"], 3);
+                assert_eq!(table_count(&state, "dataset_jobs"), 1);
+
+                // A removed folder is refused before any call, and not created; so is an
+                // unmounted root.
+                let calls_before = jobs.calls.load(Ordering::SeqCst);
+                fs::remove_dir_all(&eod).unwrap();
+                let (status, _, text) = call(client.post(&update)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(
+                    text.contains("missing") && text.contains("never creates"),
+                    "{text}"
+                );
+                responses.push(("POST update folder missing".into(), text));
+                assert!(!eod.exists(), "the folder was created");
+                fs::rename(&library, root.join("unmounted")).unwrap();
+                let (status, _, text) = call(client.post(&update)).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{text}");
+                assert!(text.contains("not mounted"), "{text}");
+                responses.push(("POST update root unmounted".into(), text));
+                assert_eq!(
+                    jobs.calls.load(Ordering::SeqCst),
+                    calls_before,
+                    "a call was made"
+                );
+                assert_eq!(table_count(&state, "dataset_jobs"), 1);
+                let (status, _, text) =
+                    call(client.post(format!("{api}/api/datasets/nope/update"))).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+
+                for (label, body) in &responses {
+                    for leak in &leaks {
+                        assert!(!body.contains(leak), "{label} carries {leak:?}: {body}");
+                    }
+                }
+                let _ = fs::remove_dir_all(&root);
             }
 
             #[tokio::test]

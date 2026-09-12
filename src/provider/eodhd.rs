@@ -1,5 +1,6 @@
 //! The EODHD adapter (decision 0020): the user, exchanges-list, and exchange-symbol-list
-//! endpoints over reqwest with rustls.
+//! endpoints, and the download endpoints the EOD job uses (eod-bulk-last-day for bars and
+//! for splits, eod for one symbol's history), over reqwest with rustls.
 //!
 //! Every call sends the token as the `api_token` query parameter and asks for `fmt=json`
 //! (the list endpoints answer CSV without it). The base URL is configurable so tests run
@@ -15,7 +16,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::{Account, Exchange, Listing, Provider, ProviderError};
+use super::{Account, Bar, BulkBar, Exchange, Listing, Provider, ProviderError, Split};
 
 /// Where the public API lives; a stub server replaces it in tests.
 pub const DEFAULT_BASE_URL: &str = "https://eodhd.com";
@@ -200,6 +201,10 @@ struct ListingRow {
     kind: String,
     #[serde(default)]
     currency: String,
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    exchange: String,
 }
 
 impl From<ListingRow> for Listing {
@@ -209,8 +214,95 @@ impl From<ListingRow> for Listing {
             name: row.name,
             kind: row.kind,
             currency: row.currency,
+            country: row.country,
+            venue: row.exchange,
         }
     }
+}
+
+/// A bar as the eod and eod-bulk-last-day endpoints write it. Prices come as numbers;
+/// a missing volume (some instruments report none) is zero. A row missing a price is
+/// dropped by the caller: nothing is invented for it.
+#[derive(Deserialize)]
+struct BarRow {
+    date: String,
+    open: Option<f64>,
+    high: Option<f64>,
+    low: Option<f64>,
+    close: Option<f64>,
+    adjusted_close: Option<f64>,
+    #[serde(default)]
+    volume: Option<f64>,
+}
+
+impl BarRow {
+    /// The bar, or `None` when a price is missing or the date is not a date.
+    fn bar(&self) -> Option<Bar> {
+        Some(Bar {
+            date: NaiveDate::parse_from_str(&self.date, "%Y-%m-%d").ok()?,
+            open: self.open?,
+            high: self.high?,
+            low: self.low?,
+            close: self.close?,
+            adjusted_close: self.adjusted_close?,
+            volume: self.volume.unwrap_or(0.0),
+        })
+    }
+}
+
+/// A bulk row: a bar with the instrument it belongs to.
+#[derive(Deserialize)]
+struct BulkRow {
+    code: String,
+    #[serde(default)]
+    exchange_short_name: String,
+    #[serde(flatten)]
+    bar: BarRow,
+}
+
+/// A split row from eod-bulk-last-day with `type=splits`.
+#[derive(Deserialize)]
+struct SplitRow {
+    code: String,
+    #[serde(default)]
+    exchange: String,
+    date: String,
+    split: String,
+}
+
+/// The bars of `rows` in the order given, rows with a missing price or an unreadable date
+/// left out.
+fn bars_of(rows: Vec<BarRow>) -> Vec<Bar> {
+    rows.iter().filter_map(BarRow::bar).collect()
+}
+
+fn bulk_bars_of(rows: Vec<BulkRow>) -> Vec<BulkBar> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let bar = row.bar.bar()?;
+            Some(BulkBar {
+                code: row.code,
+                exchange: row.exchange_short_name,
+                bar,
+            })
+        })
+        .collect()
+}
+
+fn splits_of(rows: Vec<SplitRow>) -> Result<Vec<Split>, ProviderError> {
+    rows.into_iter()
+        .map(|row| {
+            let date = NaiveDate::parse_from_str(&row.date, "%Y-%m-%d").map_err(|e| {
+                ProviderError::Malformed(format!("split date {:?} for {}: {e}", row.date, row.code))
+            })?;
+            Ok(Split {
+                code: row.code,
+                exchange: row.exchange,
+                date,
+                ratio: row.split,
+            })
+        })
+        .collect()
 }
 
 impl Provider for Eodhd {
@@ -231,6 +323,45 @@ impl Provider for Eodhd {
         let extra: &[(&str, &str)] = if delisted { &[("delisted", "1")] } else { &[] };
         let rows: Vec<ListingRow> = self.get_json(&path, &self.token, extra).await?;
         Ok(rows.into_iter().map(Listing::from).collect())
+    }
+
+    async fn bulk_eod(
+        &self,
+        exchange: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<BulkBar>, ProviderError> {
+        let path = format!("/api/eod-bulk-last-day/{exchange}");
+        let date = date.to_string();
+        let rows: Vec<BulkRow> = self
+            .get_json(&path, &self.token, &[("date", date.as_str())])
+            .await?;
+        Ok(bulk_bars_of(rows))
+    }
+
+    async fn eod_history(&self, symbol: &str, from: NaiveDate) -> Result<Vec<Bar>, ProviderError> {
+        let path = format!("/api/eod/{symbol}");
+        let from = from.to_string();
+        let rows: Vec<BarRow> = self
+            .get_json(
+                &path,
+                &self.token,
+                &[("from", from.as_str()), ("period", "d")],
+            )
+            .await?;
+        Ok(bars_of(rows))
+    }
+
+    async fn splits(&self, exchange: &str, date: NaiveDate) -> Result<Vec<Split>, ProviderError> {
+        let path = format!("/api/eod-bulk-last-day/{exchange}");
+        let date = date.to_string();
+        let rows: Vec<SplitRow> = self
+            .get_json(
+                &path,
+                &self.token,
+                &[("type", "splits"), ("date", date.as_str())],
+            )
+            .await?;
+        splits_of(rows)
     }
 }
 
@@ -346,6 +477,67 @@ mod tests {
             (listing.name.as_str(), listing.currency.as_str()),
             ("", "USD")
         );
+        assert_eq!((listing.country.as_str(), listing.venue.as_str()), ("", ""));
+        let row: ListingRow = serde_json::from_str(
+            r#"{"Code":"AAPL","Country":"USA","Exchange":"NASDAQ","Type":"Common Stock"}"#,
+        )
+        .unwrap();
+        let listing = Listing::from(row);
+        assert_eq!(
+            (listing.country.as_str(), listing.venue.as_str()),
+            ("USA", "NASDAQ")
+        );
         assert!(serde_json::from_str::<ListingRow>(r#"{"Name":"no code"}"#).is_err());
+    }
+
+    #[test]
+    fn bars_keep_their_order_drop_rows_missing_a_price_and_read_a_missing_volume_as_zero() {
+        let rows: Vec<BarRow> = serde_json::from_str(
+            r#"[{"date":"2026-09-10","open":1,"high":2,"low":0.5,"close":1.5,"adjusted_close":1.5,"volume":100},
+                {"date":"2026-09-11","open":1,"high":2,"low":0.5,"close":null,"adjusted_close":1.5,"volume":100},
+                {"date":"not a date","open":1,"high":2,"low":0.5,"close":1.5,"adjusted_close":1.5,"volume":100},
+                {"date":"2026-09-14","open":1,"high":2,"low":0.5,"close":1.5,"adjusted_close":1.4}]"#,
+        )
+        .unwrap();
+        let bars = bars_of(rows);
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].date, NaiveDate::from_ymd_opt(2026, 9, 10).unwrap());
+        assert_eq!(bars[0].volume, 100.0);
+        assert_eq!(bars[1].date, NaiveDate::from_ymd_opt(2026, 9, 14).unwrap());
+        assert_eq!((bars[1].adjusted_close, bars[1].volume), (1.4, 0.0));
+
+        let rows: Vec<BulkRow> = serde_json::from_str(
+            r#"[{"code":"SPY","exchange_short_name":"US","date":"2026-09-11","open":1,"high":2,"low":0.5,"close":1.5,"adjusted_close":1.5,"volume":7},
+                {"code":"BAD","exchange_short_name":"US","date":"2026-09-11","open":null,"high":2,"low":0.5,"close":1.5,"adjusted_close":1.5,"volume":7}]"#,
+        )
+        .unwrap();
+        let bulk = bulk_bars_of(rows);
+        assert_eq!(bulk.len(), 1);
+        assert_eq!(
+            (bulk[0].code.as_str(), bulk[0].exchange.as_str()),
+            ("SPY", "US")
+        );
+        assert_eq!(bulk[0].bar.volume, 7.0);
+    }
+
+    #[test]
+    fn splits_parse_their_date_and_a_bad_one_is_malformed() {
+        let rows: Vec<SplitRow> = serde_json::from_str(
+            r#"[{"code":"AAPL","exchange":"US","date":"2026-09-11","split":"4.000000/1.000000"}]"#,
+        )
+        .unwrap();
+        let splits = splits_of(rows).unwrap();
+        assert_eq!(splits[0].code, "AAPL");
+        assert_eq!(
+            splits[0].date,
+            NaiveDate::from_ymd_opt(2026, 9, 11).unwrap()
+        );
+        assert_eq!(splits[0].ratio, "4.000000/1.000000");
+        let rows: Vec<SplitRow> =
+            serde_json::from_str(r#"[{"code":"AAPL","date":"soon","split":"2/1"}]"#).unwrap();
+        assert!(matches!(
+            splits_of(rows),
+            Err(ProviderError::Malformed(m)) if m.contains("soon") && m.contains("AAPL")
+        ));
     }
 }

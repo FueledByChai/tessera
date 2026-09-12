@@ -1,0 +1,35 @@
+[
+  {
+    "code": "AAPL",
+    "exchange_short_name": "US",
+    "date": "2026-09-11",
+    "open": 230.1,
+    "high": 233.4,
+    "low": 229.05,
+    "close": 232.5,
+    "adjusted_close": 232.5,
+    "volume": 51234567
+  },
+  {
+    "code": "SPY",
+    "exchange_short_name": "US",
+    "date": "2026-09-11",
+    "open": 651.2,
+    "high": 654.9,
+    "low": 650.0,
+    "close": 653.75,
+    "adjusted_close": 653.75,
+    "volume": 62345678
+  },
+  {
+    "code": "BRK-B",
+    "exchange_short_name": "US",
+    "date": "2026-09-11",
+    "open": 470.5,
+    "high": 474.0,
+    "low": 469.1,
+    "close": 472.25,
+    "adjusted_close": 472.25,
+    "volume": 3456789
+  }
+]
