@@ -532,6 +532,36 @@ out. Serves BT-1204. Decisions: 0020.
 answers, and asserts `GET /api/sources` returns within 10 s with the answering source
 `connected` and the other `unreachable`, both with their last usage and `checked_at` intact.
 
+### DS-14 Catalog files are regenerated per exchange, delisted apart — Blocked by DS-08
+DS-08's EOD job regenerates `catalog.csv`, `stocks.txt`, and `etfs.txt` in the source's catalog
+folder root from the dataset's exchange, so a source with datasets on several exchanges makes
+each job overwrite the others' files, and the instrument index (`build_instrument_index` in
+`src/bin/tessera_ui.rs`) expects the non-US exchanges as sub-catalogs (`CC/catalog.csv`,
+`FOREX/catalog.csv`) and the delisted list under `delisted/`, the layout `docs/DATA_SOURCES.md`
+describes. The job writes the US exchange's files at the root and every other exchange's under
+`<EXCHANGE>/`, and writes `delisted/catalog.csv` and its symbol list from the cached delisted
+listing, all part-then-rename. Serves BT-1205. Decisions: 0012, 0022.
+**Done when:** `tests/provider_eod_job.rs` runs the job for a US dataset and a CC dataset on one
+source and asserts the root files hold only US rows, `CC/catalog.csv` holds the CC rows, and
+`delisted/catalog.csv` holds the delisted US rows with today's columns; a service test asserts
+the instrument index built from that folder lists a CC and a delisted symbol.
+
+### DS-15 The EOD nightly's call discipline before the cut-over — Blocked by DS-08
+Three things DS-08 left that would waste calls or misjudge a night once the job runs on a US
+dataset with delisted included: a symbol whose history comes back empty is skipped with its
+reason but retried on every run, one call each, so thousands of delisted names would burn the
+budget nightly; `Estimate::eod` (`src/provider/budget.rs`) counts no split refetches, so the
+mandatory estimate understates a night with splits; and the job's through-date is New York's
+today for every exchange. The job keeps a per-dataset skip list (`dataset_skips`: symbol, reason,
+first seen, retry after) and retries a skipped symbol only after a configurable interval
+(default 30 days); the estimate adds a split allowance (the dataset's average splits per session
+over its recorded jobs, at least one); the through-date is the exchange's own local date from
+the cached exchange row. Serves BT-1204, BT-1205. Decisions: 0022.
+**Done when:** `tests/provider_eod_job.rs` proves a no-history symbol costs one call on the first
+run and none on the second, and a call again after the interval; a budget unit test proves the
+split allowance is in the mandatory estimate; a job test on an exchange whose local date is ahead
+of New York plans the extra session.
+
 ## Housekeeping
 
 ### HK-01 Required symbols from the manifest
