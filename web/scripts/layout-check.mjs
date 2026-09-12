@@ -6,9 +6,15 @@
 // own wrapper). The catalog must also show its nine columns (UI-06), so a narrower table that
 // happens to fit cannot pass for it. On the strategy page it also fails when the Historical
 // runs table is not the first panel after the summary strip (UI-05), then opens the Configure
-// run dialog and fails when the dialog passes the viewport or the page behind it scrolls
-// horizontally, and counts the fields in the first row of the dialog's Data grid and fails
-// under six (UI-04: numeric fields take one auto-fit track, dates and selects two).
+// run dialog and fails when the dialog passes the viewport, when its rows scroll inside it
+// (UI-07: the whole form shows at 1280x800), or when the page behind it scrolls horizontally,
+// and counts the fields in the first row of the dialog's Data grid and fails under six (UI-04:
+// numeric fields take one auto-fit track, dates and selects two). A fifth page holds the
+// dialog to a strategy declaring eight parameters (UI-07): the fixture strategy from
+// web/fixtures/strategy-detail.json with four more parameters, long captions and hints among
+// them, added to the catalog by this script and measured with the Simple tier showing and
+// again with Advanced showing all eight; it needs the bundle served here, so a LAYOUT_URL run
+// lists it as skipped.
 //
 //   node web/scripts/layout-check.mjs                  this checkout's web/dist, API from the
 //                                                      console at LAYOUT_CONSOLE (127.0.0.1:8787)
@@ -16,14 +22,15 @@
 //   node web/scripts/layout-check.mjs --verbose        print every page's measurement
 //
 // The bundle under test is the one just built (`npm run build`), served by this script with
-// /api, /artifacts, and /reports proxied to the running console, so the check sees the current
-// stylesheet with real runs, strategies, and studies. Needs a Playwright-compatible Chromium:
+// /api, /artifacts, and /reports proxied to the running console (the catalog gaining the
+// eight-parameter fixture), so the check sees the current stylesheet with real runs,
+// strategies, and studies. Needs a Playwright-compatible Chromium:
 // `playwright` or `patchright` resolvable from web/, or the CodeGPT VS Code extension's bundled
 // copy. Without one, without a built bundle, or without a reachable console, the check reports
 // that it skipped and exits 0; the theme check's static rules still apply there. A page the
 // console cannot supply (no runs for the run overview, no strategies for the strategy page) is
 // listed as skipped and the remaining pages are measured (HK-08); the studies page always is.
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,9 +39,63 @@ import { LAUNCH, reachable, resolveChromium, serveDist } from "./headless.mjs";
 const consoleOrigin = process.env.LAYOUT_CONSOLE ?? "http://127.0.0.1:8787/";
 const servedUrl = process.env.LAYOUT_URL;
 const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
+const fixturePath = fileURLToPath(new URL("../fixtures/strategy-detail.json", import.meta.url));
 const verbose = process.argv.includes("--verbose");
 const WIDTHS = [1280, 1440];
 const HEIGHT = 800;
+
+/**
+ * The eight-parameter strategy (UI-07): the fixture strategy under its own id and name, its
+ * four manifest parameters all on the Simple tier plus four more, two of them Advanced, with
+ * a caption that wraps to three lines in a numeric track and hints that would wrap to four or
+ * five. Simple shows six numeric fields, Advanced all eight. Its default symbols are explicit,
+ * so the Data row carries the symbol picker as well: the tallest form a strategy can put in
+ * the dialog short of a ninth parameter.
+ */
+const EIGHT = (() => {
+  const detail = JSON.parse(readFileSync(fixturePath, "utf8"));
+  const id = "layout-eight-parameters";
+  const name = "Layout fixture · eight parameters";
+  const extra = [
+    { name: "hold_minutes", label: "Hold minutes", help: "Exit after this long in the trade whatever the price", tier: "simple", unit: "min", kind: "int", default: 30, min: 1, max: 390 },
+    { name: "gap_threshold", label: "Gap threshold", help: "Smallest open-to-prior-close gap that qualifies", tier: "simple", unit: "%", kind: "decimal", default: 1.5, min: 0.1, max: 20 },
+    { name: "volume_floor", label: "Dollar volume floor", help: "Skip symbols trading under this much a day", tier: "advanced", unit: "$", kind: "decimal", default: 1000000, min: 0, max: null },
+    { name: "exit_offset", label: "Exit offset", help: "Ticks above the signal price for the exit order", tier: "advanced", unit: "ticks", kind: "int", default: 2, min: 0, max: 50 },
+  ];
+  return {
+    id,
+    name,
+    detail: {
+      ...detail,
+      strategy: { ...detail.strategy, id, name, sdk_strategy_id: id },
+      presets: [],
+      runs: [],
+      sdk: {
+        ...detail.sdk,
+        id,
+        name,
+        params: [...detail.sdk.params.map((param) => ({ ...param, tier: "simple" })), ...extra.map((param) => ({ step: null, ...param }))],
+      },
+    },
+  };
+})();
+
+/** Answers the eight-parameter strategy's API from the fixture and adds it to the catalog. */
+async function fixtureApi(pathname) {
+  const json = (body) => ({ status: 200, type: "application/json", body: JSON.stringify(body) });
+  if (pathname === `/api/strategies/${EIGHT.id}`) return json(EIGHT.detail);
+  if (pathname === "/api/dashboard") {
+    try {
+      const response = await fetch(new URL(pathname, consoleOrigin), { signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return null;
+      const dashboard = await response.json();
+      return json({ ...dashboard, strategies: [...(dashboard.strategies ?? []), EIGHT.detail.strategy] });
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 /** Runs in the page: body overflow and elements past the viewport with no scrolling ancestor. */
 function measure() {
@@ -135,6 +196,7 @@ function measureDialog() {
     scrollWidth: document.documentElement.scrollWidth,
     scrollsInside: body.scrollHeight > body.clientHeight + 1,
     contentHeight: Math.round(r.height - body.clientHeight + body.scrollHeight),
+    params: [...dialog.querySelectorAll(".form-section")].filter((s) => /^Parameters\b/.test(s.querySelector("h3")?.textContent?.trim() ?? ""))[0]?.querySelectorAll(".field-grid > *").length ?? 0,
   };
 }
 
@@ -160,12 +222,66 @@ const NEEDS = {
   "run overview": (s) => (s.runs ? null : "the console has no runs"),
   "strategies catalog": (s) => (s.strategies ? null : "the console has no strategies"),
   "strategy page": (s) => (s.strategies ? null : "the console has no strategies"),
+  "eight-parameter strategy": () => (servedUrl ? "the fixture strategy needs the bundle served by this script, not LAYOUT_URL" : null),
   studies: () => null,
 };
 
 /** The columns the strategies catalog shows (UI-06): #, name, asset, runs, CAGR, Sharpe,
  *  max DD, last run, open. */
 const CATALOG_COLUMNS = 9;
+
+/** Opens the catalog and the strategy page behind the given catalog name. */
+async function openStrategy(page, name) {
+  await page.getByRole("button", { name: /Strategies$/ }).first().click();
+  await name.waitFor({ timeout: 15000 });
+  await name.click();
+  await page.getByRole("button", { name: /Open strategy/ }).first().click();
+  await page.locator(".run-strip").first().waitFor({ timeout: 15000 });
+}
+
+/**
+ * The Configure run dialog on an open strategy page: opened from the strip, inside the
+ * viewport, its rows not scrolling inside it, the page behind it not scrolling horizontally,
+ * its Data row holding six fields. With `tiers`, the Advanced tier is switched on after the
+ * Simple measurement and the dialog measured again (the eight-parameter strategy). Returns
+ * the failures; a dialog that cannot open is one failure.
+ */
+async function checkDialog(page, label, tiers) {
+  const failures = [];
+  try {
+    await page.locator(".run-strip-configure").first().click();
+    await page.locator("dialog.run-dialog[open]").waitFor({ timeout: 10000 });
+  } catch (error) {
+    return [`${label}: could not open the Configure run dialog (${String(error).split("\n")[0]})`];
+  }
+  for (const tier of tiers ? ["Simple", "Advanced"] : [""]) {
+    if (tier === "Advanced") await page.locator("dialog.run-dialog[open] .mode-switch button", { hasText: tier }).first().click();
+    await page.waitForTimeout(400);
+    const at = tier ? `${label} (${tier})` : label;
+    const dialog = await page.evaluate(measureDialog);
+    const behind = await page.evaluate(measure);
+    if (verbose || dialog.scrollsInside) {
+      console.log(`${at}: dialog ${dialog.left},${dialog.top} to ${dialog.right},${dialog.bottom} in ${dialog.innerWidth}x${dialog.innerHeight}${dialog.scrollsInside ? ` (its rows scroll inside: ${dialog.contentHeight}px of content)` : ""}`);
+    }
+    if (dialog.right > dialog.innerWidth + 1 || dialog.bottom > dialog.innerHeight + 1 || dialog.left < -1 || dialog.top < -1) {
+      failures.push(`${at}: the dialog passes the viewport (${dialog.left},${dialog.top} to ${dialog.right},${dialog.bottom} in ${dialog.innerWidth}x${dialog.innerHeight})`);
+    }
+    if (dialog.scrollsInside) {
+      failures.push(`${at}: the dialog's rows scroll inside it (${dialog.contentHeight}px of content in ${dialog.bottom - dialog.top}px, ${dialog.params} parameter fields)`);
+    }
+    if (behind.scrollWidth > behind.innerWidth) failures.push(`${at}: the page scrolls horizontally with the dialog open (${behind.scrollWidth} > ${behind.innerWidth})`);
+    for (const o of behind.offenders) failures.push(`${at}: with the dialog open, past the viewport: ${o}`);
+    const row = await page.evaluate(countFirstRow);
+    if (!row) failures.push(`${at}: no Data grid in the dialog to count (the strategy has no SDK form)`);
+    else {
+      if (verbose) console.log(`${at}: Data grid ${row.width}px, ${row.first} of ${row.total} fields in the first row`);
+      if (row.first < FIELDS_PER_ROW) {
+        failures.push(`${at}: the dialog's Data grid holds ${row.first} field(s) in its first row, under ${FIELDS_PER_ROW} (grid ${row.width}px, ${row.total} fields)`);
+      }
+    }
+  }
+  return failures;
+}
 
 /** The pages, reached by clicking, since the console has no routes. Each opens the page and
  *  returns any failures of its own beyond the layout measurement. */
@@ -188,12 +304,12 @@ const PAGES = {
     return [];
   },
   "strategy page": async (page) => {
-    await page.getByRole("button", { name: /Strategies$/ }).first().click();
-    const name = page.locator(".catalog-name").first();
-    await name.waitFor({ timeout: 15000 });
-    await name.click();
-    await page.getByRole("button", { name: /Open strategy/ }).first().click();
-    await page.locator(".run-strip").first().waitFor({ timeout: 15000 });
+    // The console's first strategy: the fixture this script adds sits wherever the catalog's
+    // name order puts it, so it is passed over here and opened by its own page below.
+    await openStrategy(page, page.locator(".catalog-name").filter({ hasNotText: EIGHT.name }).first());
+  },
+  "eight-parameter strategy": async (page) => {
+    await openStrategy(page, page.locator(".catalog-name").filter({ hasText: EIGHT.name }).first());
   },
   studies: async (page) => {
     await page.getByRole("button", { name: /Studies$/ }).first().click();
@@ -220,7 +336,7 @@ if (!servedUrl && !existsSync(join(distDir, "index.html"))) {
   console.log("layout-check: skipped (no web/dist; run npm run build first)");
   process.exit(0);
 }
-if (!servedUrl) served = await serveDist(distDir, consoleOrigin);
+if (!servedUrl) served = await serveDist(distDir, consoleOrigin, fixtureApi);
 const url = servedUrl ?? served.url;
 const supplied = await supply(servedUrl ?? consoleOrigin);
 const skipped = new Map();
@@ -267,35 +383,9 @@ try {
           const order = await page.evaluate(panelAfterStrip);
           if (!order) failures.push(`${label}: no summary strip on the page`);
           else if (!order.history) failures.push(`${label}: the panel after the summary strip is ${order.next}, not the Historical runs table`);
-          // The dialog: opened from the strip, inside the viewport, the page behind it not
-          // scrolling horizontally, its Data row holding six fields.
-          try {
-            await page.locator(".run-strip-configure").first().click();
-            await page.locator("dialog.run-dialog[open]").waitFor({ timeout: 10000 });
-          } catch (error) {
-            failures.push(`${label}: could not open the Configure run dialog (${String(error).split("\n")[0]})`);
-            continue;
-          }
-          await page.waitForTimeout(400);
-          const dialog = await page.evaluate(measureDialog);
-          const behind = await page.evaluate(measure);
-          if (verbose || dialog.scrollsInside) {
-            console.log(`${label}: dialog ${dialog.left},${dialog.top} to ${dialog.right},${dialog.bottom} in ${dialog.innerWidth}x${dialog.innerHeight}${dialog.scrollsInside ? ` (its rows scroll inside: ${dialog.contentHeight}px of content)` : ""}`);
-          }
-          if (dialog.right > dialog.innerWidth + 1 || dialog.bottom > dialog.innerHeight + 1 || dialog.left < -1 || dialog.top < -1) {
-            failures.push(`${label}: the dialog passes the viewport (${dialog.left},${dialog.top} to ${dialog.right},${dialog.bottom} in ${dialog.innerWidth}x${dialog.innerHeight})`);
-          }
-          if (behind.scrollWidth > behind.innerWidth) failures.push(`${label}: the page scrolls horizontally with the dialog open (${behind.scrollWidth} > ${behind.innerWidth})`);
-          for (const o of behind.offenders) failures.push(`${label}: with the dialog open, past the viewport: ${o}`);
-          const row = await page.evaluate(countFirstRow);
-          if (!row) failures.push(`${label}: no Data grid in the dialog to count (the first strategy in the catalog has no SDK form)`);
-          else {
-            if (verbose) console.log(`${label}: Data grid ${row.width}px, ${row.first} of ${row.total} fields in the first row`);
-            if (row.first < FIELDS_PER_ROW) {
-              failures.push(`${label}: the dialog's Data grid holds ${row.first} field(s) in its first row, under ${FIELDS_PER_ROW} (grid ${row.width}px, ${row.total} fields)`);
-            }
-          }
+          failures.push(...(await checkDialog(page, label, false)));
         }
+        if (name === "eight-parameter strategy") failures.push(...(await checkDialog(page, label, true)));
       }
       await context.close();
     }
@@ -312,5 +402,5 @@ if (failures.length) {
 }
 const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the eight-parameter dialog not scrolling inside"}, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );
