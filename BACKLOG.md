@@ -503,7 +503,7 @@ Remove `update_command`, `freshness_file`, and `provider` from `LocalConfig`
 `queue_eod_update`, `run_eod_update`, and `start_eod_update`, the `data_update` schedule kind
 and its seed, and the DATA LIBRARY panel; the status strip's latest EOD date comes from the
 calendar symbol's file. `docs/DATA_SOURCES.md` and `docs/LOCAL_UI.md` describe sources only.
-Serves BT-1207. Decisions: 0001, 0021.
+Serves BT-1207. Decisions: 0001, 0021. A `dataset_update` schedule whose dataset is deleted is removed with it (DS-10 leaves the row with a null dataset and runs that fail), and `DELETE /api/datasets/{id}` says how many schedules went with it.
 **Done when:** `grep` finds none of the removed keys under `src/`, `web/app/`, `docs/`, or
 `local.example.toml`; the config tests in `local_config.rs` pass without them;
 `data-page-check.mjs` no longer expects the panel. No new test: removal only.
@@ -1146,3 +1146,15 @@ the `--launchd` plist sets `AbandonProcessGroup` so a stopped loop never stops t
 against a fake service (a script that sleeps and serves nothing) inside `$(...)` and fails
 unless it returns within five seconds with the pid file written, and asserts the printed
 plist contains `AbandonProcessGroup`.
+
+### HK-48 Coverage runs from two worktrees do not clobber each other
+`scripts/coverage.sh` builds the instrumented crate into one shared
+`target-worktrees/llvm-cov-target`, so two lanes running the check at once corrupt each other's
+profiling data: DS-09's and DS-10's `scripts/coverage-ratchet.sh --set` each failed once with an
+empty JSON from `cargo llvm-cov`, whose stderr the script hides behind `2>/dev/null`, and passed
+on a rerun. The coverage build goes into a per-worktree subdirectory
+(`target-worktrees/llvm-cov-<worktree name>`, the dependency crates still shared through
+`CARGO_TARGET_DIR` for the ordinary build), and llvm-cov's stderr is kept in the check's log.
+**Done when:** `scripts/coverage.sh --self-test` (new, run by `scripts/check.sh`) starts two
+coverage runs from two scratch worktrees at once and both report a percentage; a run whose
+`cargo llvm-cov` fails prints its stderr instead of an empty result.
