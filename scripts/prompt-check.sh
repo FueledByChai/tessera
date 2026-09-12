@@ -28,6 +28,7 @@ grill-me.md	sprint
 grill-me.md	--stories
 review-prs.md	four questions
 review-prs.md	one status per head commit
+review-prs.md	--update-all
 grill-project.md	in a sentence
 grill-project.md	Who and where
 grill-project.md	The data

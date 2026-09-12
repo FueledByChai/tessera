@@ -797,3 +797,15 @@ tag, sync.
 **Done when:** the kit's `backlog-status.sh --self-test` archives a fixture release with
 `release-notes.sh --archive` and shows the story it served still done; `kit_ref` here moves
 to the tag.
+
+### HK-42 The review pass rebases the open pull requests a merge left behind
+Several agents now work tickets at once (claims keep them apart), but the ruleset wants a
+pull request up to date with `main` when its checks pass, so the first merge leaves every
+other open PR behind and auto-merge waits for a hand-run `scripts/open-ticket-pr.sh <id>
+--update`. Add `--update-all` to the kit's `open-ticket-pr.sh` (rebase every open PR into the
+default branch whose merge state is BEHIND, report the counts) and make `review-prs.md` run
+it first, reviewing a rebased PR when its new head is pending. Kit change, tag, sync.
+**Done when:** the kit's `open-ticket-pr.sh --self-test` proves `--update-all` rebases
+exactly the PRs behind the default branch (two of three in the fixture) and prints the
+summary; `prompt-check.sh` asserts "--update-all" in `review-prs.md`; `kit_ref` here moves to
+the tag and one real `--update-all` run here is recorded in the pull request.

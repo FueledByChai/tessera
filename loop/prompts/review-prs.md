@@ -9,6 +9,12 @@ Settings come from `.loop.toml`: `scripts/loop-config.sh backlog` names the tick
 commit has no such status: `<number> <sha> <branch> <title>`, one per line. If it lists
 nothing, report that and stop.
 
+Before reviewing, run `scripts/open-ticket-pr.sh --update-all`: it rebases every open pull
+request that is behind the default branch (with several agents working at once, each merge
+leaves the others behind, and the rules want green checks on the exact result). A rebased
+pull request gets a new head commit and new checks; review it when it turns up as pending
+again, and do not post a status on the head it just left.
+
 For each pending pull request, in order:
 
 1. **Read what it claims.** `gh pr view <number>` for the body, and `gh pr diff <number>`
