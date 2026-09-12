@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Laptop layout check (UI-03). Drives the console headlessly at 1280 and 1440 px wide, in
 // terminal and modern mode, through the run overview, the strategies catalog, a strategy page,
-// and the studies page, and fails when the page body scrolls horizontally or an element's right
+// the studies page, and the Data page's three views (DS-01: Inventory, Instrument search with
+// a query the console's catalog answers and its first row selected, Updates & schedules), and
+// fails when the page body scrolls horizontally or an element's right
 // edge passes the viewport without a scrolling ancestor (a wide table must scroll inside its
 // own wrapper). The catalog must also show its nine columns (UI-06), so a narrower table that
 // happens to fit cannot pass for it. On the strategy page it also fails when the Historical
@@ -149,9 +151,18 @@ async function supply(origin) {
       return 0;
     }
   };
+  let instrument = "";
+  try {
+    const response = await fetch(new URL("/api/instruments?limit=1", origin), { signal: AbortSignal.timeout(5000) });
+    if (response.ok) instrument = (await response.json())?.instruments?.[0]?.code ?? "";
+  } catch {
+    // no catalog: the instrument search page is measured with an empty result
+  }
   return {
     runs: await count("/api/runs", (body) => (Array.isArray(body) ? body : [])),
     strategies: await count("/api/dashboard", (body) => body?.strategies ?? []),
+    /** A code the console's catalog answers, so the instrument table is measured with rows. */
+    instrument,
   };
 }
 
@@ -161,7 +172,19 @@ const NEEDS = {
   "strategies catalog": (s) => (s.strategies ? null : "the console has no strategies"),
   "strategy page": (s) => (s.strategies ? null : "the console has no strategies"),
   studies: () => null,
+  "data inventory": () => null,
+  "data instrument search": () => null,
+  "data updates": () => null,
 };
+
+/** The Data page on one of its three views (DS-01); the tab is clicked in the DOM so the
+ *  driver does not scroll the page on the view's behalf. */
+async function openDataView(page, view, ready) {
+  await page.getByRole("button", { name: /Data$/ }).first().click();
+  await page.locator(".data-workspace").waitFor({ timeout: 15000 });
+  await page.evaluate((v) => document.querySelector(`nav.data-tabs button[data-view="${v}"]`).click(), view);
+  await page.locator(ready).first().waitFor({ timeout: 15000 });
+}
 
 /** The columns the strategies catalog shows (UI-06): #, name, asset, runs, CAGR, Sharpe,
  *  max DD, last run, open. */
@@ -203,6 +226,20 @@ const PAGES = {
       await study.click();
       await page.locator(".sweep-heatmap, .empty-state").first().waitFor({ timeout: 15000 });
     }
+  },
+  "data inventory": async (page) => {
+    await openDataView(page, "inventory", ".data-sources-panel tbody tr, .data-sources-panel .empty-state");
+  },
+  "data instrument search": async (page) => {
+    await openDataView(page, "instruments", ".instrument-search-view");
+    if (supplied.instrument) {
+      await page.locator(".instrument-search-view .instrument-search input").fill(supplied.instrument);
+      await page.locator(".instrument-table tbody tr, .instrument-search-view .empty-state, .instrument-empty").first().waitFor({ timeout: 15000 });
+      await page.evaluate(() => document.querySelector(".instrument-table tbody tr")?.click());
+    }
+  },
+  "data updates": async (page) => {
+    await openDataView(page, "updates", ".data-workspace .automation-panel");
   },
 };
 

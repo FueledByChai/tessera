@@ -15,7 +15,8 @@
     "theme-check": "node scripts/theme-check.mjs",
     "layout-check": "node scripts/layout-check.mjs",
     "chart-check": "node scripts/chart-check.mjs",
-    "run-form-check": "node scripts/run-form-check.mjs"
+    "run-form-check": "node scripts/run-form-check.mjs",
+    "data-page-check": "node scripts/data-page-check.mjs"
   },
   "dependencies": {
     "react": "19.2.6",

@@ -1,0 +1,82 @@
+{
+  "_comment": "Fixture for web/scripts/data-page-check.mjs (DS-01): the four Data page APIs in their current shapes. `sources` answers GET /api/data/sources, `status` GET /api/data/status, `automations` GET /api/automations, and `instruments` is the catalog GET /api/instruments searches (q, symbols, limit). Every path and symbol here is invented.",
+  "sources": {
+    "generated_at": "2026-09-11T20:14:03.201Z",
+    "config": {
+      "local_toml": "/srv/tessera/local.toml",
+      "local_toml_exists": true,
+      "bundled_example": false,
+      "env_overrides": [],
+      "memory_budget_gb": 24.0
+    },
+    "csv_library": {
+      "provider": "eodhd",
+      "calendar_symbol": "SPY.US",
+      "feeds": [
+        { "feed": "daily", "path": "/srv/market/eod", "exists": true, "files": 11055, "bytes": 5832114688, "first_date": "1995-01-03", "last_date": "2026-09-11", "note": null },
+        { "feed": "5m", "path": "/srv/market/5m", "exists": true, "files": 3118, "bytes": 41889234944, "first_date": "2020-10-12", "last_date": "2026-09-10", "note": "intraday files carry UTC epoch seconds" },
+        { "feed": "1m", "path": "/srv/market/1m", "exists": true, "files": 412, "bytes": 90113218560, "first_date": "2024-01-02", "last_date": "2026-09-10", "note": null }
+      ],
+      "catalog": {
+        "path": "/srv/market/catalog",
+        "exists": true,
+        "catalog_rows": 50877,
+        "stocks": 6212,
+        "etfs": 3390,
+        "extra_lists": ["watchlist.txt"]
+      },
+      "freshness_file": "/srv/market/state.json",
+      "freshness": { "updated_at_utc": "2026-09-11T02:15:18Z", "latest_market_date": "2026-09-11" },
+      "update_command": "python3 /srv/tools/refresh_eod.py"
+    },
+    "lake": {
+      "path": "/srv/lake",
+      "exists": true,
+      "feeds": [
+        { "feed": "trades", "path": "/srv/lake/trades", "exists": true, "files": 96, "bytes": 2147483648, "first_date": "2026-07-01", "last_date": "2026-09-10", "note": null },
+        { "feed": "book_snapshots", "path": "/srv/lake/book_snapshots", "exists": true, "files": 96, "bytes": 4294967296, "first_date": "2026-07-01", "last_date": "2026-09-10", "note": null },
+        { "feed": "book_events", "path": "/srv/lake/book_events", "exists": false, "files": 0, "bytes": 0, "first_date": null, "last_date": null, "note": "not recorded" }
+      ],
+      "instruments": [
+        { "exchange": "BINANCE_FUTURES", "symbol": "SOLUSDT", "first_date": "2026-07-01", "last_date": "2026-09-10", "days": 72, "has_trades": true, "has_book": true }
+      ],
+      "total_bytes": 6442450944
+    }
+  },
+  "status": {
+    "latest_market_date": "2026-09-11",
+    "latest_spy_date": "2026-09-11",
+    "symbols_on_latest_date": 11055,
+    "universe_symbols": 50877,
+    "updated_at_utc": "2026-09-11T02:15:18.853812+00:00",
+    "update_job": {
+      "id": "data-20260911T021514.220112Z",
+      "status": "complete",
+      "created_at": "2026-09-11T02:15:14.220112+00:00",
+      "started_at": "2026-09-11T02:15:14.222768+00:00",
+      "finished_at": "2026-09-11T02:15:18.859732+00:00",
+      "log_path": "data/ui/logs/data-20260911T021514.220112Z.log",
+      "error": null
+    }
+  },
+  "automations": [
+    { "id": "weekday-eod-refresh", "name": "Weekday US EOD refresh", "kind": "data_update", "enabled": true, "local_time": "19:15", "weekdays": "mon,tue,wed,thu,fri", "last_run_date": "2026-09-10", "last_status": "queued data-20260911T021514.220112Z", "created_at": "2026-08-30T17:08:28.133403+00:00" },
+    { "id": "weekend-catalog-rescan", "name": "Weekend catalog rescan", "kind": "data_update", "enabled": false, "local_time": "08:00", "weekdays": "sat", "last_run_date": null, "last_status": null, "created_at": "2026-08-30T17:08:28.133403+00:00" }
+  ],
+  "instruments": [
+    { "symbol": "IWM.US", "code": "IWM", "suffix": "US", "name": "iShares Russell 2000 ETF", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": true, "tick": false, "coverage": { "daily": { "first": "2000-05-26", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" }, "1m": { "first": "2024-01-02", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "IWN.US", "code": "IWN", "suffix": "US", "name": "iShares Russell 2000 Value ETF", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2000-07-28", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "IWO.US", "code": "IWO", "suffix": "US", "name": "iShares Russell 2000 Growth ETF", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2000-07-28", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "IWF.US", "code": "IWF", "suffix": "US", "name": "iShares Russell 1000 Growth ETF", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": false, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2000-05-26", "last": "2026-09-11" } }, "missing_resolutions": [] },
+    { "symbol": "IWD.US", "code": "IWD", "suffix": "US", "name": "iShares Russell 1000 Value ETF", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": false, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2000-05-26", "last": "2026-09-11" } }, "missing_resolutions": [] },
+    { "symbol": "IWC.US", "code": "IWC", "suffix": "US", "name": "iShares Micro-Cap ETF", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": false, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2005-08-17", "last": "2026-09-11" } }, "missing_resolutions": [] },
+    { "symbol": "MDY.US", "code": "MDY", "suffix": "US", "name": "SPDR S&P MidCap 400 ETF Trust", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": true, "tick": false, "coverage": { "daily": { "first": "1995-05-04", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" }, "1m": { "first": "2024-01-02", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "SPY.US", "code": "SPY", "suffix": "US", "name": "SPDR S&P 500 ETF Trust", "exchange": "NYSE ARCA", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": true, "tick": false, "coverage": { "daily": { "first": "1995-01-03", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" }, "1m": { "first": "2024-01-02", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "QQQ.US", "code": "QQQ", "suffix": "US", "name": "Invesco QQQ Trust", "exchange": "NASDAQ", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "1999-03-10", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "TLT.US", "code": "TLT", "suffix": "US", "name": "iShares 20+ Year Treasury Bond ETF", "exchange": "NASDAQ", "asset_class": "ETF", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2002-07-30", "last": "2026-09-11" }, "5m": { "first": "2020-10-12", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "ACME.US", "code": "ACME", "suffix": "US", "name": "Acme Industries Inc", "exchange": "NYSE", "asset_class": "Common Stock", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2018-01-02", "last": "2026-09-11" }, "5m": { "first": "2024-01-02", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "DEMO.US", "code": "DEMO", "suffix": "US", "name": "Demo Corporation", "exchange": "NYSE", "asset_class": "Common Stock", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2018-01-02", "last": "2026-09-11" }, "5m": { "first": "2024-01-02", "last": "2026-09-10" } }, "missing_resolutions": [] },
+    { "symbol": "ZENITH.US", "code": "ZENITH", "suffix": "US", "name": "Zenith Holdings Corp", "exchange": "NASDAQ", "asset_class": "Common Stock", "currency": "USD", "status": "delisted", "daily": true, "five_minute": false, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2018-01-02", "last": "2024-06-28" } }, "missing_resolutions": [] },
+    { "symbol": "BINANCE_FUTURES:SOLUSDT", "code": "SOLUSDT", "suffix": "BINANCE_FUTURES", "name": "SOL/USDT perpetual", "exchange": "BINANCE_FUTURES", "asset_class": "Crypto", "currency": "USDT", "status": "active", "daily": false, "five_minute": false, "one_minute": false, "tick": true, "coverage": { "tick": { "first": "2026-07-01", "last": "2026-09-10" } }, "missing_resolutions": [] }
+  ]
+}

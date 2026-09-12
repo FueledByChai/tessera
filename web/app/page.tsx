@@ -423,6 +423,25 @@ type DataStatus = {
   updated_at_utc: string;
   update_job?: DataUpdate;
 };
+/** The Data workspace's three views (decision 0014), remembered in browser storage. */
+type DataView = "inventory" | "instruments" | "updates";
+const DATA_VIEWS: [DataView, string][] = [
+  ["inventory", "Inventory"],
+  ["instruments", "Instrument search"],
+  ["updates", "Updates & schedules"],
+];
+const DATA_VIEW_KEY = "bt-data-view";
+/** Instrument search lives in app state so the query and selection survive leaving the workspace (BT-608). */
+type InstrumentSearchState = {
+  query: string;
+  /** The query the hits answer; a query that differs is searched again. */
+  answered: string;
+  hits: InstrumentHit[];
+  total: number;
+  selected: string | null;
+  error: string;
+};
+const EMPTY_INSTRUMENT_SEARCH: InstrumentSearchState = { query: "", answered: "", hits: [], total: 0, selected: null, error: "" };
 type SweepAxis = { parameter: string; values: number[] };
 type SweepRecord = {
   id: string;
@@ -2612,7 +2631,7 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
                 <thead><tr><th>Instrument</th><th>Exchange</th><th>First</th><th>Last</th><th>Days</th><th>Feeds</th></tr></thead>
                 <tbody>{lake.instruments.map((i) => (
                   <tr key={`${i.exchange}:${i.symbol}`}>
-                    <td>{i.exchange}:{i.symbol}</td>
+                    <td className="source-instrument">{i.exchange}:{i.symbol}</td>
                     <td>{i.exchange}</td>
                     <td>{i.first_date}</td>
                     <td>{i.last_date}</td>
@@ -2657,6 +2676,323 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
         </section>
       )}
     </>
+  );
+}
+
+/** A resolution flag cell: a tick with the coverage range on hover when the file was read. */
+function ResolutionCell({ present, range }: { present: boolean; range?: { first: string; last: string } }) {
+  if (!present) return <td className="instrument-flag missing">—</td>;
+  return (
+    <td className="instrument-flag" title={range ? `${range.first} → ${range.last}` : undefined}>
+      ✓
+    </td>
+  );
+}
+
+/** One instrument, every dataset and resolution it has (decision 0014). The query, the hits,
+ *  and the selection are the caller's state, so they are still here after a trip to another
+ *  workspace; the search runs only when the query is not the one the hits answer. */
+function InstrumentSearchView({
+  state,
+  onChange,
+}: {
+  state: InstrumentSearchState;
+  onChange: (update: (current: InstrumentSearchState) => InstrumentSearchState) => void;
+}) {
+  const needle = state.query.trim();
+  const answered = state.answered;
+  const [searching, setSearching] = useState(false);
+  useEffect(() => {
+    if (!needle || needle === answered) return;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setSearching(true);
+      try {
+        const params = new URLSearchParams({ q: needle, limit: "50" });
+        const response = await fetch(`${API}/instruments?${params}`, { cache: "no-store" });
+        const body = (await response.json()) as { error?: string; instruments?: InstrumentHit[]; total_matches?: number };
+        if (!response.ok) throw new Error(body.error ?? "Instrument search failed");
+        if (cancelled) return;
+        const hits = body.instruments ?? [];
+        onChange((current) => ({
+          ...current,
+          answered: needle,
+          hits,
+          total: body.total_matches ?? hits.length,
+          selected: current.selected && hits.some((hit) => hit.symbol === current.selected) ? current.selected : null,
+          error: "",
+        }));
+      } catch (caught) {
+        if (!cancelled) {
+          onChange((current) => ({ ...current, answered: needle, error: caught instanceof Error ? caught.message : "Instrument search failed" }));
+        }
+      } finally {
+        if (!cancelled) setSearching(false);
+      }
+    }, 200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [needle, answered, onChange]);
+  const selected = state.hits.find((hit) => hit.symbol === state.selected) ?? null;
+  const ranges: [string, string, boolean][] = selected
+    ? [
+        ["EOD", "daily", selected.daily],
+        ["5m", "5m", selected.five_minute],
+        ["1m", "1m", selected.one_minute],
+        ["tick", "tick", Boolean(selected.tick)],
+      ]
+    : [];
+  return (
+    <section className="panel instrument-search-view">
+      <div className="terminal-panel-title">
+        <span>FND</span> INSTRUMENT SEARCH
+        <small>
+          {needle
+            ? searching
+              ? "searching…"
+              : `${state.total.toLocaleString()} match${state.total === 1 ? "" : "es"}${state.total > state.hits.length ? `, first ${state.hits.length} listed` : ""}`
+            : "symbol or name, every dataset and resolution it has"}
+        </small>
+      </div>
+      <div className="instrument-search-bar">
+        <label className="instrument-search">
+          <span>⌕</span>
+          <input
+            type="search"
+            value={state.query}
+            placeholder="IWM, SPY, or a name"
+            aria-label="Instrument search"
+            autoComplete="off"
+            spellCheck={false}
+            onChange={(event) => {
+              const query = event.target.value;
+              onChange((current) => ({ ...current, query }));
+            }}
+          />
+        </label>
+      </div>
+      {state.error && <p className="instrument-empty error">{state.error}</p>}
+      {selected && (
+        <div className="instrument-detail">
+          <strong>{selected.symbol}</strong>
+          <span>{selected.name || "—"} · {selected.exchange} · {selected.asset_class} · {selected.currency || "—"} · {selected.status}</span>
+          <span className="instrument-detail-ranges">
+            {ranges.map(([label, key, present]) => {
+              const range = selected.coverage[key];
+              return (
+                <em key={key} className={present ? "" : "missing"}>
+                  {label} {present ? (range ? `${range.first} → ${range.last}` : "present") : "none"}
+                </em>
+              );
+            })}
+          </span>
+        </div>
+      )}
+      {needle && !state.error && answered === needle && state.hits.length === 0 ? (
+        <div className="empty-state">No instrument in the catalog matches “{needle}”.</div>
+      ) : state.hits.length ? (
+        <div className="table-wrap">
+          <table className="instrument-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Name</th><th>Venue</th><th>Class</th><th>Ccy</th><th>Status</th><th>EOD</th><th>5m</th><th>1m</th><th>Tick</th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.hits.map((hit) => (
+                <tr
+                  key={hit.symbol}
+                  data-symbol={hit.symbol}
+                  className={hit.symbol === state.selected ? "selected" : ""}
+                  onClick={() => onChange((current) => ({ ...current, selected: current.selected === hit.symbol ? null : hit.symbol }))}
+                >
+                  <td><strong>{hit.symbol}</strong></td>
+                  <td className="instrument-name" title={hit.name}>{hit.name || "—"}</td>
+                  <td>{hit.exchange}</td>
+                  <td>{hit.asset_class}</td>
+                  <td>{hit.currency || "—"}</td>
+                  <td className={hit.status === "active" ? "" : "instrument-inactive"}>{hit.status}</td>
+                  <ResolutionCell present={hit.daily} range={hit.coverage.daily} />
+                  <ResolutionCell present={hit.five_minute} range={hit.coverage["5m"]} />
+                  <ResolutionCell present={hit.one_minute} range={hit.coverage["1m"]} />
+                  <ResolutionCell present={Boolean(hit.tick)} range={hit.coverage.tick} />
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        !needle && <div className="empty-state">Type a symbol or a name. The catalog indexes every configured source against the files on disk.</div>
+      )}
+    </section>
+  );
+}
+
+/** Update actions with their source, scope, and current state (BT-608): the sources rescan
+ *  and the library's update command, each with its last run. */
+function DataUpdatesPanel({
+  sources,
+  status,
+  busy,
+  onRescan,
+  onUpdate,
+}: {
+  sources: DataSources | null;
+  status: DataStatus | null;
+  busy: boolean;
+  onRescan: () => void;
+  onUpdate: () => void;
+}) {
+  const job = status?.update_job;
+  const command = sources?.csv_library.update_command ?? null;
+  const when = (iso?: string | null) => (iso ? iso.slice(0, 19).replace("T", " ") : "—");
+  return (
+    <section className="panel data-updates-panel">
+      <div className="terminal-panel-title"><span>UPD</span> UPDATES</div>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Update</th><th>Source</th><th>Scope</th><th>State</th><th>Last</th><th></th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Sources rescan</strong></td>
+              <td>every configured source</td>
+              <td className="source-note">file counts, sizes, first and last dates</td>
+              <td>{sources ? "scanned" : "scanning…"}</td>
+              <td>{when(sources?.generated_at)}</td>
+              <td className="feature-actions"><button type="button" className="text-action" disabled={busy || !sources} onClick={onRescan}>Rescan</button></td>
+            </tr>
+            <tr>
+              <td><strong>Library update</strong></td>
+              <td>CSV bar library{sources ? ` · ${sources.csv_library.provider}` : ""}</td>
+              <td className="source-note">{command ? <code>{command}</code> : "no update_command in local.toml"}</td>
+              <td className={job?.error ? "negative-text" : ""}>{job ? job.status : "never run"}{job?.error ? ` · ${job.error}` : ""}</td>
+              <td>{when(job?.finished_at ?? job?.started_at ?? job?.created_at)}</td>
+              <td className="feature-actions">
+                <button type="button" className="text-action" disabled={busy || !command || job?.status === "running" || job?.status === "queued"} onClick={onUpdate}>Run update command</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+/** The Data workspace: a tab strip over three views (decisions 0010, 0014), each opening at the top. */
+function DataWorkspace({
+  view,
+  onView,
+  sources,
+  status,
+  busy,
+  onRescan,
+  onUpdate,
+  runs,
+  coverageDetail,
+  onOpenCoverage,
+  onSelectCoverageRun,
+  search,
+  onSearch,
+  schedules,
+  onToggleSchedule,
+  onRunSchedule,
+  onCreateSchedule,
+}: {
+  view: DataView;
+  onView: (view: DataView) => void;
+  sources: DataSources | null;
+  status: DataStatus | null;
+  busy: boolean;
+  onRescan: () => void;
+  onUpdate: () => void;
+  runs: Run[];
+  coverageDetail: RunDetail | null;
+  onOpenCoverage: () => void;
+  onSelectCoverageRun: (id: string) => void;
+  search: InstrumentSearchState;
+  onSearch: (update: (current: InstrumentSearchState) => InstrumentSearchState) => void;
+  schedules: AutomationSchedule[];
+  onToggleSchedule: (id: string) => void;
+  onRunSchedule: (id: string) => void;
+  onCreateSchedule: (request: Record<string, unknown>) => void;
+}) {
+  // Each view opens at the top, and so does the workspace.
+  useEffect(() => {
+    window.scrollTo({ top: 0 });
+  }, [view]);
+  return (
+    <div className="data-workspace">
+      <nav className="report-tabs data-tabs" aria-label="Data views">
+        <span className="data-tabs-label">DATA</span>
+        {DATA_VIEWS.map(([id, label]) => (
+          <button key={id} type="button" data-view={id} className={view === id ? "active" : ""} onClick={() => onView(id)}>
+            {label}
+          </button>
+        ))}
+      </nav>
+      {view === "inventory" && (
+        <>
+          <DataSourcesPanel sources={sources} busy={busy} onRefresh={onRescan} />
+          <section className="panel data-library-panel">
+            <div className="terminal-panel-title"><span>LIB</span> DATA LIBRARY</div>
+            <div className="metrics data-library-metrics">
+              <Metric
+                label="Latest market date"
+                value={status?.latest_market_date ?? "—"}
+                note={`calendar ${status?.latest_spy_date ?? "—"}`}
+              />
+              <Metric
+                label="Daily files"
+                value={String(status?.symbols_on_latest_date ?? "—")}
+                note={`${status?.universe_symbols ?? "—"} in universe`}
+              />
+              <Metric
+                label="Updated"
+                value={status?.updated_at_utc ?? "unknown"}
+                note="from the freshness file when configured"
+              />
+              <Metric
+                label="Last update job"
+                value={status?.update_job?.status ?? "none"}
+                note={status?.update_job?.error ?? status?.update_job?.id ?? "local.toml update_command"}
+              />
+            </div>
+          </section>
+          <details
+            className="panel coverage-fold"
+            onToggle={(event) => {
+              if (event.currentTarget.open) onOpenCoverage();
+            }}
+          >
+            <summary className="rules-fold-summary">
+              <div>
+                <p className="eyebrow">Signal-session audit of one completed run</p>
+                <h2>Run coverage</h2>
+              </div>
+              <span className="history-toggle">Show / hide</span>
+            </summary>
+            <div className="coverage-fold-body">
+              <DataCoverage runs={runs} detail={coverageDetail} onSelect={onSelectCoverageRun} />
+            </div>
+          </details>
+        </>
+      )}
+      {view === "instruments" && <InstrumentSearchView state={search} onChange={onSearch} />}
+      {view === "updates" && (
+        <>
+          <DataUpdatesPanel sources={sources} status={status} busy={busy} onRescan={onRescan} onUpdate={onUpdate} />
+          <AutomationsWorkspace
+            schedules={schedules}
+            busy={busy}
+            onToggle={onToggleSchedule}
+            onRun={onRunSchedule}
+            onCreate={onCreateSchedule}
+          />
+        </>
+      )}
+    </div>
   );
 }
 
@@ -5752,6 +6088,26 @@ export default function Home() {
   const [coverageDetail, setCoverageDetail] = useState<RunDetail | null>(null);
   const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const [dataSources, setDataSources] = useState<DataSources | null>(null);
+  // The Data view last chosen, remembered in browser storage (DS-01).
+  const [dataView, setDataView] = useState<DataView>(() => {
+    try {
+      const stored = window.localStorage.getItem(DATA_VIEW_KEY);
+      if (DATA_VIEWS.some(([id]) => id === stored)) return stored as DataView;
+    } catch {
+      // storage unavailable; open on Inventory
+    }
+    return "inventory";
+  });
+  const chooseDataView = useCallback((next: DataView) => {
+    setDataView(next);
+    try {
+      window.localStorage.setItem(DATA_VIEW_KEY, next);
+    } catch {
+      // ignore storage failures
+    }
+  }, []);
+  // Instrument search: query, hits, and selection outlive the Data workspace (BT-608).
+  const [instrumentSearch, setInstrumentSearch] = useState<InstrumentSearchState>(EMPTY_INSTRUMENT_SEARCH);
   const loadDataSources = useCallback(async (refresh = false) => {
     const response = await fetch(`${API}/data/sources${refresh ? "?refresh=1" : ""}`, { cache: "no-store" });
     if (response.ok) setDataSources(await response.json());
@@ -5977,25 +6333,24 @@ export default function Home() {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${API}/runs`, { cache: "no-store" });
-      const body: Run[] = await response.json();
-      setRuns(body);
-      const preferred =
-        body.find((run) => run.id === "run-20260830T011827.314481Z") ??
-        body.find((run) => !run.legacy && run.status === "Complete");
-      setView("data");
-      if (preferred) {
-        const detailResponse = await fetch(
-          `${API}/runs/${encodeURIComponent(preferred.id)}`,
-          { cache: "no-store" },
-        );
-        const detailBody = await detailResponse.json();
-        if (detailResponse.ok) setCoverageDetail(detailBody);
-      }
+      // The runs list feeds the coverage fold's selector; a run's coverage itself loads when
+      // the fold opens (DS-01), and an offline console still opens the page.
+      const response = await fetch(`${API}/runs`, { cache: "no-store" }).catch(() => null);
+      const body = response?.ok ? ((await response.json()) as Run[]) : null;
+      if (Array.isArray(body)) setRuns(body);
     } finally {
+      setView("data");
       setBusy(false);
     }
   }, []);
+  /** The coverage fold opened with nothing loaded: audit the newest completed structured run. */
+  const openCoverage = useCallback(() => {
+    if (coverageDetail) return;
+    const preferred =
+      runs.find((run) => run.id === "run-20260830T011827.314481Z") ??
+      runs.find((run) => !run.legacy && run.status === "Complete");
+    if (preferred) void loadCoverageRun(preferred.id);
+  }, [coverageDetail, runs, loadCoverageRun]);
   const refreshDataStatus = useCallback(async () => {
     const statusResponse = await fetch(`${API}/data/status`, { cache: "no-store" });
     if (statusResponse.ok) setDataStatus(await statusResponse.json());
@@ -6931,56 +7286,25 @@ export default function Home() {
 
 
           {view === "data" && (
-            <>
-              <DataSourcesPanel sources={dataSources} busy={busy} onRefresh={() => void loadDataSources(true)} />
-              <section className="panel data-library-panel">
-                <div className="terminal-panel-title">
-                  <span>LIB</span> DATA LIBRARY
-                  <button
-                    type="button"
-                    className="text-action source-filter"
-                    disabled={busy || dataStatus?.update_job?.status === "running"}
-                    onClick={() => void startDataUpdate()}
-                  >
-                    Run update command
-                  </button>
-                </div>
-                <div className="metrics data-library-metrics">
-                  <Metric
-                    label="Latest market date"
-                    value={dataStatus?.latest_market_date ?? "—"}
-                    note={`calendar ${dataStatus?.latest_spy_date ?? "—"}`}
-                  />
-                  <Metric
-                    label="Daily files"
-                    value={String(dataStatus?.symbols_on_latest_date ?? "—")}
-                    note={`${dataStatus?.universe_symbols ?? "—"} in universe`}
-                  />
-                  <Metric
-                    label="Updated"
-                    value={dataStatus?.updated_at_utc ?? "unknown"}
-                    note="from the freshness file when configured"
-                  />
-                  <Metric
-                    label="Last update job"
-                    value={dataStatus?.update_job?.status ?? "none"}
-                    note={dataStatus?.update_job?.error ?? dataStatus?.update_job?.id ?? "local.toml update_command"}
-                  />
-                </div>
-              </section>
-              <DataCoverage
-                runs={runs}
-                detail={coverageDetail}
-                onSelect={(id) => void loadCoverageRun(id)}
-              />
-              <AutomationsWorkspace
-                schedules={automations}
-                busy={busy}
-                onToggle={(id) => void automationAction(id, "toggle")}
-                onRun={(id) => void automationAction(id, "run")}
-                onCreate={(request) => void createAutomation(request)}
-              />
-            </>
+            <DataWorkspace
+              view={dataView}
+              onView={chooseDataView}
+              sources={dataSources}
+              status={dataStatus}
+              busy={busy}
+              onRescan={() => void loadDataSources(true)}
+              onUpdate={() => void startDataUpdate()}
+              runs={runs}
+              coverageDetail={coverageDetail}
+              onOpenCoverage={openCoverage}
+              onSelectCoverageRun={(id) => void loadCoverageRun(id)}
+              search={instrumentSearch}
+              onSearch={setInstrumentSearch}
+              schedules={automations}
+              onToggleSchedule={(id) => void automationAction(id, "toggle")}
+              onRunSchedule={(id) => void automationAction(id, "run")}
+              onCreateSchedule={(request) => void createAutomation(request)}
+            />
           )}
 
           {view === "costs" && (

@@ -4222,6 +4222,56 @@ nav {
 .source-template { background: #050505; border: 1px solid var(--line, #414141); padding: 12px; font-size: 12px; line-height: 1.45; overflow-x: auto; white-space: pre; }
 @media (max-width: 1100px) { .source-config-grid { grid-template-columns: minmax(0, 1fr); } }
 
+/* Data workspace: a tab strip over Inventory, Instrument search, and Updates & schedules
+   (DS-01, decisions 0010 and 0014). Each view opens at the top. */
+.data-workspace > * + * { margin-top: 16px; }
+.data-tabs { align-items: center; }
+.data-tabs-label { color: var(--accent); font: 800 12px var(--font-geist-mono); letter-spacing: 0.12em; padding: 10px 14px 10px 0; }
+.instrument-search-view { display: flex; flex-direction: column; gap: 12px; padding-bottom: 12px; }
+.instrument-search-bar { padding: 0 12px; max-width: 560px; }
+.instrument-detail { margin: 0 12px; padding: 10px 12px; border: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: baseline; font-size: 13px; }
+.instrument-detail strong { color: var(--accent); font-size: 15px; }
+.instrument-detail-ranges { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.instrument-detail-ranges em { font-style: normal; color: var(--ink); font-size: 12px; letter-spacing: 0.04em; }
+.instrument-detail-ranges em.missing { color: var(--muted); }
+.instrument-search-view .empty-state, .instrument-search-view .instrument-empty { margin: 0 12px; }
+.instrument-table tbody tr { cursor: pointer; }
+.instrument-table tbody tr:hover td { background: rgba(255, 255, 255, 0.03); }
+.instrument-table tr.selected td { background: var(--accent-soft); }
+.instrument-table tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.instrument-table td.instrument-name { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.instrument-table td.instrument-flag { white-space: nowrap; text-align: center; }
+.instrument-table th:nth-child(n + 7) { text-align: center; }
+.instrument-table td.instrument-flag.missing, .instrument-table td.instrument-inactive { color: var(--muted); }
+.app-shell[data-theme="terminal"] .instrument-table tr.selected td,
+.app-shell[data-theme="terminal"] .instrument-table tr.selected:hover td { background: #2a2a70; }
+.coverage-fold { margin-bottom: 16px; }
+.coverage-fold[open] .history-toggle::after { content: " ↑"; }
+.coverage-fold[open] .rules-fold-summary { border-bottom: 1px solid var(--line-soft); }
+.coverage-fold-body { padding: 18px; }
+.coverage-fold-body .section-intro { margin-top: 0; }
+.data-updates-panel { display: flex; flex-direction: column; gap: 12px; }
+.data-updates-panel code { background: #1a1a1a; padding: 1px 5px; word-break: break-all; }
+.data-updates-panel td.feature-actions { text-align: right; white-space: nowrap; }
+/* Paths, notes, commands, and errors wrap in their cells, so these tables fit a 13-inch
+   laptop instead of scrolling behind macOS's hidden scrollbar (the layout check measures the
+   three views). */
+.data-sources-panel th, .data-sources-panel td, .data-updates-panel th, .data-updates-panel td,
+.instrument-table th, .instrument-table td { text-align: left; }
+.data-sources-panel td.source-path, .data-sources-panel td.source-note, .data-sources-panel td.source-instrument,
+.data-updates-panel td { white-space: normal; }
+.data-sources-panel td.source-path, .data-sources-panel td.source-instrument, .data-updates-panel code { overflow-wrap: anywhere; }
+.data-sources-panel td.source-path { min-width: 200px; }
+.data-updates-panel td:first-child { white-space: nowrap; }
+@media (max-width: 1500px) {
+  .app-shell .instrument-table, .app-shell .data-sources-panel table, .app-shell .data-updates-panel table { font-size: 15px; line-height: 1.25; }
+  .app-shell .instrument-table th, .app-shell .data-sources-panel th, .app-shell .data-updates-panel th { font-size: 13px; letter-spacing: 0.04em; }
+  .app-shell .instrument-table th, .app-shell .instrument-table td,
+  .app-shell .data-sources-panel th, .app-shell .data-sources-panel td,
+  .app-shell .data-updates-panel th, .app-shell .data-updates-panel td { padding: 5px 7px; }
+  .app-shell .instrument-table td.instrument-name { max-width: 240px; }
+}
+
 /* Archived (pre-SDK) catalog rows */
 .catalog-toggle { display: inline-flex; align-items: center; gap: 6px; }
 .catalog-toggle input { accent-color: var(--accent, #f89828); }
