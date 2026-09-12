@@ -3,8 +3,8 @@
 //! A provider is a Rust module implementing [`Provider`]: verify a token and report the
 //! account's usage and limits, list the exchanges it covers, list an exchange's
 //! instruments, and fetch what the download jobs need: an exchange's bulk end-of-day bars
-//! for one session, one symbol's daily history, and an exchange's splits for one session
-//! (the intraday windows come with the intraday job). A second provider is another module
+//! for one session, one symbol's daily history, an exchange's splits for one session, and
+//! one symbol's intraday bars for a window of time. A second provider is another module
 //! behind the same trait and nothing else. The first adapter is [`eodhd`]; [`budget`] is the
 //! call budget every job checks against the usage a provider reports (decision 0022), and
 //! [`jobs`] holds the jobs themselves, written against the trait alone.
@@ -100,6 +100,21 @@ pub struct Split {
     pub ratio: String,
 }
 
+/// One intraday bar as the engine's intraday files carry it (`docs/DATA_SOURCES.md`): the
+/// bar's start as UTC epoch seconds, the provider's offset from UTC in seconds (EODHD
+/// reports zero: its timestamps are UTC), the raw prints, and the volume.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntradayBar {
+    pub timestamp: i64,
+    pub gmtoffset: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    /// Shares traded; a provider that reports none gives zero.
+    pub volume: f64,
+}
+
 /// Why a provider call failed. The text is safe to log: no variant carries the token or a URL
 /// that would.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +185,22 @@ pub trait Provider: Send + Sync {
         exchange: &str,
         date: NaiveDate,
     ) -> impl Future<Output = Result<Vec<Split>, ProviderError>> + Send;
+
+    /// The longest span, in days, one intraday request may cover at `resolution` (the
+    /// engine's name: `5m`, `1m`, `1h`); `None` when the provider offers no intraday bars
+    /// at it. The intraday job cuts its windows to this.
+    fn intraday_window_days(&self, resolution: &str) -> Option<u32>;
+
+    /// The intraday bars of `symbol` (the provider's full form, `SPY.US`) at `resolution`
+    /// whose start lies in `from..=to`, oldest first; empty when the provider has none
+    /// there. One request, whatever its span, costs [`budget::INTRADAY_CALL_COST`] calls.
+    fn intraday(
+        &self,
+        symbol: &str,
+        resolution: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<IntradayBar>, ProviderError>> + Send;
 }
 
 #[cfg(test)]
@@ -261,5 +292,20 @@ mod tests {
         let text = serde_json::to_string(&split).unwrap();
         assert!(text.contains("\"date\":\"2026-09-11\""));
         assert_eq!(serde_json::from_str::<Split>(&text).unwrap(), split);
+        let intraday = IntradayBar {
+            timestamp: 1_704_205_800,
+            gmtoffset: 0,
+            open: 277.4155,
+            high: 277.6767,
+            low: 277.3743,
+            close: 277.6451,
+            volume: 11_881.0,
+        };
+        let text = serde_json::to_string(&intraday).unwrap();
+        assert!(text.contains("\"timestamp\":1704205800"));
+        assert_eq!(
+            serde_json::from_str::<IntradayBar>(&text).unwrap(),
+            intraday
+        );
     }
 }

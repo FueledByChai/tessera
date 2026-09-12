@@ -174,6 +174,51 @@ async fn history(
     json(StatusCode::OK, serde_json::to_string(&kept).unwrap())
 }
 
+/// `intraday/{symbol}`: SPY.US's recorded three 5-minute rows, those whose timestamp lies
+/// in `from..=to`, for `interval=5m`; an empty list at another interval; 404 for another
+/// symbol.
+async fn intraday(
+    State(state): State<Stub>,
+    Path(symbol): Path<String>,
+    query: Query<Vec<(String, String)>>,
+) -> Response {
+    if let Some(rejected) = record(&state, &format!("/api/intraday/{symbol}"), &query) {
+        return rejected;
+    }
+    if symbol != "SPY.US" {
+        return json(
+            StatusCode::NOT_FOUND,
+            r#"{"message":"Symbol not found"}"#.to_owned(),
+        );
+    }
+    let param = |name: &str| -> Option<i64> {
+        query
+            .0
+            .iter()
+            .find(|(k, _)| k == name)
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let interval = query
+        .0
+        .iter()
+        .find(|(k, _)| k == "interval")
+        .map(|(_, v)| v.as_str());
+    if interval != Some("5m") {
+        return json(StatusCode::OK, "[]".to_owned());
+    }
+    let (from, to) = (param("from").unwrap_or(0), param("to").unwrap_or(i64::MAX));
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&fixture("intraday-SPY.US-5m")).unwrap();
+    let kept: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter(|row| {
+            let ts = row["timestamp"].as_i64().unwrap();
+            ts >= from && ts <= to
+        })
+        .collect();
+    json(StatusCode::OK, serde_json::to_string(&kept).unwrap())
+}
+
 fn stub_router() -> (Router, Queries) {
     let queries: Queries = Arc::new(Mutex::new(Vec::new()));
     let router = Router::new()
@@ -182,6 +227,7 @@ fn stub_router() -> (Router, Queries) {
         .route("/api/exchange-symbol-list/{exchange}", get(symbols))
         .route("/api/eod-bulk-last-day/{exchange}", get(bulk))
         .route("/api/eod/{symbol}", get(history))
+        .route("/api/intraday/{symbol}", get(intraday))
         .with_state(Stub {
             queries: queries.clone(),
         });
@@ -393,6 +439,73 @@ async fn bulk_bars_history_and_splits_parse_the_recorded_answers_and_send_their_
         );
         assert_never_prints_token(&err, &[TOKEN, wrong]);
     }
+}
+
+/// The intraday endpoint (DS-09): the recorded 5-minute rows parse with a null volume as
+/// zero, the query carries the interval and the window as epoch seconds, the window the
+/// provider offers per request is its own table, a daily resolution has no interval and
+/// makes no call, an unknown symbol is the provider's 404, and a wrong token is rejected
+/// with the token in no message.
+#[tokio::test]
+async fn intraday_bars_parse_the_recorded_answer_and_send_the_interval_and_window() {
+    let (router, queries) = stub_router();
+    let base = serve(router).await;
+    let provider = Eodhd::new(&base, TOKEN);
+    let from = Utc.with_ymd_and_hms(2024, 1, 2, 14, 30, 0).unwrap();
+    let to = Utc.with_ymd_and_hms(2024, 1, 2, 14, 40, 0).unwrap();
+
+    let bars = provider.intraday("SPY.US", "5m", from, to).await.unwrap();
+    assert_eq!(bars.len(), 3);
+    assert_eq!(bars[0].timestamp, 1_704_205_800);
+    assert_eq!(bars[0].gmtoffset, 0);
+    assert_eq!((bars[0].open, bars[0].close), (472.16, 473.2));
+    assert_eq!(bars[0].volume, 1_523_401.0);
+    assert_eq!(bars[2].timestamp, 1_704_206_400);
+    assert_eq!(bars[2].volume, 0.0, "a null volume reads as zero");
+    let later = provider
+        .intraday("SPY.US", "5m", from + chrono::Duration::seconds(1), to)
+        .await
+        .unwrap();
+    assert_eq!(later.len(), 2);
+    assert_eq!(provider.intraday_window_days("5m"), Some(600));
+    assert_eq!(provider.intraday_window_days("1m"), Some(120));
+    assert_eq!(provider.intraday_window_days("daily"), None);
+
+    let seen = queries.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].starts_with("/api/intraday/SPY.US?"), "{}", seen[0]);
+    assert!(seen[0].contains("interval=5m"), "{}", seen[0]);
+    assert!(seen[0].contains("from=1704205800"), "{}", seen[0]);
+    assert!(seen[0].contains("to=1704206400"), "{}", seen[0]);
+    assert!(seen[0].contains("fmt=json"), "{}", seen[0]);
+    assert!(seen[1].contains("from=1704205801"), "{}", seen[1]);
+
+    let err = provider
+        .intraday("SPY.US", "daily", from, to)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Malformed(_)), "{err:?}");
+    assert!(err.to_string().contains("no intraday bars"), "{err}");
+    assert_eq!(queries.lock().unwrap().len(), 2, "a daily request was sent");
+    let err = provider
+        .intraday("NOPE.US", "5m", from, to)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Malformed(_)), "{err:?}");
+    assert!(err.to_string().contains("404"), "{err}");
+    assert_never_prints_token(&err, &[TOKEN]);
+
+    let wrong = "wrong-token-9999";
+    let provider = Eodhd::new(&base, wrong);
+    let err = provider
+        .intraday("SPY.US", "5m", from, to)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ProviderError::CredentialsRejected(_)),
+        "{err:?}"
+    );
+    assert_never_prints_token(&err, &[TOKEN, wrong]);
 }
 
 #[tokio::test]

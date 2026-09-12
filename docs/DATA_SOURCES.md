@@ -102,10 +102,11 @@ registered token.
 | `/api/eod-bulk-last-day/{code}?date=` | `bulk_eod` | one row per instrument with `code`, `exchange_short_name`, and the bar; a row missing a price is dropped (nothing is invented for it) and a missing `volume` is zero |
 | `/api/eod-bulk-last-day/{code}?type=splits&date=` | `splits` | `split` is the ratio text (`4.000000/1.000000`) |
 | `/api/eod/{symbol}?from=&period=d` | `eod_history` | the symbol's daily rows from the date on; a symbol the provider does not know is its 404, `Malformed` |
+| `/api/intraday/{symbol}?interval=&from=&to=` | `intraday` | the symbol's bars at `interval` (`1m`, `5m`, `1h`, the engine's resolution names) whose `timestamp` lies in `from..=to`, both UTC epoch seconds; a row missing its timestamp or a price is dropped and a null `volume` is zero; the `datetime` text is not read (the file derives it from the timestamp); a request costs five calls, and `intraday_window_days` is the longest span one may cover: 120 days at `1m`, 600 at `5m`, 7200 at `1h`, none at `daily` (asked anyway, `Malformed` with no call) |
 
 HTTP 401 and 403 are `CredentialsRejected` with the provider's `message`; 429 and 5xx are
 `Unreachable`; any other non-2xx (a 404 for an exchange or a symbol it does not know) is
-`Malformed` with the status. The intraday windows come with the intraday job (BT-1206).
+`Malformed` with the status.
 
 ### The call budget (`src/provider/budget.rs`)
 
@@ -117,7 +118,10 @@ returns a `Refused` naming both numbers (`needs 551 calls, 550 available above t
 of 50`), `charge(n)` counts calls made, and `at_reserve()` is where the optional part of a
 job stops. `Estimate::eod(sessions, backfills)` is two mandatory calls per session (bulk and
 splits) and one optional per backfill; `Estimate::intraday(windows, symbols)` is windows
-times symbols times five, all mandatory. `reserve_calls(limit, pct)` rounds the reserve up
+times symbols times five, all mandatory, and `Estimate::intraday_windows(increment,
+backfill)` is what the intraday job runs on: the windows that extend the files that exist
+times five mandatory, the windows that backfill the symbols without one times five
+optional. `reserve_calls(limit, pct)` rounds the reserve up
 and caps it at the limit; a limit of zero (an account the provider has not described)
 admits no call and is already at its reserve. The budget never talks to a provider: the
 service refreshes the figures before a job starts and after it ends.
@@ -294,7 +298,7 @@ run continues from them.
 
 | Endpoint | Does | Refuses with |
 |---|---|---|
-| `POST /api/datasets/{id}/update` | refreshes the source's usage, queues the job, and answers 202 with its record; the dataset says `Updating` until the job ends | 409 while a job runs on the source, naming the running id and its dataset; 409, before any call, for a root that is not mounted or a folder that is missing, not a folder, or not writable; 409 when no token is on file, and when the provider has not reported usage for the source (a job starts only from reported usage); 400 for an intraday dataset (its job is BT-1206); 404 for an unknown dataset |
+| `POST /api/datasets/{id}/update` | refreshes the source's usage, queues the job, and answers 202 with its record; the dataset says `Updating` until the job ends | 409 while a job runs on the source, naming the running id and its dataset; 409, before any call, for a root that is not mounted or a folder that is missing, not a folder, or not writable; 409 when no token is on file, and when the provider has not reported usage for the source (a job starts only from reported usage); 400 for a dataset at a resolution the source serves no intraday bars at (a daily dataset gets the EOD job, any other the intraday job below); 404 for an unknown dataset |
 | `GET /api/datasets/jobs/{id}` | the record | 404 |
 | `GET /api/datasets/jobs/{id}/log` | the log as a text download (`Content-Disposition: attachment`); empty until the job has started writing it | 404 |
 
@@ -318,6 +322,52 @@ Complete record (files added, updated, the delisted symbol without a history ski
 its reason), the files, the catalog files from the cached listing, the log download from
 under `data/ui/`, the source's usage checked after the job finished, the rescan, and the
 409 with no call for a removed folder and for an unmounted root.
+
+The intraday increment job (BT-1206, DS-09) is `src/provider/jobs/intraday.rs`, the same
+shape against the same trait, and `POST /api/datasets/{id}/update` runs it for every
+dataset whose resolution is not `daily` (kind `intraday` in `dataset_jobs`; the record,
+the log, the one-job-per-source lock, the usage refresh, and the rescan are the EOD job's).
+It knows the dataset's exchange, resolution, folder, from-date, and symbols, and the instant
+it fetches through (now, from the service). `plan` reads the folder and cuts every fetch to
+windows of the span the provider allows per request at the resolution
+(`intraday_window_days`: 120 days at `1m`, 600 at `5m`): for each symbol with a file, the
+windows from the file's last timestamp through the instant, the first window starting at
+that bar so a current file gets it back and nothing else; for each symbol without one, the
+windows from midnight UTC of the from-date. `run` then: refuses without a call a folder that
+is missing, not a folder, or not writable (never created), a resolution the provider has no
+intraday bars at, and mandatory calls (the increments, every window at five calls) over what
+the budget has above its reserve, with both numbers; extends every file, the windows fetched
+oldest first and the bars after the file's last timestamp appended in order, never one
+already in the file, through a part file renamed over the target, a delisted symbol's file
+never touched and a file whose last row carries no timestamp left as it is and skipped;
+backfills the symbols with no file, delisted ones included, from the from-date, a new file
+each, stopping before the request that would reach the reserve: a symbol cut off between
+its windows keeps the file its fetched windows made (the next run extends it from its last
+bar), the symbols left are counted on the record and in the log (`stopped at reserve`), and
+the next run, planning from the files again, picks them up. A symbol the provider answers
+with no bars in any of its windows, or whose request it answers with something other than
+bars (its 404), is skipped with the reason and asked nothing more in that run; the next run
+asks again. A provider that stops answering, or rejects the token, fails the job on that
+request with the files written before it whole. Files keep the intraday layout
+(`Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume`, the timestamp as UTC epoch
+seconds, `Datetime` as that instant in UTC, one file per symbol named `<CODE>.<EXCHANGE>.csv`)
+and the catalog files are not touched (they are the EOD job's). `tests/provider_intraday_job.rs`
+drives the job through the EODHD adapter over a stub answering `intraday/{symbol}` from rows
+set per symbol, cut to each request's span, and proves each clause of the ticket's done line:
+a 5m file 700 days behind extended across two 600-day windows with two requests (ten calls)
+and one a bar behind with one, the bar each file holds asked back and not written twice; a
+missing symbol backfilled from the from-date across two windows; a symbol with no bars
+skipped with the reason after its windows; a rerun at the same instant asking each file's
+last bar back and writing nothing, an instant before the from-date asking nothing; the
+reserve stopping the backfill before its first request or between a symbol's windows with
+the file holding what was fetched and no part file, the rerun continuing from the symbol
+left, and a budget short of the increments refusing before any call; a removed folder and a
+daily resolution refused with no call; a rejected token and an outage failing the job with
+the files whole and a 404 symbol skipped beside them. The service test
+(`tests::sources::datasets::a_5m_datasets_update_routes_to_the_intraday_job`) posts an
+update on a 5m dataset over the stub and asserts the record's kind `intraday`, the seeded
+file extended in the intraday layout, the backfilled file, the symbol skipped with its
+reason, the calls at five a request, no part file, and the job as the dataset's `last_job`.
 
 ## Environment overrides
 
