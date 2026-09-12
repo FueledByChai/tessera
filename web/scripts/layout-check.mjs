@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 // Laptop layout check (UI-03). Drives the console headlessly at 1280 and 1440 px wide, in
-// terminal and modern mode, through the run overview, a strategy page, and the studies page,
-// and fails when the page body scrolls horizontally or an element's right edge passes the
-// viewport without a scrolling ancestor (a wide table must scroll inside its own wrapper).
-// On the strategy page it also fails when the Historical runs table is not the first panel
-// after the summary strip (UI-05), then opens the Configure run dialog and fails when the
-// dialog passes the viewport or the page behind it scrolls horizontally, and counts the fields
-// in the first row of the dialog's Data grid and fails under six (UI-04: numeric fields take
-// one auto-fit track, dates and selects two).
+// terminal and modern mode, through the run overview, the strategies catalog, a strategy page,
+// and the studies page, and fails when the page body scrolls horizontally or an element's right
+// edge passes the viewport without a scrolling ancestor (a wide table must scroll inside its
+// own wrapper). The catalog must also show its nine columns (UI-06), so a narrower table that
+// happens to fit cannot pass for it. On the strategy page it also fails when the Historical
+// runs table is not the first panel after the summary strip (UI-05), then opens the Configure
+// run dialog and fails when the dialog passes the viewport or the page behind it scrolls
+// horizontally, and counts the fields in the first row of the dialog's Data grid and fails
+// under six (UI-04: numeric fields take one auto-fit track, dates and selects two).
 //
 //   node web/scripts/layout-check.mjs                  this checkout's web/dist, API from the
 //                                                      console at LAYOUT_CONSOLE (127.0.0.1:8787)
@@ -157,11 +158,17 @@ async function supply(origin) {
 /** The reason a page cannot be opened on this console, or null when it can. */
 const NEEDS = {
   "run overview": (s) => (s.runs ? null : "the console has no runs"),
+  "strategies catalog": (s) => (s.strategies ? null : "the console has no strategies"),
   "strategy page": (s) => (s.strategies ? null : "the console has no strategies"),
   studies: () => null,
 };
 
-/** The three pages, reached by clicking, since the console has no routes. */
+/** The columns the strategies catalog shows (UI-06): #, name, asset, runs, CAGR, Sharpe,
+ *  max DD, last run, open. */
+const CATALOG_COLUMNS = 9;
+
+/** The pages, reached by clicking, since the console has no routes. Each opens the page and
+ *  returns any failures of its own beyond the layout measurement. */
 const PAGES = {
   "run overview": async (page) => {
     await page.getByRole("button", { name: /Runs$/ }).first().click();
@@ -170,6 +177,15 @@ const PAGES = {
     await row.locator("td").nth(1).click();
     await page.locator(".equity-chart svg, .run-failure").first().waitFor({ timeout: 30000 });
     await page.getByRole("button", { name: /^Overview/ }).first().click().catch(() => {});
+  },
+  "strategies catalog": async (page) => {
+    await page.getByRole("button", { name: /Strategies$/ }).first().click();
+    await page.locator(".catalog-name").first().waitFor({ timeout: 15000 });
+    const columns = await page.locator(".catalog-table thead th").count();
+    if (columns !== CATALOG_COLUMNS) {
+      return [`the catalog shows ${columns} columns, not ${CATALOG_COLUMNS}`];
+    }
+    return [];
   },
   "strategy page": async (page) => {
     await page.getByRole("button", { name: /Strategies$/ }).first().click();
@@ -227,8 +243,9 @@ try {
         if (skipped.has(name)) continue;
         await page.goto(url, { waitUntil: "domcontentloaded" });
         await page.locator(".app-shell").waitFor({ timeout: 15000 });
+        let own = [];
         try {
-          await open(page);
+          own = (await open(page)) ?? [];
         } catch (error) {
           failures.push(`${mode} ${width}px ${name}: could not open (${String(error).split("\n")[0]})`);
           continue;
@@ -237,6 +254,7 @@ try {
         const result = await page.evaluate(measure);
         measured += 1;
         const label = `${mode} ${width}px ${name}`;
+        for (const failure of own) failures.push(`${label}: ${failure}`);
         const wide = result.scrollWidth > result.innerWidth;
         const notes = [...result.offenders.map((o) => `past the viewport: ${o}`), ...result.clipped.map((c) => `cut off in its wrapper: ${c}`)];
         if (verbose || wide || notes.length) {

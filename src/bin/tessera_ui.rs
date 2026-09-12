@@ -59,6 +59,20 @@ struct StrategyRecord {
     custom: bool,
     /// Manifest id for SDK strategies (row ids may carry dev/release suffixes).
     sdk_strategy_id: Option<String>,
+    /// Every run recorded against the strategy, whatever its status.
+    run_count: usize,
+    /// The newest completed run, so the catalog reads as a scoreboard (UI-06); `None` before
+    /// the first completes.
+    last_run: Option<StrategyLastRun>,
+}
+
+/// A strategy's newest completed run as the catalog shows it: when it ran and the headline
+/// metrics cached on it (`None` when the run's report yielded none).
+#[derive(Debug, Clone, Serialize)]
+struct StrategyLastRun {
+    run_id: String,
+    created_at: String,
+    metrics: Option<RunMetrics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5205,57 +5219,65 @@ fn load_dashboard(state: &AppState) -> Result<DashboardResponse> {
     })
 }
 
+/// The catalog row: the strategy's own columns, its run count, and its newest completed run
+/// joined in (`l`), so one statement serves both readers below. Append the WHERE clause.
+const STRATEGY_ROW_SQL: &str =
+    "SELECT s.id, s.name, s.version, s.status, s.description, s.asset_scope, s.config_path,
+            s.runnable, s.base_strategy_id, s.source_sha256, s.sdk_strategy_id,
+            (SELECT COUNT(*) FROM runs r WHERE r.strategy_id = s.id),
+            l.id, l.created_at, l.metrics_json
+     FROM strategies s
+     LEFT JOIN runs l ON l.id = (
+         SELECT r.id FROM runs r
+         WHERE r.strategy_id = s.id AND r.status = 'Complete'
+         ORDER BY r.created_at DESC, r.id DESC
+         LIMIT 1)";
+
+fn strategy_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StrategyRecord> {
+    let last_run = match (
+        row.get::<_, Option<String>>(12)?,
+        row.get::<_, Option<String>>(13)?,
+    ) {
+        (Some(run_id), Some(created_at)) => Some(StrategyLastRun {
+            run_id,
+            created_at,
+            metrics: parse_metrics_json(row.get::<_, Option<String>>(14)?),
+        }),
+        _ => None,
+    };
+    Ok(StrategyRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        version: row.get(2)?,
+        status: row.get(3)?,
+        description: row.get(4)?,
+        asset_scope: row.get(5)?,
+        config_path: row.get(6)?,
+        runnable: row.get::<_, i64>(7)? != 0,
+        base_strategy_id: row.get(8)?,
+        source_sha256: row.get(9)?,
+        custom: row
+            .get::<_, Option<String>>(8)?
+            .is_some_and(|base| base != "sdk"),
+        sdk_strategy_id: row.get(10)?,
+        run_count: row.get::<_, i64>(11)?.max(0) as usize,
+        last_run,
+    })
+}
+
 fn query_strategies(connection: &Connection) -> Result<Vec<StrategyRecord>> {
-    let mut statement = connection.prepare(
-        "SELECT id, name, version, status, description, asset_scope, config_path, runnable,
-                base_strategy_id, source_sha256, sdk_strategy_id
-         FROM strategies WHERE id != 'sdk' ORDER BY name",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok(StrategyRecord {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            version: row.get(2)?,
-            status: row.get(3)?,
-            description: row.get(4)?,
-            asset_scope: row.get(5)?,
-            config_path: row.get(6)?,
-            runnable: row.get::<_, i64>(7)? != 0,
-            base_strategy_id: row.get(8)?,
-            source_sha256: row.get(9)?,
-            custom: row
-                .get::<_, Option<String>>(8)?
-                .is_some_and(|base| base != "sdk"),
-            sdk_strategy_id: row.get(10)?,
-        })
-    })?;
+    let mut statement = connection.prepare(&format!(
+        "{STRATEGY_ROW_SQL} WHERE s.id != 'sdk' ORDER BY s.name"
+    ))?;
+    let rows = statement.query_map([], strategy_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn query_strategy(connection: &Connection, id: &str) -> Result<StrategyRecord> {
     Ok(connection.query_row(
-        "SELECT id, name, version, status, description, asset_scope, config_path, runnable,
-                base_strategy_id, source_sha256, sdk_strategy_id
-         FROM strategies WHERE id=?1",
+        &format!("{STRATEGY_ROW_SQL} WHERE s.id = ?1"),
         [id],
-        |row| {
-            Ok(StrategyRecord {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                version: row.get(2)?,
-                status: row.get(3)?,
-                description: row.get(4)?,
-                asset_scope: row.get(5)?,
-                config_path: row.get(6)?,
-                runnable: row.get::<_, i64>(7)? != 0,
-                base_strategy_id: row.get(8)?,
-                source_sha256: row.get(9)?,
-                custom: row
-                    .get::<_, Option<String>>(8)?
-                    .is_some_and(|base| base != "sdk"),
-                sdk_strategy_id: row.get(10)?,
-            })
-        },
+        strategy_from_row,
     )?)
 }
 
@@ -6625,6 +6647,146 @@ mod tests {
         // Names are trimmed and bounded; a blank expression is refused.
         assert!(save_feature_preset(&connection, "  ", "obi_l1", "", false).is_err());
         assert!(save_feature_preset(&connection, "x", "   ", "", false).is_err());
+    }
+
+    /// UI-06: each catalog row carries its last completed run (date and cached metrics) so the
+    /// strategies page is a scoreboard. A strategy with two completed runs reports the newer
+    /// one's metrics, not the older's and not a later failed run; one whose only completed run
+    /// has no cached metrics reports the date with null metrics; one with no runs reports null.
+    #[test]
+    fn catalog_rows_carry_the_last_completed_runs_metrics() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        for id in ["gap_fade", "limit_buyer", "orb_breakout"] {
+            connection
+                .execute(
+                    "INSERT INTO strategies
+                     (id, name, version, status, description, asset_scope, config_path,
+                      runnable, created_at, base_strategy_id)
+                     VALUES (?1, ?1, 'v1', 'Research', '', 'ETF', 'x.toml', 1,
+                             '2026-09-01T00:00:00Z', 'sdk')",
+                    [id],
+                )
+                .unwrap();
+        }
+        let older = RunMetrics {
+            cagr_percent: Some(4.0),
+            total_return_percent: Some(9.0),
+            sharpe: Some(0.5),
+            sortino: None,
+            calmar: None,
+            max_drawdown_percent: Some(20.0),
+            annual_volatility_percent: None,
+            win_rate_percent: None,
+            trades: Some(10),
+            start: None,
+            end: None,
+        };
+        let newer = RunMetrics {
+            cagr_percent: Some(18.2),
+            sharpe: Some(1.31),
+            max_drawdown_percent: Some(9.4),
+            trades: Some(42),
+            ..older.clone()
+        };
+        let runs = [
+            (
+                "gap_fade-1",
+                "gap_fade",
+                "Complete",
+                "2026-09-08T00:00:00Z",
+                Some(&older),
+            ),
+            (
+                "gap_fade-2",
+                "gap_fade",
+                "Complete",
+                "2026-09-10T00:00:00Z",
+                Some(&newer),
+            ),
+            // A later run that did not complete never becomes the strategy's headline.
+            (
+                "gap_fade-3",
+                "gap_fade",
+                "Failed",
+                "2026-09-11T00:00:00Z",
+                None,
+            ),
+            (
+                "limit_buyer-1",
+                "limit_buyer",
+                "Complete",
+                "2026-09-09T00:00:00Z",
+                None,
+            ),
+        ];
+        for (id, strategy, status, created_at, metrics) in runs {
+            connection
+                .execute(
+                    "INSERT INTO runs
+                     (id, strategy_id, name, research_label, status, artifact_dir, created_at,
+                      metrics_json)
+                     VALUES (?1, ?2, ?1, 'baseline', ?3, ?1, ?4, ?5)",
+                    params![
+                        id,
+                        strategy,
+                        status,
+                        created_at,
+                        metrics.map(|m| serde_json::to_string(m).unwrap())
+                    ],
+                )
+                .unwrap();
+        }
+
+        let rows = query_strategies(&connection).unwrap();
+        let row = |id: &str| rows.iter().find(|row| row.id == id).unwrap();
+
+        let gap_fade = row("gap_fade");
+        assert_eq!(gap_fade.run_count, 3);
+        let last = gap_fade.last_run.as_ref().expect("a completed run");
+        assert_eq!(last.run_id, "gap_fade-2");
+        assert_eq!(last.created_at, "2026-09-10T00:00:00Z");
+        let metrics = last.metrics.as_ref().expect("cached metrics");
+        assert_eq!(metrics.cagr_percent, Some(18.2));
+        assert_eq!(metrics.sharpe, Some(1.31));
+        assert_eq!(metrics.max_drawdown_percent, Some(9.4));
+
+        let limit_buyer = row("limit_buyer");
+        assert_eq!(limit_buyer.run_count, 1);
+        let last = limit_buyer.last_run.as_ref().expect("a completed run");
+        assert_eq!(last.run_id, "limit_buyer-1");
+        assert_eq!(last.created_at, "2026-09-09T00:00:00Z");
+        assert!(
+            last.metrics.is_none(),
+            "no cached metrics gives null metrics"
+        );
+
+        let orb_breakout = row("orb_breakout");
+        assert_eq!(orb_breakout.run_count, 0);
+        assert!(
+            orb_breakout.last_run.is_none(),
+            "no run gives a null last run"
+        );
+
+        // The single-strategy reader agrees with the catalog, and the wire shape carries the
+        // nulls the page renders as a dash.
+        let one = query_strategy(&connection, "gap_fade").unwrap();
+        assert_eq!(
+            one.last_run.as_ref().map(|l| l.run_id.as_str()),
+            Some("gap_fade-2")
+        );
+        let json = serde_json::to_value(&rows).unwrap();
+        let by_id = |id: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert!(by_id("orb_breakout")["last_run"].is_null());
+        assert!(by_id("limit_buyer")["last_run"]["metrics"].is_null());
+        assert_eq!(by_id("gap_fade")["last_run"]["metrics"]["sharpe"], 1.31);
     }
 
     #[test]

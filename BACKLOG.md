@@ -822,3 +822,17 @@ it first, reviewing a rebased PR when its new head is pending. Kit change, tag, 
 exactly the PRs behind the default branch (two of three in the fixture) and prints the
 summary; `prompt-check.sh` asserts "--update-all" in `review-prs.md`; `kit_ref` here moves to
 the tag and one real `--update-all` run here is recorded in the pull request.
+
+### HK-43 The scratch console from a worktree finds the engine that was just built
+`scripts/scratch-console.sh` links the scratch root's `target` to the checkout's own `target/`,
+and the service resolves the engine for the SDK strategy sync at `<root>/target/release/tessera`.
+From a worktree, `scripts/check.sh` builds into the shared `target-worktrees/` (HK-27), so the
+worktree's `target/` holds no binaries: the scratch console starts, logs `SDK strategy sync
+failed: tessera engine is not built`, its catalog stays empty, and `start` times out waiting
+for it (found while working UI-06; copying the two binaries into the worktree's
+`target/release/` was the workaround). The script should give the scratch root the engine
+from `$CARGO_TARGET_DIR/release` when that is set (a link per binary, or the service taking
+the engine path from an environment variable the script sets).
+**Done when:** `CARGO_TARGET_DIR=<shared> scripts/scratch-console.sh start --port 8793` from a
+worktree whose own `target/` is empty seeds the strategy catalog and the run; the CI web job,
+which starts the scratch console from the main checkout, is unaffected.

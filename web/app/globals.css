@@ -1480,7 +1480,9 @@ nav {
   gap: 14px;
   align-items: start;
 }
-@media (max-width: 1240px) {
+/* Up to 1500 px the nine scoreboard columns (UI-06) need the whole panel width, so the
+   inspector rail drops below the table instead of standing beside it. */
+@media (max-width: 1500px) {
   .catalog-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1567,17 +1569,34 @@ nav {
 .catalog-row.blocked strong {
   color: var(--muted);
 }
+/* The name cell (UI-06): the name on one line, its version and status badges under it. */
 .catalog-name {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  max-width: 300px;
+}
+.catalog-name-line,
+.catalog-badges {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
-  max-width: 300px;
+}
+.catalog-badges {
+  gap: 6px;
+}
+.catalog-badges .version {
+  margin: 0;
 }
 .catalog-name strong {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
   font-weight: 600;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .catalog-name small {
   flex: 0 1 auto;
@@ -4285,13 +4304,15 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 
 /* Laptop widths (UI-03): up to 1500 px (a 13-inch MacBook is 1280 to 1470 px wide) the wide
    grids fit their panel instead of scrolling behind an invisible macOS scrollbar. The monthly
-   heat map, the run history, and the study tables go dense (15 px cells, 13 px headers, tight
-   padding); run names truncate; the studies page stacks its history above the results; under
-   1280 px the study heat map keeps one line per cell (the rest is in the hover title). Both
-   display modes. web/scripts/layout-check.mjs measures this at 1280 and 1440 px. */
+   heat map, the run history, the strategies catalog (UI-06), and the study tables go dense
+   (15 px cells, 13 px headers, tight padding); run and strategy names truncate; the studies
+   page stacks its history above the results; under 1280 px the study heat map keeps one line
+   per cell (the rest is in the hover title). Both display modes. web/scripts/layout-check.mjs
+   measures this at 1280 and 1440 px. */
 @media (max-width: 1500px) {
   .app-shell .monthly-panel .table-wrap table,
   .app-shell .strategy-run-history .table-wrap table,
+  .app-shell .catalog-table.table-wrap table,
   .app-shell .sweep-heatmap table,
   .app-shell .sweep-heatmap td,
   .app-shell .ranked-cells {
@@ -4300,10 +4321,19 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
   }
   .app-shell .monthly-panel .table-wrap th,
   .app-shell .strategy-run-history .table-wrap th,
+  .app-shell .catalog-table.table-wrap th,
   .app-shell .sweep-heatmap th,
   .app-shell .ranked-cells th {
     font-size: 13px;
     letter-spacing: 0.04em;
+  }
+  /* Nine catalog columns across the panel: tight cells, long names truncated. */
+  .app-shell .catalog-table.table-wrap th,
+  .app-shell .catalog-table.table-wrap td {
+    padding: 5px 7px;
+  }
+  .app-shell .catalog-name {
+    max-width: 260px;
   }
   .app-shell .monthly-panel .table-wrap th,
   .app-shell .monthly-panel .table-wrap td {
