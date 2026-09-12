@@ -1005,6 +1005,55 @@ denser columns, so that the catalog answers "how is it doing" without opening ea
 +------------------------------------------------------------------------------+
 ```
 
+### BT-1103 — The console's left menu collapses to an icon rail
+
+**Status:** Proposed
+**User story:** As a researcher working on a 13-inch screen, I want the left menu to collapse
+to a narrow rail of icons so that the dense tables get the width back without losing the
+ability to move between pages.
+
+**Acceptance criteria:**
+
+- A control in the sidebar collapses it to a rail and expands it again. The state is the
+  user's: nothing auto-collapses, and no viewport width triggers it.
+- Collapsed, the sidebar is a fixed 56 px icon rail, the same width in both display modes,
+  showing the BT brand mark, the ten nav icons, and the engine-status dot. The Tessera name,
+  the Research Console subtitle, every item label, and the foot's two lines of text are not
+  rendered.
+- Hovering a nav icon shows its label in a themed tooltip; the brand mark and the engine dot
+  carry tooltips too.
+- The current page stays obvious: the active item keeps its amber colour and its inset bar.
+- Collapsing animates the width and the label fade over 150 ms. The expanded sidebar is
+  unchanged.
+- The choice is remembered per browser; a fresh browser starts expanded. It is independent of
+  the display-mode choice.
+- At 1280 and 1440 px in both display modes the collapsed page does not scroll horizontally
+  and no icon clips.
+- The Code page's navigator and the Strategies catalog's inspector rail are unchanged.
+
+**Wireframe:**
+
+```
+EXPANDED (unchanged)                    COLLAPSED (new, 56 px, both modes)
++------------------------+              +------+
+| [BT] Tessera    [<]    |              |  BT  |  brand mark kept
+|      Research Console  |              | [>]  |  toggle
+|  ⌂  Dashboard          |              |      |
+|  ◆  Strategies         |              |  ⌂   |  label on hover
+|  ＋  New Backtest       |              |  ＋   |
+|  ▤  Runs               |              |  ▤   |
+|  ⇄  Compare            |              |  ⇄   |
+|  ◫  Portfolios         |              |  ◫   |
+|  ∿  Studies            |              |  ∿   |
+|  ▦  Data               |              |  ▦   |
+|  ¢  Costs              |              |  ¢   |
+| </>  Code              |              | </>  |
+|  ●  Engine ready       |              |  ●   |  label on hover
+|     Local Mac · 0      |              |      |
++------------------------+              +------+
+   224 px (216 terminal)                 56 px; active item keeps its highlight
+```
+
 ## Recommended delivery milestones
 
 ### Completed foundation — Event-driven SDK steps 1–6

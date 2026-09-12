@@ -21,3 +21,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0016](0016-strategy-scope-is-explicit-isolated-state-per-instrument-or-.md) Strategy scope is explicit: isolated state per instrument or one portfolio instance — accepted
 - [0017](0017-strategies-emit-broker-neutral-order-intents-adapters-own-ex.md) Strategies emit broker-neutral order intents; adapters own execution and accounting — accepted
 - [0018](0018-a-live-broker-interface-is-not-live-trading-readiness.md) A live-broker interface is not live-trading readiness — accepted
+- [0019](0019-the-console-s-left-menu-collapses-to-an-icon-rail-the-choice.md) The console's left menu collapses to an icon rail; the choice is per-browser — accepted
