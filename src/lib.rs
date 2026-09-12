@@ -4,6 +4,7 @@ pub mod indicators;
 pub mod lake;
 pub mod local_config;
 pub mod portfolio;
+pub mod provider;
 pub mod report;
 pub mod sdk;
 pub mod series;

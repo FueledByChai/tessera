@@ -1,0 +1,13 @@
+{
+  "name": "Example User",
+  "email": "user@example.com",
+  "subscriptionType": "All-In-One",
+  "paymentMethod": "Stripe",
+  "apiRequests": 1234,
+  "apiRequestsDate": "2026-09-11",
+  "dailyRateLimit": 100000,
+  "extraLimit": 0,
+  "inviteToken": "REDACTED",
+  "inviteTokenClicked": 0,
+  "subscriptionMode": "user"
+}

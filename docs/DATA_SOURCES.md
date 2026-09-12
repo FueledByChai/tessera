@@ -60,6 +60,43 @@ It reports epochs, the delta mix, and how many trades print inside the rebuilt t
 better; lower means the venue's delta semantics differ from absolute-size CHANGE/DELETE and the
 reader needs adjusting.
 
+## Providers
+
+A provider is where a source's data comes from: an API the service talks to with the user's
+own token (decision 0020). Each one is a module under `src/provider/` implementing the
+`Provider` trait in `src/provider/mod.rs`; the service, the jobs, and the console see only
+the trait. Its read-only calls:
+
+| Call | Returns | Fails with |
+|---|---|---|
+| `verify(token)` | the account: plan, requests today, daily limit, when the counter resets (UTC) | `CredentialsRejected` on a refused token |
+| `exchanges()` | code, name, country, and the bar resolutions offered there (`daily`, `1h`, `5m`, `1m`) | `Unreachable` when the provider cannot be reached, times out, answers 5xx, or rate-limits |
+| `symbols(exchange, delisted)` | each listing's code, name, type (the provider's classification, verbatim), currency | `Malformed` when the answer is not the shape the adapter reads |
+
+An error's text is safe to log: no variant carries the token, and reqwest's own errors are
+stripped of the request URL (which would carry it) before they become one.
+
+### EODHD (`src/provider/eodhd.rs`)
+
+`Eodhd::new(base_url, token)`; `Eodhd::public(token)` uses `https://eodhd.com`. The
+adapter sends the token as the `api_token` query parameter and asks every endpoint for
+`fmt=json` (the list endpoints answer CSV without it). The base URL is configurable so the
+tests run against a stub server: `tests/provider_eodhd.rs` serves the recorded responses
+under `tests/fixtures/eodhd/` (`user.json`, `exchanges-list.json`,
+`exchange-symbol-list-US.json`, token scrubbed, trimmed to a few rows), and nothing in the
+repository calls eodhd.com unless the service does with a registered token.
+
+| Endpoint | Call | Notes |
+|---|---|---|
+| `/api/user` | `verify` | `subscriptionType` is the plan, `apiRequests` the count for `apiRequestsDate`, `dailyRateLimit` the limit; the counter resets at 00:00 UTC the next day |
+| `/api/exchanges-list/` | `exchanges` | every exchange offers `daily`, `1h`, `5m`; `US`, `FOREX`, and `CC` add `1m` (the adapter's own table: the endpoint says nothing about resolutions) |
+| `/api/exchange-symbol-list/{code}` | `symbols` | `delisted=1` asks for the instruments no longer trading instead of the active ones; `Type` is `Common Stock`, `ETF`, `Fund`, ... |
+
+HTTP 401 and 403 are `CredentialsRejected` with the provider's `message`; 429 and 5xx are
+`Unreachable`; any other non-2xx (a 404 for an exchange it does not know) is `Malformed`
+with the status. The download calls (bulk EOD, history, splits, intraday windows) come with
+the tickets that build the native download jobs.
+
 ## Environment overrides
 
 `TESSERA_DATA_ROOT` (a folder holding `eod/`, `5m/`, `1m/`, `catalog/`), `TESSERA_ENGINE`,
