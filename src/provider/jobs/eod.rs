@@ -224,9 +224,9 @@ fn last_date_in_text(text: &str) -> Option<NaiveDate> {
         .and_then(|field| NaiveDate::parse_from_str(field.trim(), "%Y-%m-%d").ok())
 }
 
-/// The last row's date of a daily file, read from its tail; `None` for a file with no
-/// dated row or one that cannot be read.
-pub fn last_date_of(path: &Path) -> Option<NaiveDate> {
+/// The last 4 KiB of `path` as text (lossily decoded), enough to hold its last rows;
+/// `None` for a file that cannot be read.
+pub fn tail_of(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -234,7 +234,13 @@ pub fn last_date_of(path: &Path) -> Option<NaiveDate> {
     file.seek(SeekFrom::Start(len - tail)).ok()?;
     let mut buf = vec![0u8; tail as usize];
     file.read_exact(&mut buf).ok()?;
-    last_date_in_text(&String::from_utf8_lossy(&buf))
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The last row's date of a daily file, read from its tail; `None` for a file with no
+/// dated row or one that cannot be read.
+pub fn last_date_of(path: &Path) -> Option<NaiveDate> {
+    last_date_in_text(&tail_of(path)?)
 }
 
 /// One daily row as the file carries it.
@@ -245,15 +251,17 @@ pub fn csv_line(bar: &Bar) -> String {
     )
 }
 
-fn part_path(path: &Path) -> PathBuf {
+/// The part file a write of `path` goes through: `path` with [`PART_SUFFIX`].
+pub fn part_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_owned();
     os.push(PART_SUFFIX);
     PathBuf::from(os)
 }
 
 /// Writes `content` to the part file beside `path` and renames it over `path`; on any
-/// failure the part file is removed and the target is as it was.
-fn write_part_then_rename(path: &Path, content: &[u8]) -> io::Result<()> {
+/// failure the part file is removed and the target is as it was. Every data file a job
+/// writes goes through here (decision 0022).
+pub fn write_part_then_rename(path: &Path, content: &[u8]) -> io::Result<()> {
     let part = part_path(path);
     let written = (|| {
         let mut file = fs::File::create(&part)?;
@@ -404,7 +412,7 @@ pub fn plan(input: &EodJobInput) -> Result<Plan, String> {
 
 /// Whether a provider error ends the run (the provider is gone, or the token is) or only
 /// the symbol it was for (the provider answered, but not with that symbol's history).
-fn ends_the_run(error: &ProviderError) -> bool {
+pub fn ends_the_run(error: &ProviderError) -> bool {
     !matches!(error, ProviderError::Malformed(_))
 }
 
