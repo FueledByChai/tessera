@@ -2,7 +2,9 @@
 
 Tessera reads two kinds of source. Both are configured in `local.toml` at the repository root
 (git-ignored; copy `local.example.toml`) and shown, with file counts, sizes, and date coverage,
-on the Data page under **Data sources**.
+on the Data page's Inventory view under **Configured library**. Provider accounts and the
+datasets they keep current are registered from the same view (**Data sources**, decision
+0021); see [Registering a source from the console](#registering-a-source-from-the-console).
 
 ## 1. CSV bar library (daily, 5-minute, 1-minute)
 
@@ -240,6 +242,59 @@ folders, not the root.
 the console reads the synthetic dataset under `examples/data`. `TESSERA_EODHD_BASE_URL` points
 the EODHD adapter of every registered source at another base URL (a stub server for a scratch
 console) instead of `https://eodhd.com`.
+
+## Registering a source from the console
+
+The Inventory view of the Data page (DS-06; decisions 0003, 0014, 0021) is where a provider
+account and its datasets are registered, with no restart. Its panels, top to bottom:
+
+1. **Data sources**: one card per registered source. The header carries the name, the kind,
+   the root, and "token set, verified <time>" with *Replace token*, *Verify*, *Rescan*, and
+   *Remove*; the next line the connection state with the time checked (Connected, Credentials
+   rejected with the provider's message, Unreachable) and the root volume's used, free, and
+   total space; then the credits line (requests used / daily limit, "resets 00:00 UTC", what
+   is left above the reserve, and the reserve as an editable field, decision 0022); then the
+   datasets table (exchange, types, resolution, from, folder, listed, on disk, latest, current,
+   size, state; `remove` on each row); then the Uncataloged line (files under the root no
+   dataset claims, per folder, with the scan's time) and *Add dataset*. A source with no
+   datasets says "no datasets yet, add one to scan" and still shows its Uncataloged folders.
+   Every time is UTC, the service's own stamp.
+2. **Available from <source>**: the provider's cached exchange list (BT-1202): code, name,
+   country, the listed count per instrument type under the provider's own names (the two
+   largest, then `+n`, the full list on hover, and the delisted count once fetched), the
+   resolutions offered, and *Here*, the datasets registered against the exchange. The title
+   says "listed <time>"; *Refresh* asks the provider again; an unreachable provider leaves the
+   rows with an Unreachable note; the filter narrows by code or name; rows with datasets sort
+   first; an exchange whose listing is not cached shows `+`, which fetches that one listing.
+   With several sources a select in the title picks the one shown.
+3. **Configured library**: the `local.toml` library and lake as before, then the library
+   metrics and the run-coverage fold.
+
+**Add source** (a button on the Data sources title) opens an inline form, never a dialog (the
+run form is the console's one, decision 0003): kind (the adapters compiled in), name, library
+root, catalog folder, API token (a password field), reserve %. Root and catalog are pre-filled
+from the configured library when no source covers that root yet, so the first EODHD source
+adopts today's folders in place and nothing is downloaded again. *Save* posts the token once;
+the service verifies it with the provider before writing anything, a rejected token is refused
+with the provider's message and nothing is saved, and the field is cleared either way. The
+token is never rendered again: the card shows only "token set, verified <time>", and
+`web/scripts/data-page-check.mjs` fails if the fixture's token or the secrets path appears in
+any element's text or value after a save.
+
+**Add dataset** (on the card) is an inline form as well: the exchange from the cached list,
+the types as checkboxes from that exchange's listing (with a *fetch it* link when the listing
+is not cached yet), the resolution from what the provider offers there (EOD, 1h, 5m, 1m), the
+from-date, include delisted (on by default for EOD), and the folder, defaulted to
+`<root>/eod` for daily bars and `<root>/<resolution>` otherwise. The new row is Unknown until
+*Rescan* runs the scan in the background; the card polls while the scan runs.
+
+*Remove* on a source or `remove` on a dataset asks the service, which refuses while files lie
+under the folders concerned: the console never deletes data files (decision 0022).
+
+The fixture `web/fixtures/data-sources.json` seeds the view for the check with two sources
+(one Credentials rejected), five datasets, an Uncataloged folder, the US and LSE availability
+rows, and the usage object; the check drives Add dataset, Replace token, and Add source
+against a stateful stand-in for the API and measures the seeded Inventory at 1280 and 1440 px.
 
 ## Adding a source
 

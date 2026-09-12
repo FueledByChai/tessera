@@ -1,5 +1,5 @@
 {
-  "_comment": "Fixture for web/scripts/data-page-check.mjs (DS-01): the four Data page APIs in their current shapes. `sources` answers GET /api/data/sources, `status` GET /api/data/status, `automations` GET /api/automations, and `instruments` is the catalog GET /api/instruments searches (q, symbols, limit). Every path and symbol here is invented.",
+  "_comment": "Fixture for web/scripts/data-page-check.mjs (DS-01, DS-06): the Data page APIs in their current shapes. `sources` answers GET /api/data/sources, `status` GET /api/data/status, `automations` GET /api/automations, `instruments` is the catalog GET /api/instruments searches (q, symbols, limit), `registered` answers GET /api/sources (two sources, the second with its credentials rejected; five datasets and an Uncataloged folder on the first), `availability` answers GET /api/sources/{id}/availability per source (the US row with datasets and a listing, the LSE row with neither), and `secret` is what must never reach the page: the token the check types into Add source and the path of the file the service would keep it in. Every path, symbol, id, and token here is invented.",
   "sources": {
     "generated_at": "2026-09-11T20:14:03.201Z",
     "config": {
@@ -78,5 +78,84 @@
     { "symbol": "DEMO.US", "code": "DEMO", "suffix": "US", "name": "Demo Corporation", "exchange": "NYSE", "asset_class": "Common Stock", "currency": "USD", "status": "active", "daily": true, "five_minute": true, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2018-01-02", "last": "2026-09-11" }, "5m": { "first": "2024-01-02", "last": "2026-09-10" } }, "missing_resolutions": [] },
     { "symbol": "ZENITH.US", "code": "ZENITH", "suffix": "US", "name": "Zenith Holdings Corp", "exchange": "NASDAQ", "asset_class": "Common Stock", "currency": "USD", "status": "delisted", "daily": true, "five_minute": false, "one_minute": false, "tick": false, "coverage": { "daily": { "first": "2018-01-02", "last": "2024-06-28" } }, "missing_resolutions": [] },
     { "symbol": "BINANCE_FUTURES:SOLUSDT", "code": "SOLUSDT", "suffix": "BINANCE_FUTURES", "name": "SOL/USDT perpetual", "exchange": "BINANCE_FUTURES", "asset_class": "Crypto", "currency": "USDT", "status": "active", "daily": false, "five_minute": false, "one_minute": false, "tick": true, "coverage": { "tick": { "first": "2026-07-01", "last": "2026-09-10" } }, "missing_resolutions": [] }
-  ]
+  ],
+  "registered": {
+    "kinds": ["eodhd"],
+    "sources": [
+      {
+        "id": "source-20260901T120000.000000Z",
+        "name": "EODHD",
+        "kind": "eodhd",
+        "root": "/srv/eodhd",
+        "catalog_dir": "/srv/eodhd/catalog",
+        "reserve_pct": 5.0,
+        "usage": { "requests_today": 41430, "daily_limit": 100000, "resets_at": "2026-09-12T00:00:00+00:00", "checked_at": "2026-09-11T19:02:11+00:00", "reserve_calls": 5000, "available_calls": 53570 },
+        "root_exists": true,
+        "volume": { "total_bytes": 2000000000000, "used_bytes": 1210000000000, "free_bytes": 790000000000 },
+        "token_set": true,
+        "token_set_at": "2026-09-01T12:00:00+00:00",
+        "verified_at": "2026-09-11T19:02:11+00:00",
+        "verify_state": "connected",
+        "verify_message": null,
+        "created_at": "2026-09-01T12:00:00+00:00",
+        "datasets": [
+          { "id": "dataset-20260901T120100.000000Z", "source_id": "source-20260901T120000.000000Z", "exchange": "US", "types": ["Common Stock", "ETF"], "resolution": "daily", "from_date": "2000-01-01", "folder": "/srv/eodhd/eod", "include_delisted": true, "created_at": "2026-09-01T12:01:00+00:00", "state": "Current", "scan": { "scanned_at": "2026-09-11T02:10:44+00:00", "listed": 23765, "on_disk": 23748, "latest_date": "2026-09-10", "current_count": 23700, "bytes": 41200000000, "error": null } },
+          { "id": "dataset-20260901T120200.000000Z", "source_id": "source-20260901T120000.000000Z", "exchange": "US", "types": ["Common Stock", "ETF"], "resolution": "5m", "from_date": "2020-10-01", "folder": "/srv/eodhd/5m", "include_delisted": false, "created_at": "2026-09-01T12:02:00+00:00", "state": "Partial", "scan": { "scanned_at": "2026-09-11T02:10:44+00:00", "listed": 23765, "on_disk": 18804, "latest_date": "2026-09-10", "current_count": 18790, "bytes": 1080000000000, "error": null } },
+          { "id": "dataset-20260901T120300.000000Z", "source_id": "source-20260901T120000.000000Z", "exchange": "CC", "types": ["Currency"], "resolution": "daily", "from_date": "2015-01-01", "folder": "/srv/eodhd/eod", "include_delisted": true, "created_at": "2026-09-01T12:03:00+00:00", "state": "Current", "scan": { "scanned_at": "2026-09-11T02:10:44+00:00", "listed": 3110, "on_disk": 3102, "latest_date": "2026-09-10", "current_count": 3100, "bytes": 900000000, "error": null } },
+          { "id": "dataset-20260901T120400.000000Z", "source_id": "source-20260901T120000.000000Z", "exchange": "FOREX", "types": ["Currency"], "resolution": "daily", "from_date": "2000-01-01", "folder": "/srv/eodhd/eod", "include_delisted": true, "created_at": "2026-09-01T12:04:00+00:00", "state": "Current", "scan": { "scanned_at": "2026-09-11T02:10:44+00:00", "listed": 150, "on_disk": 150, "latest_date": "2026-09-10", "current_count": 150, "bytes": 100000000, "error": null } },
+          { "id": "dataset-20260901T120500.000000Z", "source_id": "source-20260901T120000.000000Z", "exchange": "GBOND", "types": ["Government bond"], "resolution": "daily", "from_date": "2000-01-01", "folder": "/srv/eodhd/eod", "include_delisted": true, "created_at": "2026-09-01T12:05:00+00:00", "state": "Current", "scan": { "scanned_at": "2026-09-11T02:10:44+00:00", "listed": 40, "on_disk": 40, "latest_date": "2026-09-10", "current_count": 40, "bytes": 40000000, "error": null } }
+        ],
+        "uncataloged": [ { "folder": "1m", "files": 9, "bytes": 12400000000 } ],
+        "scanned_at": "2026-09-11T02:10:44+00:00",
+        "scanning": false
+      },
+      {
+        "id": "source-20260910T083000.000000Z",
+        "name": "EODHD sandbox",
+        "kind": "eodhd",
+        "root": "/srv/sandbox",
+        "catalog_dir": "/srv/sandbox/catalog",
+        "reserve_pct": 5.0,
+        "usage": null,
+        "root_exists": true,
+        "volume": { "total_bytes": 500000000000, "used_bytes": 120000000000, "free_bytes": 380000000000 },
+        "token_set": true,
+        "token_set_at": "2026-09-10T08:30:00+00:00",
+        "verified_at": "2026-09-11T19:02:12+00:00",
+        "verify_state": "credentials_rejected",
+        "verify_message": "the provider answered 403: api token is not valid",
+        "created_at": "2026-09-10T08:30:00+00:00",
+        "datasets": [],
+        "uncataloged": [ { "folder": "eod", "files": 3, "bytes": 1200000 } ],
+        "scanned_at": "2026-09-11T02:11:02+00:00",
+        "scanning": false
+      }
+    ]
+  },
+  "availability": {
+    "source-20260901T120000.000000Z": {
+      "source_id": "source-20260901T120000.000000Z",
+      "fetched_at": "2026-09-11T02:00:07+00:00",
+      "refreshed_at": "2026-09-11T02:00:07+00:00",
+      "unreachable": null,
+      "exchanges": [
+        { "code": "CC", "name": "Cryptocurrencies", "country": "Unknown", "resolutions": ["daily", "1h", "5m", "1m"], "fetched_at": "2026-09-11T02:00:07+00:00", "listings_fetched_at": "2026-09-11T02:00:07+00:00", "listed": 3110, "types": [ { "type": "Currency", "count": 3110 } ], "delisted_fetched_at": "2026-09-11T02:00:07+00:00", "delisted": 412 },
+        { "code": "FOREX", "name": "FOREX", "country": "Unknown", "resolutions": ["daily", "1h", "5m", "1m"], "fetched_at": "2026-09-11T02:00:07+00:00", "listings_fetched_at": "2026-09-11T02:00:07+00:00", "listed": 150, "types": [ { "type": "Currency", "count": 150 } ], "delisted_fetched_at": null, "delisted": 0 },
+        { "code": "GBOND", "name": "Government Bonds", "country": "Unknown", "resolutions": ["daily", "1h", "5m"], "fetched_at": "2026-09-11T02:00:07+00:00", "listings_fetched_at": "2026-09-11T02:00:07+00:00", "listed": 40, "types": [ { "type": "Government bond", "count": 40 } ], "delisted_fetched_at": null, "delisted": 0 },
+        { "code": "LSE", "name": "London Exchange", "country": "UK", "resolutions": ["daily", "1h", "5m"], "fetched_at": "2026-09-11T02:00:07+00:00", "listings_fetched_at": null, "listed": 0, "types": [], "delisted_fetched_at": null, "delisted": 0 },
+        { "code": "US", "name": "USA Stocks", "country": "USA", "resolutions": ["daily", "1h", "5m", "1m"], "fetched_at": "2026-09-11T02:00:07+00:00", "listings_fetched_at": "2026-09-11T02:00:07+00:00", "listed": 50877, "types": [ { "type": "Common Stock", "count": 17906 }, { "type": "ETF", "count": 5859 }, { "type": "Preferred Stock", "count": 1204 }, { "type": "Fund", "count": 880 }, { "type": "Mutual Fund", "count": 25028 } ], "delisted_fetched_at": "2026-09-11T02:00:07+00:00", "delisted": 31412 }
+      ]
+    },
+    "source-20260910T083000.000000Z": {
+      "source_id": "source-20260910T083000.000000Z",
+      "fetched_at": null,
+      "refreshed_at": "2026-09-11T19:02:12+00:00",
+      "unreachable": "the provider answered 403: api token is not valid",
+      "exchanges": []
+    }
+  },
+  "secret": {
+    "token": "FIXTURE-TOKEN-6c1f0e2a9b3d.NEVER-SHOWN",
+    "secrets_path": "data/ui/secrets/source-20260901T120000.000000Z.token"
+  }
 }

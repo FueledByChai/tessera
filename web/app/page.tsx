@@ -2536,6 +2536,775 @@ function gb(bytes: number) {
   return `${(bytes / 1e3).toFixed(0)} KB`;
 }
 
+// Registered sources (DS-06, decisions 0003, 0013, 0021, 0022): what GET /api/sources and
+// GET /api/sources/{id}/availability serve. No token and no secrets path are in these shapes.
+type SourceUsage = {
+  requests_today: number;
+  daily_limit: number;
+  resets_at: string;
+  checked_at: string;
+  reserve_calls: number;
+  available_calls: number;
+};
+type VolumeFigures = { total_bytes: number; used_bytes: number; free_bytes: number };
+type DatasetScan = {
+  scanned_at: string;
+  listed: number;
+  on_disk: number;
+  latest_date?: string | null;
+  current_count: number;
+  bytes: number;
+  error?: string | null;
+};
+type DatasetRow = {
+  id: string;
+  source_id: string;
+  exchange: string;
+  types: string[];
+  resolution: string;
+  from_date: string;
+  folder: string;
+  include_delisted: boolean;
+  created_at: string;
+  state: string;
+  scan?: DatasetScan | null;
+};
+type UncatalogedFolder = { folder: string; files: number; bytes: number };
+type SourceCard = {
+  id: string;
+  name: string;
+  kind: string;
+  root: string;
+  catalog_dir: string;
+  reserve_pct: number;
+  usage?: SourceUsage | null;
+  root_exists: boolean;
+  volume?: VolumeFigures | null;
+  token_set: boolean;
+  token_set_at?: string | null;
+  verified_at?: string | null;
+  verify_state: string;
+  verify_message?: string | null;
+  created_at: string;
+  datasets: DatasetRow[];
+  uncataloged: UncatalogedFolder[];
+  scanned_at?: string | null;
+  scanning: boolean;
+};
+type SourcesResponse = { kinds: string[]; sources: SourceCard[] };
+type TypeCount = { type: string; count: number };
+type AvailableExchange = {
+  code: string;
+  name: string;
+  country: string;
+  resolutions: string[];
+  fetched_at: string;
+  listings_fetched_at?: string | null;
+  listed: number;
+  types: TypeCount[];
+  delisted_fetched_at?: string | null;
+  delisted: number;
+};
+type AvailabilityResponse = {
+  source_id: string;
+  fetched_at?: string | null;
+  refreshed_at?: string | null;
+  unreachable?: string | null;
+  exchanges: AvailableExchange[];
+};
+
+/** The service stamps every time in UTC (RFC 3339); the cards show them as such. */
+function utcParts(iso?: string | null) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  const two = (n: number) => String(n).padStart(2, "0");
+  return {
+    date: `${date.getUTCFullYear()}-${two(date.getUTCMonth() + 1)}-${two(date.getUTCDate())}`,
+    day: `${two(date.getUTCMonth() + 1)}-${two(date.getUTCDate())}`,
+    clock: `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}`,
+  };
+}
+/** "MM-DD HH:MM", the wireframes' short stamp. */
+const stampUtc = (iso?: string | null) => {
+  const parts = utcParts(iso);
+  return parts ? `${parts.day} ${parts.clock}` : "—";
+};
+/** "HH:MM". */
+const clockUtc = (iso?: string | null) => utcParts(iso)?.clock ?? "—";
+/** "YYYY-MM-DD HH:MM UTC", a date and time rather than the raw ISO string. */
+const dateTimeUtc = (iso?: string | null) => {
+  const parts = utcParts(iso);
+  return parts ? `${parts.date} ${parts.clock} UTC` : (iso ?? "unknown");
+};
+/** "MM-DD" of a date. */
+const shortDate = (date?: string | null) => (date && /^\d{4}-\d{2}-\d{2}/.test(date) ? date.slice(5, 10) : "—");
+const tb = (bytes: number) => `${(bytes / 1e12).toFixed(2)} TB`;
+const sizeOf = (bytes: number) => (bytes >= 1e12 ? tb(bytes) : bytes >= 1e10 ? `${(bytes / 1e9).toFixed(1)} GB` : gb(bytes));
+const count = (n: number) => n.toLocaleString("en-US");
+const resolutionLabel = (resolution: string) => (resolution === "daily" ? "EOD" : resolution);
+/** The dataset's default folder under the root: `eod` for daily bars, else the resolution's name. */
+const defaultDatasetFolder = (root: string, resolution: string) => `${root.replace(/\/+$/, "")}/${resolution === "daily" ? "eod" : resolution}`;
+/** A folder relative to the source's root, with a trailing slash; the full path when it is elsewhere. */
+function folderLabel(folder: string, root: string) {
+  const base = root.replace(/\/+$/, "");
+  if (folder === base) return "./";
+  if (folder.startsWith(`${base}/`)) return `${folder.slice(base.length + 1)}/`;
+  return folder;
+}
+const VERIFY_LABELS: Record<string, string> = {
+  connected: "Connected",
+  credentials_rejected: "Credentials rejected",
+  unreachable: "Unreachable",
+};
+/** The root the configured library sits under (its daily feed's parent), for the first source to adopt (BT-1201). */
+function libraryRoot(library: DataSources | null) {
+  const feed = library?.csv_library.feeds.find((f) => f.feed === "daily") ?? library?.csv_library.feeds[0];
+  if (!feed?.path) return "";
+  const cut = feed.path.replace(/\/+$/, "").lastIndexOf("/");
+  return cut > 0 ? feed.path.slice(0, cut) : "";
+}
+
+/** The API's `{ error }` body, or the status line. */
+async function apiFailure(response: Response) {
+  try {
+    const body = await response.json();
+    if (body && typeof body.error === "string") return body.error;
+  } catch {
+    // no JSON body
+  }
+  return `${response.status} ${response.statusText}`;
+}
+
+/** The reserve on a card: edited in place, saved on blur or Enter when changed (decision 0022). */
+function ReserveField({ value, busy, onSave }: { value: number; busy: boolean; onSave: (pct: number) => void }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => setText(String(value)), [value]);
+  const commit = () => {
+    const next = Number(text);
+    if (!Number.isFinite(next) || next < 0 || next > 100) {
+      setText(String(value));
+      return;
+    }
+    if (next !== value) onSave(next);
+  };
+  return (
+    <form
+      className="field-grid reserve-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        commit();
+      }}
+    >
+      <label className="numeric reserve-field">
+        <span>reserve %</span>
+        <input type="number" name="reserve_pct" min={0} max={100} step={0.5} value={text} disabled={busy} onChange={(e) => setText(e.target.value)} onBlur={commit} />
+      </label>
+    </form>
+  );
+}
+
+/** Add dataset, inline on the card (BT-1203): the exchange from the cached list, the types as
+ *  checkboxes from that exchange's listing, the resolution from what the provider offers there. */
+function DatasetForm({
+  source,
+  availability,
+  busy,
+  onFetchListing,
+  onSave,
+  onCancel,
+}: {
+  source: SourceCard;
+  availability: AvailabilityResponse | null;
+  busy: boolean;
+  onFetchListing: (exchange: string) => void;
+  onSave: (request: Record<string, unknown>) => Promise<boolean>;
+  onCancel: () => void;
+}) {
+  const exchanges = [...(availability?.exchanges ?? [])].sort((a, b) => a.code.localeCompare(b.code));
+  const [exchange, setExchange] = useState("");
+  const [types, setTypes] = useState<string[]>([]);
+  const [resolution, setResolution] = useState("daily");
+  const [fromDate, setFromDate] = useState("2000-01-01");
+  const [folder, setFolder] = useState(defaultDatasetFolder(source.root, "daily"));
+  const [folderEdited, setFolderEdited] = useState(false);
+  const [delisted, setDelisted] = useState(true);
+  const [delistedEdited, setDelistedEdited] = useState(false);
+  const [error, setError] = useState("");
+  const chosen = exchanges.find((e) => e.code === exchange) ?? null;
+  const offered = chosen?.resolutions ?? [];
+  const chooseResolution = (next: string) => {
+    setResolution(next);
+    if (!folderEdited) setFolder(defaultDatasetFolder(source.root, next));
+    if (!delistedEdited) setDelisted(next === "daily");
+  };
+  const chooseExchange = (code: string) => {
+    setExchange(code);
+    setTypes([]);
+    const next = exchanges.find((e) => e.code === code);
+    if (next && !next.resolutions.includes(resolution)) chooseResolution(next.resolutions[0] ?? "daily");
+  };
+  return (
+    <form
+      className="field-grid dataset-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        setError("");
+        if (!chosen) {
+          setError("choose an exchange");
+          return;
+        }
+        if (!types.length) {
+          setError("tick at least one type");
+          return;
+        }
+        void onSave({ exchange, types, resolution, from_date: fromDate, folder: folder.trim(), include_delisted: delisted }).then((ok) => {
+          if (!ok) setError("the service refused the dataset; see the card");
+        });
+      }}
+    >
+      <label>
+        <span>Exchange</span>
+        <select name="exchange" value={exchange} onChange={(e) => chooseExchange(e.target.value)}>
+          <option value="">choose…</option>
+          {exchanges.map((e) => (
+            <option key={e.code} value={e.code}>{e.code} · {e.name}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>Resolution</span>
+        <select name="resolution" value={resolution} onChange={(e) => chooseResolution(e.target.value)} disabled={!chosen}>
+          {(offered.length ? offered : ["daily"]).map((r) => (
+            <option key={r} value={r}>{resolutionLabel(r)}</option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>From</span>
+        <input type="date" name="from_date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} required />
+      </label>
+      <label className="dataset-folder-field">
+        <span>Folder</span>
+        <input
+          name="folder"
+          value={folder}
+          spellCheck={false}
+          onChange={(e) => {
+            setFolder(e.target.value);
+            setFolderEdited(true);
+          }}
+        />
+      </label>
+      <label className="toggle-label">
+        <input
+          type="checkbox"
+          name="include_delisted"
+          checked={delisted}
+          onChange={(e) => {
+            setDelisted(e.target.checked);
+            setDelistedEdited(true);
+          }}
+        />
+        <span>Include delisted</span>
+      </label>
+      <fieldset className="dataset-types">
+        <legend>Types{chosen ? ` on ${chosen.code}` : ""}</legend>
+        {!chosen && <small>choose an exchange first</small>}
+        {chosen && !chosen.listings_fetched_at && (
+          <small>
+            the listing of {chosen.code} is not cached yet ·{" "}
+            <button type="button" className="text-action" disabled={busy} onClick={() => onFetchListing(chosen.code)}>fetch it</button>
+          </small>
+        )}
+        {chosen?.types.map((t) => (
+          <label key={t.type} className="toggle-label">
+            <input
+              type="checkbox"
+              name="types"
+              value={t.type}
+              checked={types.includes(t.type)}
+              onChange={(e) => setTypes((current) => (e.target.checked ? [...current, t.type] : current.filter((x) => x !== t.type)))}
+            />
+            <span>{t.type} <em>{count(t.count)}</em></span>
+          </label>
+        ))}
+      </fieldset>
+      <div className="form-actions">
+        <button type="submit" className="secondary-action" disabled={busy}>Save dataset</button>
+        <button type="button" className="text-action" onClick={onCancel}>Cancel</button>
+        {error && <span className="negative-text">{error}</span>}
+      </div>
+    </form>
+  );
+}
+
+/** One registered source (BT-1201 to BT-1204): header, connection state, credits, datasets,
+ *  Uncataloged, with Replace token and Add dataset as inline forms. The token field is a
+ *  password input, cleared after the save and gone from the DOM. */
+function SourceCardView({
+  source,
+  availability,
+  busy,
+  onReplaceToken,
+  onReserve,
+  onVerify,
+  onScan,
+  onRemove,
+  onFetchListing,
+  onCreateDataset,
+  onDeleteDataset,
+}: {
+  source: SourceCard;
+  availability: AvailabilityResponse | null;
+  busy: boolean;
+  onReplaceToken: (token: string) => Promise<boolean>;
+  onReserve: (pct: number) => void;
+  onVerify: () => void;
+  onScan: () => void;
+  onRemove: () => void;
+  onFetchListing: (exchange: string) => void;
+  onCreateDataset: (request: Record<string, unknown>) => Promise<boolean>;
+  onDeleteDataset: (id: string) => void;
+}) {
+  const [replacing, setReplacing] = useState(false);
+  const [token, setToken] = useState("");
+  const [adding, setAdding] = useState(false);
+  const stateLabel = VERIFY_LABELS[source.verify_state] ?? source.verify_state;
+  const stateClass = source.verify_state === "connected" ? "connected" : source.verify_state === "credentials_rejected" ? "rejected" : "unreachable";
+  const usage = source.usage;
+  const uncataloged = source.uncataloged.map((f) => `${f.folder}/ ${count(f.files)} files ${sizeOf(f.bytes)}`);
+  return (
+    <article className="source-card" data-source-id={source.id}>
+      <div className="source-card-head">
+        <strong>{source.name}</strong>
+        <em>{source.kind}</em>
+        <span className="source-path">{source.root}</span>
+        <span className="source-token">
+          {source.token_set ? `token set, verified ${stampUtc(source.verified_at)}` : "no token on file · enter it again"}
+        </span>
+        <span className="source-actions">
+          <button type="button" className="text-action replace-token-toggle" disabled={busy} onClick={() => setReplacing((v) => !v)}>
+            {replacing ? "Keep token" : source.token_set ? "Replace token" : "Set token"}
+          </button>
+          <button type="button" className="text-action" disabled={busy || !source.token_set} onClick={onVerify}>Verify</button>
+          <button type="button" className="text-action rescan-source" disabled={busy || source.scanning} onClick={onScan}>
+            {source.scanning ? "Scanning…" : "Rescan"}
+          </button>
+          <button type="button" className="text-action" disabled={busy} onClick={onRemove}>Remove</button>
+        </span>
+      </div>
+      {replacing && (
+        <form
+          className="field-grid token-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void onReplaceToken(token).then((ok) => {
+              setToken("");
+              if (ok) setReplacing(false);
+            });
+          }}
+        >
+          <label>
+            <span>New API token</span>
+            <input type="password" name="token" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} required />
+          </label>
+          <div className="form-actions">
+            <button type="submit" className="secondary-action" disabled={busy || !token.trim()}>Save token</button>
+            <button
+              type="button"
+              className="text-action"
+              onClick={() => {
+                setToken("");
+                setReplacing(false);
+              }}
+            >
+              Cancel
+            </button>
+            <small>verified with the provider before it is written; the old token stays until then</small>
+          </div>
+        </form>
+      )}
+      <div className={`source-state ${stateClass}`}>
+        <strong>{stateLabel} {clockUtc(source.verified_at)}</strong>
+        {source.verify_message && <span className="source-message">· {source.verify_message}</span>}
+        {source.volume ? (
+          <span>· volume {tb(source.volume.used_bytes)} used, {tb(source.volume.free_bytes)} free of {tb(source.volume.total_bytes)}</span>
+        ) : (
+          <span className="negative-text">· root {source.root_exists ? "volume unknown" : "missing"}</span>
+        )}
+      </div>
+      <div className="source-credits">
+        <span>
+          credits {usage ? `${count(usage.requests_today)} / ${count(usage.daily_limit)} today, resets ${clockUtc(usage.resets_at)} UTC` : "not reported yet"}
+        </span>
+        {usage && <span className="source-note">· {count(usage.available_calls)} above the reserve · checked {stampUtc(usage.checked_at)}</span>}
+        <ReserveField value={source.reserve_pct} busy={busy} onSave={onReserve} />
+      </div>
+      {source.datasets.length ? (
+        <div className="table-wrap">
+          <table className="dataset-table">
+            <thead>
+              <tr>
+                <th>Exchange</th><th>Types</th><th>Res</th><th>From</th><th>Folder</th><th>Listed</th><th>On disk</th><th>Latest</th><th>Current</th><th>Size</th><th>State</th><th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {source.datasets.map((d) => (
+                <tr key={d.id} data-dataset-id={d.id}>
+                  <td>{d.exchange}</td>
+                  <td className="dataset-types-cell">{d.types.join(", ")}</td>
+                  <td>{resolutionLabel(d.resolution)}</td>
+                  <td>{d.from_date}</td>
+                  <td className="dataset-folder" title={d.folder}>{folderLabel(d.folder, source.root)}</td>
+                  <td className="numeric-cell">{d.scan ? count(d.scan.listed) : "—"}</td>
+                  <td className="numeric-cell">{d.scan ? count(d.scan.on_disk) : "—"}</td>
+                  <td>{d.scan ? shortDate(d.scan.latest_date) : "—"}</td>
+                  <td className="numeric-cell">{d.scan ? count(d.scan.current_count) : "—"}</td>
+                  <td className="numeric-cell">{d.scan ? sizeOf(d.scan.bytes) : "—"}</td>
+                  <td className={`dataset-state state-${d.state.toLowerCase()}`} title={d.scan?.error ?? undefined}>{d.state}</td>
+                  <td className="feature-actions">
+                    <button type="button" className="text-action" disabled={busy} onClick={() => onDeleteDataset(d.id)}>remove</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="empty-state dataset-empty">no datasets yet, add one to scan</div>
+      )}
+      <div className="source-uncataloged">
+        <span>
+          <strong>Uncataloged</strong> {uncataloged.length ? uncataloged.join(" · ") : source.scanned_at ? "none" : "not scanned yet"}
+        </span>
+        <span className="source-note">scanned {source.scanning ? "now…" : stampUtc(source.scanned_at)}</span>
+        <button type="button" className="text-action add-dataset-toggle" disabled={busy} onClick={() => setAdding((v) => !v)}>
+          {adding ? "Close" : "Add dataset"}
+        </button>
+      </div>
+      {adding && (
+        <DatasetForm
+          source={source}
+          availability={availability}
+          busy={busy}
+          onFetchListing={onFetchListing}
+          onSave={(request) => onCreateDataset(request).then((ok) => {
+            if (ok) setAdding(false);
+            return ok;
+          })}
+          onCancel={() => setAdding(false)}
+        />
+      )}
+    </article>
+  );
+}
+
+/** The Inventory view's registered sources (DS-06): the source cards with their inline forms,
+ *  then "Available from <source>" (BT-1202). Both read the catalog's records live; nothing
+ *  here restarts the service. */
+function RegisteredSources({ library }: { library: DataSources | null }) {
+  const [data, setData] = useState<SourcesResponse | null>(null);
+  const [availability, setAvailability] = useState<Record<string, AvailabilityResponse>>({});
+  const [availableFor, setAvailableFor] = useState("");
+  const [filter, setFilter] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [sourceForm, setSourceForm] = useState({ kind: "eodhd", name: "", root: "", catalog_dir: "", token: "", reserve_pct: "5" });
+  const [sourceError, setSourceError] = useState("");
+
+  const loadAvailability = useCallback(async (id: string) => {
+    try {
+      const response = await fetch(`${API}/sources/${encodeURIComponent(id)}/availability`, { cache: "no-store" });
+      if (!response.ok) return;
+      const table: AvailabilityResponse = await response.json();
+      if (Array.isArray(table?.exchanges)) setAvailability((current) => ({ ...current, [id]: table }));
+    } catch {
+      // the cached table is shown as it was
+    }
+  }, []);
+  // A service from before the source API answers /api/sources with the console's own page;
+  // that, a refused request, or no service at all shows as a line, never as loading forever.
+  const load = useCallback(async () => {
+    try {
+      const response = await fetch(`${API}/sources`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiFailure(response));
+      const body: SourcesResponse = await response.json();
+      if (!Array.isArray(body?.sources)) throw new Error("no source list in the answer");
+      setData(body);
+      setError("");
+      await Promise.all(body.sources.map((s) => loadAvailability(s.id)));
+    } catch (failure) {
+      setError(`the service did not answer /api/sources (${failure instanceof Error ? failure.message : String(failure)}); an engine from before the source API needs a restart`);
+      setData((current) => current ?? { kinds: [], sources: [] });
+    }
+  }, [loadAvailability]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  // A scan runs in the background: poll while any card says so.
+  const scanning = data?.sources.some((s) => s.scanning) ?? false;
+  useEffect(() => {
+    if (!scanning) return;
+    const timer = window.setInterval(() => void load(), 2000);
+    return () => window.clearInterval(timer);
+  }, [scanning, load]);
+
+  const sources = data?.sources ?? [];
+  const selectedId = sources.some((s) => s.id === availableFor) ? availableFor : (sources.find((s) => s.verify_state === "connected") ?? sources[0])?.id ?? "";
+  const selected = sources.find((s) => s.id === selectedId) ?? null;
+  const table = selected ? (availability[selected.id] ?? null) : null;
+
+  /** Runs `action`, records a failure under the panel, reloads the cards, and says whether it succeeded. */
+  async function act(action: () => Promise<Response>, reload = true) {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await action();
+      if (!response.ok) {
+        setError(await apiFailure(response));
+        return false;
+      }
+      if (reload) await load();
+      return true;
+    } catch (failure) {
+      setError(String(failure));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  const jsonRequest = (method: string, body?: unknown) => ({
+    method,
+    headers: { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const refreshAvailability = async (id: string, exchange?: string) => {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/sources/${encodeURIComponent(id)}/availability/refresh`, jsonRequest("POST", exchange ? { exchange } : {}));
+      if (!response.ok) {
+        setError(await apiFailure(response));
+        return;
+      }
+      const refreshed: AvailabilityResponse = await response.json();
+      setAvailability((current) => ({ ...current, [id]: refreshed }));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const openAddSource = () => {
+    if (!adding) {
+      const root = libraryRoot(library);
+      const covered = sources.some((s) => s.root.replace(/\/+$/, "") === root);
+      setSourceForm({
+        kind: data?.kinds[0] ?? "eodhd",
+        name: "",
+        root: covered ? "" : root,
+        catalog_dir: covered ? "" : (library?.csv_library.catalog.path ?? ""),
+        token: "",
+        reserve_pct: "5",
+      });
+      setSourceError("");
+    }
+    setAdding((v) => !v);
+  };
+
+  const filtered = (table?.exchanges ?? [])
+    .filter((e) => {
+      const needle = filter.trim().toLowerCase();
+      return !needle || e.code.toLowerCase().includes(needle) || e.name.toLowerCase().includes(needle);
+    })
+    .map((e) => ({ exchange: e, here: selected?.datasets.filter((d) => d.exchange === e.code).length ?? 0 }))
+    .sort((a, b) => Number(b.here > 0) - Number(a.here > 0) || b.here - a.here || a.exchange.code.localeCompare(b.exchange.code));
+
+  return (
+    <>
+      <section className="panel data-sources-panel">
+        <div className="terminal-panel-title">
+          <span>SRC</span> DATA SOURCES
+          <small>{data ? `${sources.length} registered` : "loading…"}</small>
+          <button type="button" className="text-action source-filter add-source-toggle" disabled={busy || !data?.kinds.length} onClick={openAddSource}>
+            {adding ? "Close" : "Add source"}
+          </button>
+          <button
+            type="button"
+            className="text-action source-filter rescan-all"
+            disabled={busy || !sources.length || scanning}
+            onClick={() => void act(async () => {
+              let last: Response = new Response(null, { status: 200 });
+              for (const s of sources) last = await fetch(`${API}/sources/${encodeURIComponent(s.id)}/scan`, jsonRequest("POST"));
+              return last;
+            })}
+          >
+            Rescan
+          </button>
+        </div>
+        {error && <p className="negative-text source-error">{error}</p>}
+        {!data && <div className="source-loading">Loading registered sources…</div>}
+        {data && !sources.length && !adding && (
+          <div className="empty-state">
+            No data source registered yet. Add source registers a provider account from here, no restart; the first EODHD source adopts the configured library in place.
+          </div>
+        )}
+        {sources.map((source) => (
+          <SourceCardView
+            key={source.id}
+            source={source}
+            availability={availability[source.id] ?? null}
+            busy={busy}
+            onReplaceToken={(token) => act(() => fetch(`${API}/sources/${encodeURIComponent(source.id)}/token`, jsonRequest("PUT", { token })))}
+            onReserve={(pct) => void act(() => fetch(`${API}/sources/${encodeURIComponent(source.id)}`, jsonRequest("PUT", { reserve_pct: pct })))}
+            onVerify={() => void act(() => fetch(`${API}/sources/${encodeURIComponent(source.id)}/verify`, jsonRequest("POST")))}
+            onScan={() => void act(() => fetch(`${API}/sources/${encodeURIComponent(source.id)}/scan`, jsonRequest("POST")))}
+            onRemove={() => {
+              if (window.confirm(`Remove the source ${source.name}? Its record and token file go; data files are never deleted.`)) {
+                void act(() => fetch(`${API}/sources/${encodeURIComponent(source.id)}`, { method: "DELETE" }));
+              }
+            }}
+            onFetchListing={(exchange) => void refreshAvailability(source.id, exchange)}
+            onCreateDataset={(request) => act(() => fetch(`${API}/sources/${encodeURIComponent(source.id)}/datasets`, jsonRequest("POST", request)))}
+            onDeleteDataset={(id) => void act(() => fetch(`${API}/datasets/${encodeURIComponent(id)}`, { method: "DELETE" }))}
+          />
+        ))}
+        {adding && data && (
+          <form
+            className="field-grid source-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setSourceError("");
+              const request = {
+                kind: sourceForm.kind,
+                name: sourceForm.name.trim(),
+                root: sourceForm.root.trim(),
+                catalog_dir: sourceForm.catalog_dir.trim(),
+                token: sourceForm.token.trim(),
+                reserve_pct: Number(sourceForm.reserve_pct) || 5,
+              };
+              void act(() => fetch(`${API}/sources`, jsonRequest("POST", request))).then((ok) => {
+                setSourceForm((current) => ({ ...current, token: "" }));
+                if (ok) setAdding(false);
+                else setSourceError("nothing was saved");
+              });
+            }}
+          >
+            <label>
+              <span>Kind</span>
+              <select name="kind" value={sourceForm.kind} onChange={(e) => setSourceForm((c) => ({ ...c, kind: e.target.value }))}>
+                {data.kinds.map((k) => (
+                  <option key={k} value={k}>{k}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Name</span>
+              <input name="name" value={sourceForm.name} required placeholder="EODHD" onChange={(e) => setSourceForm((c) => ({ ...c, name: e.target.value }))} />
+            </label>
+            <label className="source-root-field">
+              <span>Library root</span>
+              <input name="root" value={sourceForm.root} required spellCheck={false} placeholder="/Volumes/data/eodhd" onChange={(e) => setSourceForm((c) => ({ ...c, root: e.target.value }))} />
+            </label>
+            <label className="source-root-field">
+              <span>Catalog folder</span>
+              <input name="catalog_dir" value={sourceForm.catalog_dir} required spellCheck={false} placeholder="/Volumes/data/eodhd/catalog" onChange={(e) => setSourceForm((c) => ({ ...c, catalog_dir: e.target.value }))} />
+            </label>
+            <label>
+              <span>API token</span>
+              <input type="password" name="token" autoComplete="off" value={sourceForm.token} required onChange={(e) => setSourceForm((c) => ({ ...c, token: e.target.value }))} />
+            </label>
+            <label className="numeric">
+              <span>Reserve %</span>
+              <input type="number" name="reserve_pct" min={0} max={100} step={0.5} value={sourceForm.reserve_pct} onChange={(e) => setSourceForm((c) => ({ ...c, reserve_pct: e.target.value }))} />
+            </label>
+            <div className="form-actions">
+              <button type="submit" className="secondary-action" disabled={busy}>Save source</button>
+              <button type="button" className="text-action" onClick={() => setAdding(false)}>Cancel</button>
+              <small>the token is verified with the provider and written to a file only the service reads; a rejected token saves nothing</small>
+              {sourceError && <span className="negative-text">{sourceError}</span>}
+            </div>
+          </form>
+        )}
+      </section>
+      <section className="panel availability-panel">
+        <div className="terminal-panel-title">
+          <span>AVL</span> AVAILABLE FROM {selected ? selected.name.toUpperCase() : "—"}
+          <small>{table?.fetched_at ? `listed ${stampUtc(table.fetched_at)}` : selected ? "not listed yet" : ""}</small>
+          {sources.length > 1 && (
+            <select value={selectedId} onChange={(e) => setAvailableFor(e.target.value)} aria-label="Source">
+              {sources.map((s) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+          )}
+          <button type="button" className="text-action source-filter" disabled={busy || !selected} onClick={() => selected && void refreshAvailability(selected.id)}>
+            Refresh
+          </button>
+        </div>
+        {table?.unreachable && (
+          <p className="availability-note negative-text">
+            Unreachable {stampUtc(table.refreshed_at)} · {table.unreachable}
+            {table.fetched_at ? ` · the rows are the ones listed ${stampUtc(table.fetched_at)}` : ""}
+          </p>
+        )}
+        {selected && (
+          <label className="instrument-search availability-filter">
+            <span>⌕</span>
+            <input value={filter} placeholder="filter by code or name" spellCheck={false} onChange={(e) => setFilter(e.target.value)} />
+          </label>
+        )}
+        {!selected && <div className="empty-state">Register a source to see what its provider offers.</div>}
+        {selected && !filtered.length && (
+          <div className="empty-state">
+            {table?.exchanges.length ? "No exchange matches the filter." : "Nothing listed yet: Refresh asks the provider for its exchanges."}
+          </div>
+        )}
+        {selected && filtered.length > 0 && (
+          <div className="table-wrap">
+            <table className="availability-table">
+              <thead>
+                <tr><th>Exchange</th><th>Name</th><th>Country</th><th>Types (listed)</th><th>Res</th><th>Here</th></tr>
+              </thead>
+              <tbody>
+                {filtered.map(({ exchange, here }) => {
+                  const shown = exchange.types.slice(0, 2).map((t) => `${t.type} ${count(t.count)}`);
+                  const more = exchange.types.length - shown.length;
+                  return (
+                    <tr key={exchange.code} data-exchange={exchange.code}>
+                      <td><strong>{exchange.code}</strong></td>
+                      <td>{exchange.name}</td>
+                      <td>{exchange.country}</td>
+                      <td className="availability-types" title={exchange.types.map((t) => `${t.type} ${count(t.count)}`).join(" · ")}>
+                        {exchange.listings_fetched_at ? (
+                          <>
+                            {shown.join(" · ")}
+                            {more > 0 ? ` · +${more}` : ""}
+                            {exchange.delisted_fetched_at ? <span className="source-note"> · delisted {count(exchange.delisted)}</span> : null}
+                          </>
+                        ) : (
+                          <>
+                            <span className="source-note">not listed</span>{" "}
+                            <button type="button" className="text-action fetch-listing" title={`fetch the listing of ${exchange.code}`} disabled={busy} onClick={() => void refreshAvailability(selected.id, exchange.code)}>
+                              +
+                            </button>
+                          </>
+                        )}
+                      </td>
+                      <td>{exchange.resolutions.map(resolutionLabel).join(" ")}</td>
+                      <td className="numeric-cell">{here || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
 const LOCAL_TOML_TEMPLATE = `[data]
 daily_dir = "/path/to/eod"            # <SYMBOL>.csv  Date,Open,High,Low,Close,Adjusted_close,Volume
 five_minute_dir = "/path/to/5m"       # <SYMBOL>.csv  Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume
@@ -2555,9 +3324,9 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
   const [showConfig, setShowConfig] = useState(false);
   if (!sources) {
     return (
-      <section className="panel data-sources-panel">
-        <div className="terminal-panel-title"><span>SRC</span> DATA SOURCES</div>
-        <div className="empty-state">Scanning configured sources…</div>
+      <section className="panel data-library-feeds">
+        <div className="terminal-panel-title"><span>CFG</span> CONFIGURED LIBRARY</div>
+        <div className="empty-state">Scanning the configured library…</div>
       </section>
     );
   }
@@ -2566,10 +3335,10 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
   const csvTotal = csv.feeds.reduce((sum, f) => sum + f.bytes, 0);
   return (
     <>
-      <section className="panel data-sources-panel">
+      <section className="panel data-library-feeds">
         <div className="terminal-panel-title">
-          <span>SRC</span> DATA SOURCES
-          <small>scanned {sources.generated_at.slice(0, 19).replace("T", " ")} UTC</small>
+          <span>CFG</span> CONFIGURED LIBRARY
+          <small>local.toml · scanned {sources.generated_at.slice(0, 19).replace("T", " ")} UTC</small>
           <button type="button" className="text-action source-filter" disabled={busy} onClick={onRefresh}>Rescan</button>
           <button type="button" className="text-action source-filter" onClick={() => setShowConfig((v) => !v)}>
             {showConfig ? "Hide configuration" : "Configure sources"}
@@ -2651,8 +3420,8 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
         </div>
       </section>
       {showConfig && (
-        <section className="panel data-sources-panel">
-          <div className="terminal-panel-title"><span>CFG</span> CONFIGURING SOURCES</div>
+        <section className="panel data-library-feeds">
+          <div className="terminal-panel-title"><span>CFG</span> CONFIGURING THE LIBRARY</div>
           <div className="source-config-grid">
             <div>
               <h3>Two source types</h3>
@@ -2934,6 +3703,7 @@ function DataWorkspace({
       </nav>
       {view === "inventory" && (
         <>
+          <RegisteredSources library={sources} />
           <DataSourcesPanel sources={sources} busy={busy} onRefresh={onRescan} />
           <section className="panel data-library-panel">
             <div className="terminal-panel-title"><span>LIB</span> DATA LIBRARY</div>
@@ -2950,7 +3720,7 @@ function DataWorkspace({
               />
               <Metric
                 label="Updated"
-                value={status?.updated_at_utc ?? "unknown"}
+                value={dateTimeUtc(status?.updated_at_utc)}
                 note="from the freshness file when configured"
               />
               <Metric
