@@ -4327,6 +4327,38 @@ nav {
 .app-shell .availability-panel .availability-filter { order: 0; margin: 0 12px; max-width: 420px; }
 .availability-panel .empty-state { margin: 0 12px; }
 .availability-panel .table-wrap { margin: 0; }
+/* Updates & schedules (DS-10, BT-1207; decisions 0001, 0014): the jobs table over the
+   schedules table, the seven outcomes as marks, the log opening in a row under its job, and
+   Add schedule as an inline field grid (the sizing block sizes its controls). */
+.dataset-jobs-panel, .dataset-schedules-panel { display: flex; flex-direction: column; gap: 12px; padding-bottom: 12px; }
+.dataset-jobs-panel .terminal-panel-title small, .dataset-schedules-panel .terminal-panel-title small { margin-left: 10px; opacity: 0.8; }
+.dataset-schedules-panel .terminal-panel-title .add-schedule-toggle { margin-left: auto; }
+.dataset-jobs-panel .table-wrap, .dataset-schedules-panel .table-wrap { margin: 0; }
+.dataset-jobs-panel .empty-state, .dataset-schedules-panel .empty-state, .dataset-jobs-panel .source-error { margin: 0 12px; }
+.dataset-jobs-table th, .dataset-jobs-table td, .dataset-schedules-table th, .dataset-schedules-table td { text-align: left; white-space: nowrap; }
+.dataset-jobs-table td.numeric-cell, .dataset-jobs-table th:nth-child(n + 5):nth-child(-n + 7) { text-align: right; }
+.dataset-jobs-table td.job-dataset, .dataset-schedules-table td.schedule-dataset { color: var(--accent, #f89828); }
+.dataset-jobs-table td.job-error { white-space: normal; min-width: 120px; max-width: 320px; overflow-wrap: anywhere; color: #e03040; }
+.dataset-jobs-table td.state-queued, .dataset-jobs-table td.state-running { color: var(--accent, #f89828); }
+.dataset-jobs-table td.state-complete { color: #32c832; }
+.dataset-jobs-table td.state-failed { color: #e03040; }
+.dataset-jobs-table td.feature-actions, .dataset-schedules-table td.feature-actions { text-align: right; white-space: nowrap; }
+.dataset-schedules-table td.feature-actions .text-action + .text-action { margin-left: 14px; }
+.dataset-jobs-table tr.job-log-row td { white-space: normal; }
+.dataset-jobs-table tr.job-log-row pre { margin: 0; max-height: 320px; overflow: auto; font-size: 13px; line-height: 1.3; white-space: pre-wrap; }
+.dataset-schedules-table td.schedule-on { color: #32c832; }
+.dataset-schedules-table td.schedule-off { color: var(--text-muted, #b8b8b8); }
+.dataset-schedules-table td.schedule-status { white-space: normal; max-width: 300px; overflow-wrap: anywhere; }
+.dataset-schedules-table td.run-marks { letter-spacing: 0.18em; font-weight: 700; }
+.dataset-schedules-table .run-marks i { font-style: normal; }
+.dataset-schedules-table .run-marks .mark-complete { color: #32c832; }
+.dataset-schedules-table .run-marks .mark-failed { color: #e03040; }
+.dataset-schedules-table .run-marks .mark-skipped, .dataset-schedules-table .run-marks .mark-running { color: var(--accent, #f89828); }
+.dataset-schedules-table .run-marks .mark-none, .dataset-schedules-table .run-marks .mark-other { color: var(--text-muted, #b8b8b8); }
+.schedule-form { margin: 0 12px; padding: 12px; border: 1px dashed var(--line, #414141); }
+.schedule-form > .schedule-dataset-field { grid-column: span 4; }
+.schedule-form > .form-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.schedule-form > .form-actions small { color: var(--text-muted, #b8b8b8); font-size: 12px; }
 /* Under 1500 px the two new tables go dense like the others; these selectors carry three
    classes so they outrank the terminal theme's `.app-shell[data-theme] .table-wrap th`. */
 @media (max-width: 1500px) {
@@ -4339,6 +4371,10 @@ nav {
   .app-shell .data-updates-panel th, .app-shell .data-updates-panel td,
   .app-shell .table-wrap .dataset-table th, .app-shell .table-wrap .dataset-table td,
   .app-shell .table-wrap .availability-table th, .app-shell .table-wrap .availability-table td { padding: 5px 7px; }
+  .app-shell .table-wrap .dataset-jobs-table, .app-shell .table-wrap .dataset-schedules-table { font-size: 15px; line-height: 1.25; }
+  .app-shell .table-wrap .dataset-jobs-table th, .app-shell .table-wrap .dataset-schedules-table th { font-size: 13px; letter-spacing: 0.04em; }
+  .app-shell .table-wrap .dataset-jobs-table th, .app-shell .table-wrap .dataset-jobs-table td,
+  .app-shell .table-wrap .dataset-schedules-table th, .app-shell .table-wrap .dataset-schedules-table td { padding: 5px 7px; }
   .app-shell .instrument-table td.instrument-name { max-width: 240px; }
   .app-shell .source-card { padding: 8px; }
   .app-shell .source-card-head, .app-shell .source-state, .app-shell .source-credits, .app-shell .source-uncataloged { font-size: 13px; }

@@ -285,9 +285,32 @@ struct AutomationScheduleRecord {
     local_time: String,
     weekdays: String,
     last_run_date: Option<String>,
+    /// The newest run's status; for a run that queued a job, the job's outcome once it has
+    /// one (`complete`, `failed: <error>`), else what was recorded when the run happened.
     last_status: Option<String>,
     created_at: String,
+    /// The dataset a `dataset_update` schedule queues the job for (DS-10, decision 0001).
+    dataset_id: Option<String>,
+    /// That dataset's label (`US EOD`); `None` for other kinds and for a removed dataset.
+    dataset: Option<String>,
+    /// The last seven outcomes, oldest first: the marks the console shows.
+    runs: Vec<AutomationRunRecord>,
 }
+
+/// One outcome of a schedule (`automation_runs`): when it ran, what came of it, and the job
+/// it queued when it queued one.
+#[derive(Debug, Clone, Serialize)]
+struct AutomationRunRecord {
+    ran_at: String,
+    status: String,
+    job_id: Option<String>,
+}
+
+/// The kind of schedule that queues a dataset's download job (DS-10).
+const AUTOMATION_KIND_DATASET_UPDATE: &str = "dataset_update";
+
+/// How many outcomes a schedule serves as marks.
+const AUTOMATION_RUNS_SERVED: usize = 7;
 
 #[derive(Debug, Clone, Serialize)]
 struct StrategySourceFile {
@@ -371,6 +394,8 @@ struct ReleaseStrategyDraftRequest {
 
 #[derive(Debug, Deserialize)]
 struct CreateAutomationScheduleRequest {
+    /// Optional for a `dataset_update` schedule, which is named after its dataset.
+    #[serde(default)]
     name: String,
     kind: String,
     local_time: String,
@@ -378,6 +403,9 @@ struct CreateAutomationScheduleRequest {
     weekdays: String,
     #[serde(default)]
     enabled: bool,
+    /// The dataset a `dataset_update` schedule updates; required for that kind.
+    #[serde(default)]
+    dataset_id: Option<String>,
 }
 
 fn default_weekdays() -> String {
@@ -780,6 +808,7 @@ fn api_router() -> Router<AppState> {
         .route("/api/sources/{id}/scan", post(scan_source))
         .route("/api/datasets/{id}", delete(delete_dataset))
         .route("/api/datasets/{id}/update", post(start_dataset_update))
+        .route("/api/datasets/jobs", get(list_dataset_jobs))
         .route("/api/datasets/jobs/{id}", get(get_dataset_job))
         .route("/api/datasets/jobs/{id}/log", get(get_dataset_job_log))
 }
@@ -1080,8 +1109,19 @@ fn migrate(connection: &Connection) -> Result<()> {
              log_path TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_dataset_jobs_dataset_created
-         ON dataset_jobs(dataset_id, created_at DESC);",
+         ON dataset_jobs(dataset_id, created_at DESC);
+         CREATE TABLE IF NOT EXISTS automation_runs (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             schedule_id TEXT NOT NULL REFERENCES automation_schedules(id) ON DELETE CASCADE,
+             ran_at TEXT NOT NULL,
+             status TEXT NOT NULL,
+             job_id TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_automation_runs_schedule
+         ON automation_runs(schedule_id, ran_at DESC, id DESC);",
     )?;
+    // DS-10: the dataset a `dataset_update` schedule queues the job for.
+    ensure_column(connection, "automation_schedules", "dataset_id", "TEXT")?;
     ensure_column(
         connection,
         "jobs",
@@ -1426,13 +1466,27 @@ fn validate_profile_compatibility(strategy_id: &str, _profile: &CostProfileRecor
 }
 
 fn validate_automation_request(request: &CreateAutomationScheduleRequest) -> Result<()> {
+    let dataset_kind = request.kind == AUTOMATION_KIND_DATASET_UPDATE;
     anyhow::ensure!(
-        !request.name.trim().is_empty() && request.name.trim().len() <= 100,
+        (dataset_kind && request.name.trim().is_empty()) || !request.name.trim().is_empty(),
         "automation name must contain 1 to 100 characters"
     );
     anyhow::ensure!(
-        ["data_update", "watchlist"].contains(&request.kind.as_str()),
+        request.name.trim().len() <= 100,
+        "automation name must contain 1 to 100 characters"
+    );
+    anyhow::ensure!(
+        ["data_update", "watchlist", AUTOMATION_KIND_DATASET_UPDATE]
+            .contains(&request.kind.as_str()),
         "unsupported automation kind"
+    );
+    anyhow::ensure!(
+        !dataset_kind
+            || request
+                .dataset_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty()),
+        "a dataset_update schedule names the dataset it updates (dataset_id)"
     );
     NaiveTime::parse_from_str(&request.local_time, "%H:%M").context("local_time must use HH:MM")?;
     let allowed = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
@@ -1443,6 +1497,9 @@ fn validate_automation_request(request: &CreateAutomationScheduleRequest) -> Res
     );
     Ok(())
 }
+
+const AUTOMATION_COLUMNS: &str = "id, name, kind, enabled, local_time, weekdays, last_run_date, \
+     last_status, created_at, dataset_id";
 
 fn map_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationScheduleRecord> {
     Ok(AutomationScheduleRecord {
@@ -1455,27 +1512,102 @@ fn map_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationSchedul
         last_run_date: row.get(6)?,
         last_status: row.get(7)?,
         created_at: row.get(8)?,
+        dataset_id: row.get(9)?,
+        dataset: None,
+        runs: Vec::new(),
     })
+}
+
+/// The label a dataset goes by on the schedules and updates tables: `US EOD`, `US 5m`.
+fn dataset_label(exchange: &str, resolution: &str) -> String {
+    let resolution = if resolution == "daily" {
+        "EOD"
+    } else {
+        resolution
+    };
+    format!("{exchange} {resolution}")
+}
+
+/// A run's status as the console shows it: a run that queued a job takes the job's outcome
+/// once it has one (`complete`, `failed: <error>`); until then, and for a run that queued
+/// none, the status recorded when it ran (`queued job-...`, `skipped: job ... running`).
+fn resolved_run_status(recorded: &str, job: Option<(&str, Option<&str>)>) -> String {
+    match job {
+        Some(("Complete", _)) => "complete".to_owned(),
+        Some(("Failed", error)) => format!("failed: {}", error.unwrap_or("no reason recorded")),
+        _ => recorded.to_owned(),
+    }
+}
+
+/// Fills in each schedule's dataset label and its last seven runs, oldest first, and lets
+/// the newest run's resolved status stand as `last_status`.
+fn attach_automation_runs(
+    connection: &Connection,
+    schedules: &mut [AutomationScheduleRecord],
+) -> Result<()> {
+    let mut runs_statement = connection.prepare(
+        "SELECT r.ran_at, r.status, r.job_id, j.state, j.error
+         FROM automation_runs r LEFT JOIN dataset_jobs j ON j.id = r.job_id
+         WHERE r.schedule_id = ?1 ORDER BY r.ran_at DESC, r.id DESC LIMIT ?2",
+    )?;
+    let mut label_statement =
+        connection.prepare("SELECT exchange, resolution FROM datasets WHERE id = ?1")?;
+    for schedule in schedules.iter_mut() {
+        let mut runs = runs_statement
+            .query_map(params![schedule.id, AUTOMATION_RUNS_SERVED as i64], |row| {
+                let recorded: String = row.get(1)?;
+                let state: Option<String> = row.get(3)?;
+                let error: Option<String> = row.get(4)?;
+                Ok(AutomationRunRecord {
+                    ran_at: row.get(0)?,
+                    status: resolved_run_status(
+                        &recorded,
+                        state.as_deref().map(|state| (state, error.as_deref())),
+                    ),
+                    job_id: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        runs.reverse();
+        if let Some(newest) = runs.last() {
+            schedule.last_status = Some(newest.status.clone());
+        }
+        schedule.runs = runs;
+        if let Some(dataset_id) = schedule.dataset_id.as_deref() {
+            schedule.dataset = label_statement
+                .query_row([dataset_id], |row| {
+                    Ok(dataset_label(
+                        &row.get::<_, String>(0)?,
+                        &row.get::<_, String>(1)?,
+                    ))
+                })
+                .optional()?;
+        }
+    }
+    Ok(())
 }
 
 fn load_automations(state: &AppState) -> Result<Vec<AutomationScheduleRecord>> {
     let connection = state.database.lock().expect("database lock poisoned");
-    let mut statement = connection.prepare(
-        "SELECT id, name, kind, enabled, local_time, weekdays, last_run_date, last_status, created_at
-         FROM automation_schedules ORDER BY created_at",
-    )?;
-    let rows = statement.query_map([], map_automation)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut statement = connection.prepare(&format!(
+        "SELECT {AUTOMATION_COLUMNS} FROM automation_schedules ORDER BY created_at"
+    ))?;
+    let mut schedules = statement
+        .query_map([], map_automation)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    attach_automation_runs(&connection, &mut schedules)?;
+    Ok(schedules)
 }
 
 fn load_automation(state: &AppState, id: &str) -> Result<AutomationScheduleRecord> {
     let connection = state.database.lock().expect("database lock poisoned");
-    Ok(connection.query_row(
-        "SELECT id, name, kind, enabled, local_time, weekdays, last_run_date, last_status, created_at
-         FROM automation_schedules WHERE id=?1",
+    let mut schedules = vec![connection.query_row(
+        &format!("SELECT {AUTOMATION_COLUMNS} FROM automation_schedules WHERE id=?1"),
         [id],
         map_automation,
-    )?)
+    )?];
+    attach_automation_runs(&connection, &mut schedules)?;
+    Ok(schedules.remove(0))
 }
 
 async fn automation_scheduler(state: AppState) {
@@ -1526,16 +1658,51 @@ async fn execute_automation(state: &AppState, id: &str) -> Result<()> {
         )?;
     }
     let outcome = match schedule.kind.as_str() {
-        "data_update" => queue_eod_update(state).map(|record| format!("queued {}", record.id)),
+        "data_update" => {
+            queue_eod_update(state).map(|record| (format!("queued {}", record.id), None))
+        }
+        AUTOMATION_KIND_DATASET_UPDATE => run_dataset_schedule(state, &schedule).await,
         _ => bail!("unsupported automation kind"),
     };
-    let status = outcome.unwrap_or_else(|error| format!("failed: {error:#}"));
+    let (status, job_id) = outcome.unwrap_or_else(|error| (format!("failed: {error:#}"), None));
     let connection = state.database.lock().expect("database lock poisoned");
     connection.execute(
         "UPDATE automation_schedules SET last_status=?2 WHERE id=?1",
         params![id, status],
     )?;
+    connection.execute(
+        "INSERT INTO automation_runs (schedule_id, ran_at, status, job_id) VALUES (?1, ?2, ?3, ?4)",
+        params![id, Utc::now().to_rfc3339(), status, job_id],
+    )?;
     Ok(())
+}
+
+/// A `dataset_update` schedule's run (DS-10, decision 0001): queues the dataset's download
+/// job through the same path as `POST /api/datasets/{id}/update` and answers `queued <job>`
+/// with the job's id; while a job runs on the dataset's source it answers `skipped: job
+/// <id> running` and queues nothing, so a schedule never queues twice. A refusal (an
+/// unmounted root, no usage reported) is the run's failure.
+async fn run_dataset_schedule(
+    state: &AppState,
+    schedule: &AutomationScheduleRecord,
+) -> Result<(String, Option<String>)> {
+    let dataset_id = schedule
+        .dataset_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .context("the schedule names no dataset")?;
+    let dataset = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        load_dataset(&connection, dataset_id)?
+            .with_context(|| format!("no dataset {dataset_id:?}; it was removed"))?
+    };
+    if let Some(running) = running_job_on(state, &dataset.source_id) {
+        return Ok((format!("skipped: job {} running", running.id), None));
+    }
+    match start_dataset_update(State(state.clone()), AxumPath(dataset_id.to_owned())).await {
+        Ok((_, Json(job))) => Ok((format!("queued {}", job.id), Some(job.id))),
+        Err(ApiError(_, error)) => Err(error),
+    }
 }
 
 fn recover_incomplete_jobs(connection: &Connection) -> Result<()> {
@@ -3642,18 +3809,34 @@ async fn create_automation(
     let id = format!("automation-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
     {
         let connection = state.database.lock().expect("database lock poisoned");
+        // A dataset_update schedule names a registered dataset and is named after it.
+        let (name, dataset_id) = if request.kind == AUTOMATION_KIND_DATASET_UPDATE {
+            let dataset_id = request.dataset_id.as_deref().unwrap_or_default().trim();
+            let dataset = load_dataset(&connection, dataset_id)?.ok_or_else(|| {
+                api_error(StatusCode::NOT_FOUND, format!("no dataset {dataset_id:?}"))
+            })?;
+            let label = dataset_label(&dataset.exchange, &dataset.resolution);
+            let name = match request.name.trim() {
+                "" => label,
+                name => name.to_owned(),
+            };
+            (name, Some(dataset.id))
+        } else {
+            (request.name.trim().to_owned(), None)
+        };
         connection.execute(
             "INSERT INTO automation_schedules
-             (id, name, kind, enabled, local_time, weekdays, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, name, kind, enabled, local_time, weekdays, created_at, dataset_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
-                request.name.trim(),
+                name,
                 request.kind,
                 request.enabled,
                 request.local_time,
                 request.weekdays,
-                now.to_rfc3339()
+                now.to_rfc3339(),
+                dataset_id
             ],
         )?;
     }
@@ -6498,11 +6681,20 @@ struct DatasetJobRecord {
     error: Option<String>,
     /// Relative to the service root; `GET /api/datasets/jobs/{id}/log` serves it.
     log_path: String,
+    /// The dataset's exchange and resolution, so a listing names it (`US EOD`).
+    exchange: String,
+    resolution: String,
+    /// `scheduled` when a schedule's run queued the job (DS-10), else `manual`.
+    trigger: String,
 }
 
 const DATASET_JOB_COLUMNS: &str = "j.id, j.dataset_id, d.source_id, j.kind, j.state, \
      j.percent, j.created_at, j.started_at, j.finished_at, j.calls, j.added, j.updated, \
-     j.skipped_json, j.estimate_json, j.error, j.log_path";
+     j.skipped_json, j.estimate_json, j.error, j.log_path, d.exchange, d.resolution, \
+     EXISTS (SELECT 1 FROM automation_runs r WHERE r.job_id = j.id)";
+
+/// The most jobs `GET /api/datasets/jobs` lists (`?limit=` asks for fewer, or up to 500).
+const DATASET_JOBS_LISTED: usize = 50;
 
 fn map_dataset_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetJobRecord> {
     let skipped_json: String = row.get(12)?;
@@ -6524,7 +6716,43 @@ fn map_dataset_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetJobRecord
         estimate: estimate_json.and_then(|text| serde_json::from_str(&text).ok()),
         error: row.get(14)?,
         log_path: row.get(15)?,
+        exchange: row.get(16)?,
+        resolution: row.get(17)?,
+        trigger: if row.get::<_, i64>(18)? != 0 {
+            "scheduled".to_owned()
+        } else {
+            "manual".to_owned()
+        },
     })
+}
+
+/// The jobs across every dataset, newest first, capped (DS-10): what the Updates table lists.
+fn load_dataset_jobs(connection: &Connection, limit: usize) -> Result<Vec<DatasetJobRecord>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT {DATASET_JOB_COLUMNS} FROM dataset_jobs j
+         JOIN datasets d ON d.id = j.dataset_id
+         ORDER BY j.created_at DESC, j.id DESC LIMIT ?1"
+    ))?;
+    let rows = statement
+        .query_map([limit as i64], map_dataset_job)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug, Deserialize)]
+struct DatasetJobsQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /api/datasets/jobs`: the download jobs newest first, `DATASET_JOBS_LISTED` of them
+/// unless `?limit=` asks for another number (at most 500).
+async fn list_dataset_jobs(
+    State(state): State<AppState>,
+    Query(query): Query<DatasetJobsQuery>,
+) -> Result<Json<Vec<DatasetJobRecord>>, ApiError> {
+    let limit = query.limit.unwrap_or(DATASET_JOBS_LISTED).clamp(1, 500);
+    let connection = state.database.lock().expect("database lock poisoned");
+    Ok(Json(load_dataset_jobs(&connection, limit)?))
 }
 
 fn load_dataset_job(connection: &Connection, id: &str) -> Result<Option<DatasetJobRecord>> {
@@ -11169,6 +11397,249 @@ mod tests {
                     for leak in &leaks {
                         assert!(!body.contains(leak), "{label} carries {leak:?}: {body}");
                     }
+                }
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            #[test]
+            fn a_run_takes_its_jobs_outcome_and_a_dataset_is_labelled_by_exchange_and_resolution() {
+                assert_eq!(dataset_label("US", "daily"), "US EOD");
+                assert_eq!(dataset_label("US", "5m"), "US 5m");
+                assert_eq!(dataset_label("LSE", "1m"), "LSE 1m");
+                assert_eq!(resolved_run_status("queued job-1", None), "queued job-1");
+                assert_eq!(
+                    resolved_run_status("queued job-1", Some(("Queued", None))),
+                    "queued job-1"
+                );
+                assert_eq!(
+                    resolved_run_status("queued job-1", Some(("Running", None))),
+                    "queued job-1"
+                );
+                assert_eq!(
+                    resolved_run_status("queued job-1", Some(("Complete", None))),
+                    "complete"
+                );
+                assert_eq!(
+                    resolved_run_status("queued job-1", Some(("Failed", Some("root unmounted")))),
+                    "failed: root unmounted"
+                );
+                assert_eq!(
+                    resolved_run_status("queued job-1", Some(("Failed", None))),
+                    "failed: no reason recorded"
+                );
+                assert_eq!(
+                    resolved_run_status("skipped: job job-0 running", None),
+                    "skipped: job job-0 running"
+                );
+            }
+
+            /// DS-10 (decision 0001): a `dataset_update` schedule over an in-memory catalog.
+            /// `POST /api/automations` refuses the kind without a registered dataset and
+            /// names the schedule after it; `execute_automation` with the source idle queues
+            /// the dataset's job and records the run as a mark (`queued <job>`, the job id on
+            /// the run); with that job running it records `skipped: job <id> running` and
+            /// queues no second job, over the API's Run now too; `GET /api/datasets/jobs`
+            /// lists the jobs newest first, named after their dataset and marked scheduled
+            /// or manual, capped by `?limit=`; and once the job ends its run's status is the
+            /// job's outcome.
+            #[tokio::test]
+            async fn a_dataset_schedule_queues_the_job_once_and_skips_while_one_runs() {
+                let (eodhd, jobs) = job_stub().await;
+                let root = scratch_root("schedules");
+                let library = root.join("library");
+                let eod = library.join("eod");
+                let catalog = library.join("catalog");
+                fs::create_dir_all(&eod).unwrap();
+                fs::create_dir_all(&catalog).unwrap();
+                for code in ["AAPL", "SPY", "BRK-B"] {
+                    fs::write(
+                        eod.join(format!("{code}.US.csv")),
+                        seeded_daily(&["2026-09-08", "2026-09-09"]),
+                    )
+                    .unwrap();
+                }
+                let state = test_state_over(&root, &eodhd, &library);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+
+                let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                    &serde_json::json!({
+                        "kind": "eodhd", "name": "EODHD", "root": library,
+                        "catalog_dir": catalog, "token": TOKEN
+                    }),
+                ))
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                let source_id = card["id"].as_str().unwrap().to_owned();
+                let (status, _, text) = call(
+                    client
+                        .post(format!(
+                            "{api}/api/sources/{source_id}/availability/refresh"
+                        ))
+                        .json(&serde_json::json!({ "exchange": "US", "delisted": true })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                let (status, dataset, text) = call(
+                    client
+                        .post(format!("{api}/api/sources/{source_id}/datasets"))
+                        .json(&serde_json::json!({
+                            "exchange": "US", "types": ["Common Stock", "ETF"],
+                            "resolution": "daily", "from_date": "2020-01-01",
+                            "min_bulk_rows": 3
+                        })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                let dataset_id = dataset["id"].as_str().unwrap().to_owned();
+
+                // The kind needs a registered dataset; the schedule is named after it.
+                let automations = format!("{api}/api/automations");
+                let (status, _, text) =
+                    call(client.post(&automations).json(
+                        &serde_json::json!({ "kind": "dataset_update", "local_time": "19:15" }),
+                    ))
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+                assert!(text.contains("dataset_id"), "{text}");
+                let (status, _, text) = call(client.post(&automations).json(&serde_json::json!({
+                    "kind": "dataset_update", "dataset_id": "nope", "local_time": "19:15"
+                })))
+                .await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+                let (status, schedule, text) =
+                    call(client.post(&automations).json(&serde_json::json!({
+                        "kind": "dataset_update", "dataset_id": dataset_id,
+                        "local_time": "19:15", "weekdays": "mon,tue,wed,thu,fri",
+                        "enabled": true
+                    })))
+                    .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                assert_eq!(schedule["name"], "US EOD");
+                assert_eq!(schedule["dataset"], "US EOD");
+                assert_eq!(schedule["dataset_id"], dataset_id.as_str());
+                assert_eq!(schedule["kind"], "dataset_update");
+                assert_eq!(schedule["enabled"], true);
+                assert_eq!(schedule["runs"], serde_json::json!([]));
+                assert!(schedule["last_status"].is_null(), "{schedule}");
+                let schedule_id = schedule["id"].as_str().unwrap().to_owned();
+                let (status, listed, text) =
+                    call(client.get(format!("{api}/api/datasets/jobs"))).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_eq!(listed, serde_json::json!([]));
+
+                // The source idle: the run queues the job and is recorded as a mark.
+                jobs.hold.store(true, Ordering::SeqCst);
+                execute_automation(&state, &schedule_id).await.unwrap();
+                let schedule = load_automation(&state, &schedule_id).unwrap();
+                let queued = schedule.last_status.clone().unwrap();
+                assert!(queued.starts_with("queued job-"), "{queued}");
+                let job_id = queued["queued ".len()..].to_owned();
+                assert!(schedule.last_run_date.is_some());
+                assert_eq!(schedule.runs.len(), 1);
+                assert_eq!(schedule.runs[0].status, queued);
+                assert_eq!(schedule.runs[0].job_id.as_deref(), Some(job_id.as_str()));
+                assert_eq!(table_count(&state, "dataset_jobs"), 1);
+                assert_eq!(table_count(&state, "automation_runs"), 1);
+                assert_eq!(
+                    running_job_on(&state, &source_id).map(|running| running.id),
+                    Some(job_id.clone())
+                );
+
+                // That job running: the run is skipped naming it, and nothing is queued.
+                execute_automation(&state, &schedule_id).await.unwrap();
+                let skipped = format!("skipped: job {job_id} running");
+                let (status, schedules, text) = call(client.get(&automations)).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                let served = schedules
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"] == schedule_id.as_str())
+                    .cloned()
+                    .expect("the schedule is listed");
+                assert_eq!(served["last_status"], skipped.as_str());
+                let runs = served["runs"].as_array().unwrap();
+                assert_eq!(runs.len(), 2, "{served}");
+                assert_eq!(runs[0]["status"], queued.as_str());
+                assert_eq!(runs[0]["job_id"], job_id.as_str());
+                assert_eq!(runs[1]["status"], skipped.as_str());
+                assert!(runs[1]["job_id"].is_null(), "{served}");
+                assert!(runs[1]["ran_at"].as_str().unwrap() >= runs[0]["ran_at"].as_str().unwrap());
+                assert_eq!(table_count(&state, "dataset_jobs"), 1);
+                // Run now over the API is the same run.
+                let (status, ran, text) =
+                    call(client.post(format!("{automations}/{schedule_id}/run"))).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_eq!(ran["last_status"], skipped.as_str());
+                assert_eq!(ran["runs"].as_array().unwrap().len(), 3);
+                assert_eq!(table_count(&state, "dataset_jobs"), 1);
+
+                // The listing names the job's dataset and says a schedule queued it.
+                let (status, listed, text) =
+                    call(client.get(format!("{api}/api/datasets/jobs"))).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                let listed = listed.as_array().unwrap().clone();
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0]["id"], job_id.as_str());
+                assert_eq!(listed[0]["trigger"], "scheduled");
+                assert_eq!(listed[0]["exchange"], "US");
+                assert_eq!(listed[0]["resolution"], "daily");
+                assert!(
+                    listed[0]["state"] == "Queued" || listed[0]["state"] == "Running",
+                    "{}",
+                    listed[0]
+                );
+
+                // The job's outcome becomes its run's status once it ends.
+                jobs.hold.store(false, Ordering::SeqCst);
+                let job = finished_job(&client, &api, &job_id).await;
+                assert_eq!(job["state"], "Complete", "{job}");
+                let schedule = load_automation(&state, &schedule_id).unwrap();
+                assert_eq!(schedule.runs.len(), 3);
+                assert_eq!(schedule.runs[0].status, "complete");
+                assert_eq!(schedule.runs[2].status, skipped);
+                assert_eq!(schedule.last_status.as_deref(), Some(skipped.as_str()));
+                for _ in 0..400 {
+                    if running_job_on(&state, &source_id).is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                assert!(
+                    running_job_on(&state, &source_id).is_none(),
+                    "the lock is held"
+                );
+
+                // A manual job lists first, marked manual; the cap holds the list to one.
+                let (status, manual, text) =
+                    call(client.post(format!("{api}/api/datasets/{dataset_id}/update"))).await;
+                assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+                let manual_id = manual["id"].as_str().unwrap().to_owned();
+                assert_eq!(manual["trigger"], "manual");
+                let (_, listed, _) = call(client.get(format!("{api}/api/datasets/jobs"))).await;
+                let ids: Vec<&str> = listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|job| job["id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(ids, vec![manual_id.as_str(), job_id.as_str()]);
+                assert_eq!(listed[0]["trigger"], "manual");
+                assert_eq!(listed[1]["trigger"], "scheduled");
+                let (_, capped, _) =
+                    call(client.get(format!("{api}/api/datasets/jobs?limit=1"))).await;
+                assert_eq!(capped.as_array().unwrap().len(), 1);
+                assert_eq!(capped[0]["id"], manual_id.as_str());
+                let manual = finished_job(&client, &api, &manual_id).await;
+                assert_eq!(manual["state"], "Complete", "{manual}");
+                let schedule = load_automation(&state, &schedule_id).unwrap();
+                assert_eq!(schedule.runs.len(), 3, "a manual job is not a run");
+                for _ in 0..400 {
+                    if running_job_on(&state, &source_id).is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
                 let _ = fs::remove_dir_all(&root);
             }
