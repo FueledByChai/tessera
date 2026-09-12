@@ -4,13 +4,15 @@
 //! account's usage and limits, list the exchanges it covers, and list an exchange's
 //! instruments. The download calls the jobs need (bulk EOD, history, splits, intraday windows)
 //! extend this trait when those tickets land; a second provider is another module behind the
-//! same trait and nothing else. The first adapter is [`eodhd`].
+//! same trait and nothing else. The first adapter is [`eodhd`]; [`budget`] is the call
+//! budget every job checks against the usage a provider reports (decision 0022).
 //!
 //! Every method fails with a [`ProviderError`] whose three variants are what a caller acts on:
 //! the token is wrong (ask for another), the provider cannot be reached (try later), or the
 //! provider answered something this adapter cannot read (a bug or an API change, report it).
 //! An error's text never carries the token: it is the only thing the service will log.
 
+pub mod budget;
 pub mod eodhd;
 
 use std::fmt;
