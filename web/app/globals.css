@@ -4256,20 +4256,92 @@ nav {
 /* Paths, notes, commands, and errors wrap in their cells, so these tables fit a 13-inch
    laptop instead of scrolling behind macOS's hidden scrollbar (the layout check measures the
    three views). */
-.data-sources-panel th, .data-sources-panel td, .data-updates-panel th, .data-updates-panel td,
+.data-library-feeds { display: flex; flex-direction: column; gap: 12px; }
+.data-library-feeds .terminal-panel-title small { margin-left: 10px; opacity: 0.8; }
+.data-library-feeds th, .data-library-feeds td, .data-updates-panel th, .data-updates-panel td,
 .instrument-table th, .instrument-table td { text-align: left; }
-.data-sources-panel td.source-path, .data-sources-panel td.source-note, .data-sources-panel td.source-instrument,
+.data-library-feeds td.source-path, .data-library-feeds td.source-note, .data-library-feeds td.source-instrument,
 .data-updates-panel td { white-space: normal; }
-.data-sources-panel td.source-path, .data-sources-panel td.source-instrument, .data-updates-panel code { overflow-wrap: anywhere; }
-.data-sources-panel td.source-path { min-width: 200px; }
+.data-library-feeds td.source-path, .data-library-feeds td.source-instrument, .data-updates-panel code { overflow-wrap: anywhere; }
+.data-library-feeds td.source-path { min-width: 200px; }
 .data-updates-panel td:first-child { white-space: nowrap; }
+
+/* Registered sources (DS-06; decisions 0003, 0013, 0021, 0022): the source cards with their
+   inline forms (never a dialog) and the "Available from <source>" panel. The forms are field
+   grids, so the sizing block at the end of the file gives them the 42 px controls. */
+.data-sources-panel .source-loading { padding: 12px; color: var(--text-muted, #b8b8b8); font-size: 13px; }
+.data-sources-panel .source-error { margin: 0 12px; font-size: 13px; }
+.source-card { display: flex; flex-direction: column; gap: 8px; margin: 0 8px; padding: 10px 12px; border: 1px solid var(--line, #414141); }
+.source-card:last-child { margin-bottom: 12px; }
+.source-card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; font-size: 15px; }
+.source-card-head strong { color: var(--accent, #f89828); font-size: 18px; letter-spacing: 0.04em; }
+.source-card-head em { font-style: normal; color: var(--text-muted, #b8b8b8); }
+.source-card-head .source-path { font-size: 13px; }
+.source-card-head .source-token { color: var(--text-muted, #b8b8b8); font-size: 13px; }
+.source-card-head .source-actions { margin-left: auto; display: flex; gap: 14px; white-space: nowrap; }
+.source-state, .source-credits, .source-uncataloged { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-size: 15px; line-height: 1.3; }
+.source-state strong { color: #32c832; font-weight: 600; }
+.source-state.rejected strong { color: #e03040; }
+.source-state.unreachable strong { color: var(--accent, #f89828); }
+.source-state .source-message { color: #e03040; }
+.source-credits .source-note, .source-uncataloged .source-note { font-size: 13px; }
+.source-uncataloged strong { color: var(--accent, #f89828); }
+.source-uncataloged .add-dataset-toggle { margin-left: auto; }
+.source-credits .reserve-form { margin-left: auto; display: flex; }
+.app-shell .source-credits .reserve-form label { display: flex; align-items: center; gap: 8px; width: auto; }
+.source-credits .reserve-form input { width: 92px; }
+.source-card .empty-state { margin: 0; padding: 8px 0; }
+.source-card .table-wrap { margin: 0; }
+.dataset-table th, .dataset-table td, .availability-table th, .availability-table td { text-align: left; white-space: nowrap; }
+.dataset-table td.numeric-cell, .dataset-table th:nth-child(n + 6):nth-child(-n + 10),
+.availability-table td.numeric-cell, .availability-table th:last-child { text-align: right; }
+.dataset-table td.dataset-types-cell { white-space: normal; min-width: 130px; }
+.availability-table td.availability-types { white-space: normal; min-width: 220px; }
+.dataset-table td.dataset-folder { color: var(--text-muted, #b8b8b8); }
+.dataset-table td.dataset-state { letter-spacing: 0.04em; }
+.dataset-table td.state-current { color: #32c832; }
+.dataset-table td.state-updating, .dataset-table td.state-partial, .dataset-table td.state-stale { color: var(--accent, #f89828); }
+.dataset-table td.state-failed, .dataset-table td.state-unavailable { color: #e03040; }
+.dataset-table td.state-unknown { color: var(--text-muted, #b8b8b8); }
+.dataset-table td.feature-actions { text-align: right; }
+.availability-table td strong { color: var(--accent, #f89828); }
+.availability-table .fetch-listing { padding: 0 6px; border: 1px solid var(--line, #414141); }
+.source-form, .dataset-form, .token-form { margin: 0 12px 12px; padding: 12px; border: 1px dashed var(--line, #414141); }
+.source-card .dataset-form, .source-card .token-form { margin: 0; }
+.source-form > .source-root-field { grid-column: span 4; }
+.dataset-form > .dataset-folder-field { grid-column: span 4; }
+.token-form > label { grid-column: span 4; }
+.dataset-form > .dataset-types { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin: 0; padding: 8px 10px; border: 1px solid var(--line, #414141); }
+.dataset-form > .dataset-types legend { color: var(--text-muted, #b8b8b8); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0 6px; }
+.dataset-form > .dataset-types small { color: var(--text-muted, #b8b8b8); font-size: 13px; }
+.dataset-form > .dataset-types .toggle-label { padding-top: 0; }
+.dataset-form > .dataset-types .toggle-label em { font-style: normal; color: var(--text-muted, #b8b8b8); }
+.source-form > .form-actions, .dataset-form > .form-actions, .token-form > .form-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.source-form > .form-actions small, .token-form > .form-actions small { color: var(--text-muted, #b8b8b8); font-size: 12px; }
+.availability-panel { display: flex; flex-direction: column; gap: 12px; padding-bottom: 12px; }
+.availability-panel .terminal-panel-title small { margin-left: 10px; opacity: 0.8; }
+.availability-panel .terminal-panel-title select { margin-left: auto; }
+.availability-panel .availability-note { margin: 0 12px; font-size: 13px; }
+/* The sizing block gives `.instrument-search` `order: 2` for its own flex row; in this
+   column the filter stays where the wireframe puts it, above the table. */
+.app-shell .availability-panel .availability-filter { order: 0; margin: 0 12px; max-width: 420px; }
+.availability-panel .empty-state { margin: 0 12px; }
+.availability-panel .table-wrap { margin: 0; }
+/* Under 1500 px the two new tables go dense like the others; these selectors carry three
+   classes so they outrank the terminal theme's `.app-shell[data-theme] .table-wrap th`. */
 @media (max-width: 1500px) {
-  .app-shell .instrument-table, .app-shell .data-sources-panel table, .app-shell .data-updates-panel table { font-size: 15px; line-height: 1.25; }
-  .app-shell .instrument-table th, .app-shell .data-sources-panel th, .app-shell .data-updates-panel th { font-size: 13px; letter-spacing: 0.04em; }
+  .app-shell .instrument-table, .app-shell .data-library-feeds table, .app-shell .data-updates-panel table,
+  .app-shell .table-wrap .dataset-table, .app-shell .table-wrap .availability-table { font-size: 15px; line-height: 1.25; }
+  .app-shell .instrument-table th, .app-shell .data-library-feeds th, .app-shell .data-updates-panel th,
+  .app-shell .table-wrap .dataset-table th, .app-shell .table-wrap .availability-table th { font-size: 13px; letter-spacing: 0.04em; }
   .app-shell .instrument-table th, .app-shell .instrument-table td,
-  .app-shell .data-sources-panel th, .app-shell .data-sources-panel td,
-  .app-shell .data-updates-panel th, .app-shell .data-updates-panel td { padding: 5px 7px; }
+  .app-shell .data-library-feeds th, .app-shell .data-library-feeds td,
+  .app-shell .data-updates-panel th, .app-shell .data-updates-panel td,
+  .app-shell .table-wrap .dataset-table th, .app-shell .table-wrap .dataset-table td,
+  .app-shell .table-wrap .availability-table th, .app-shell .table-wrap .availability-table td { padding: 5px 7px; }
   .app-shell .instrument-table td.instrument-name { max-width: 240px; }
+  .app-shell .source-card { padding: 8px; }
+  .app-shell .source-card-head, .app-shell .source-state, .app-shell .source-credits, .app-shell .source-uncataloged { font-size: 13px; }
 }
 
 /* Archived (pre-SDK) catalog rows */
