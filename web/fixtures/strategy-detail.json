@@ -1,0 +1,205 @@
+{
+  "strategy": {
+    "id": "rsi_mean_reversion",
+    "name": "RSI Mean Reversion",
+    "version": "v1",
+    "status": "Research",
+    "description": "Buys when RSI falls below the oversold level and exits when it climbs above the overbought level.",
+    "asset_scope": "Any",
+    "config_path": "sdk",
+    "runnable": true,
+    "base_strategy_id": "sdk",
+    "source_sha256": null,
+    "custom": false,
+    "sdk_strategy_id": "rsi_mean_reversion"
+  },
+  "rules": [
+    "Buys when RSI falls below the oversold level and exits when it climbs above the overbought level.",
+    "Compute Wilder RSI over the configured length from completed closes only.",
+    "When flat and RSI < oversold, buy at the next bar open using the platform position size.",
+    "When long and RSI > overbought, exit at the next bar open.",
+    "An optional protective stop sits a fixed percent below the entry price.",
+    "Replays 200 warm-up bars before the requested start so indicators are ready; orders during warm-up are ignored."
+  ],
+  "default_parameters": {
+    "initial_capital": 100000.0,
+    "length": 14,
+    "max_entries_per_day": 0,
+    "max_open_positions": 0,
+    "overbought": 90.0,
+    "oversold": 10.0,
+    "position_percent": 1.0,
+    "random_seed": 0,
+    "resolution": "daily",
+    "session": "regular",
+    "stop_percent": 0.0,
+    "symbols": ["SPY.US"],
+    "tie_break": "priority"
+  },
+  "presets": [
+    {
+      "id": "preset-fixture",
+      "name": "Fixture baseline",
+      "parameters": {
+        "initial_capital": 250000.0,
+        "length": 21,
+        "max_entries_per_day": 2,
+        "max_open_positions": 5,
+        "overbought": 75.0,
+        "oversold": 25.0,
+        "position_percent": 0.2,
+        "resolution": "5m",
+        "session": "regular",
+        "stop_percent": 3.0,
+        "symbols": ["universe:etfs"],
+        "tie_break": "priority"
+      },
+      "costs_enabled": true,
+      "created_at": "2026-01-01T00:00:00+00:00"
+    }
+  ],
+  "runs": [
+    {
+      "id": "run-fixture-0002",
+      "strategy_id": "rsi_mean_reversion",
+      "name": "RSI Mean Reversion · fixture baseline",
+      "research_label": "Development",
+      "status": "Complete",
+      "legacy": false,
+      "report_path": "artifacts/ui_runs/fixture-0002/report.html",
+      "artifact_dir": "artifacts/ui_runs/fixture-0002",
+      "config_path": "artifacts/ui_runs/fixture-0002/strategy.toml",
+      "start_date": "2020-01-01",
+      "end_date": "2025-12-31",
+      "created_at": "2026-01-02T00:00:00+00:00",
+      "starred": true,
+      "metrics_cached": true,
+      "metrics": {
+        "cagr_percent": 8.4,
+        "total_return_percent": 62.1,
+        "sharpe": 0.91,
+        "sortino": 1.32,
+        "calmar": 0.7,
+        "max_drawdown_percent": -12.0,
+        "annual_volatility_percent": 9.8,
+        "win_rate_percent": 58.0,
+        "trades": 41,
+        "start": "2020-01-02",
+        "end": "2025-12-31"
+      }
+    },
+    {
+      "id": "run-fixture-0001",
+      "strategy_id": "rsi_mean_reversion",
+      "name": "RSI Mean Reversion · defaults",
+      "research_label": "Development",
+      "status": "Complete",
+      "legacy": false,
+      "report_path": "artifacts/ui_runs/fixture-0001/report.html",
+      "artifact_dir": "artifacts/ui_runs/fixture-0001",
+      "config_path": "artifacts/ui_runs/fixture-0001/strategy.toml",
+      "start_date": "2020-01-01",
+      "end_date": "2025-12-31",
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "starred": false,
+      "metrics_cached": true,
+      "metrics": {
+        "cagr_percent": 3.1,
+        "total_return_percent": 20.2,
+        "sharpe": 0.44,
+        "sortino": 0.6,
+        "calmar": 0.2,
+        "max_drawdown_percent": -15.5,
+        "annual_volatility_percent": 8.1,
+        "win_rate_percent": 51.0,
+        "trades": 27,
+        "start": "2020-01-02",
+        "end": "2025-12-31"
+      }
+    }
+  ],
+  "instruments": {
+    "parameter": "symbols",
+    "mode": "multiple",
+    "resolutions": [],
+    "suffixes": [],
+    "asset_classes": [],
+    "maximum": 50,
+    "note": "One strategy instance per symbol on a shared account. Every symbol needs bars at the selected resolution."
+  },
+  "sdk": {
+    "id": "rsi_mean_reversion",
+    "name": "RSI Mean Reversion",
+    "version": "v1",
+    "description": "Buys when RSI falls below the oversold level and exits when it climbs above the overbought level.",
+    "rules": [
+      "Compute Wilder RSI over the configured length from completed closes only.",
+      "When flat and RSI < oversold, buy at the next bar open using the platform position size.",
+      "When long and RSI > overbought, exit at the next bar open.",
+      "An optional protective stop sits a fixed percent below the entry price."
+    ],
+    "asset_scope": "Any",
+    "warmup_bars": 200,
+    "allows_short": false,
+    "daily_context": false,
+    "screen_universe": false,
+    "default_max_entries_per_day": null,
+    "default_max_gross_exposure": null,
+    "fractional_units": false,
+    "default_tie_break": null,
+    "default_seed": 0,
+    "default_symbols": [],
+    "required_symbols": [],
+    "default_resolution": null,
+    "params": [
+      {
+        "name": "length",
+        "label": "Length",
+        "help": "RSI lookback",
+        "tier": "simple",
+        "unit": "bars",
+        "kind": "int",
+        "default": 14,
+        "min": 2,
+        "max": 200,
+        "step": null
+      },
+      {
+        "name": "oversold",
+        "label": "Oversold",
+        "help": "Enter below this RSI",
+        "tier": "simple",
+        "unit": "",
+        "kind": "decimal",
+        "default": 10.0,
+        "min": 1.0,
+        "max": 50.0,
+        "step": null
+      },
+      {
+        "name": "overbought",
+        "label": "Overbought",
+        "help": "Exit above this RSI",
+        "tier": "simple",
+        "unit": "",
+        "kind": "decimal",
+        "default": 90.0,
+        "min": 50.0,
+        "max": 99.0,
+        "step": null
+      },
+      {
+        "name": "stop_percent",
+        "label": "Stop percent",
+        "help": "Protective stop below entry; 0 disables",
+        "tier": "advanced",
+        "unit": "%",
+        "kind": "decimal",
+        "default": 0.0,
+        "min": 0.0,
+        "max": 50.0,
+        "step": null
+      }
+    ]
+  }
+}

@@ -103,6 +103,19 @@ metrics) and one with none and asserts the catalog rows carry the last completed
 metrics, a null-metrics row, and a no-run row; `web/scripts/layout-check.mjs` measures the
 strategies page at 1280 px with the nine columns and fails on horizontal scroll.
 
+### UI-07 The Configure run dialog fits an 800 px viewport for every strategy — Blocked by UI-05
+The dialog (UI-05) fits 1280×800 in both display modes for the fixture strategy, but against
+the console's catalog `web/scripts/layout-check.mjs --verbose` reports its rows scrolling
+inside by a few pixels in modern mode for the first strategy there (783 px of content in
+776): modern mode's taller head and footer and the two-line captions in the Limits row
+(`web/app/globals.css`, `SdkForm` in `web/app/page.tsx`) cost the difference, and a strategy
+declaring many parameters scrolls in either mode. Decide whether the rows may scroll for such a
+strategy or the Parameters row goes two-column and the modern head and footer as dense as the
+terminal's, and make the check hold it. Serves BT-1101.
+**Done when:** `web/scripts/layout-check.mjs` fails when the dialog's rows scroll inside at
+1280×800 in either mode for a strategy declaring up to eight parameters, and passes against
+the console and the scratch console.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar
