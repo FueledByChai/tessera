@@ -556,11 +556,11 @@ today for every exchange. The job keeps a per-dataset skip list (`dataset_skips`
 first seen, retry after) and retries a skipped symbol only after a configurable interval
 (default 30 days); the estimate adds a split allowance (the dataset's average splits per session
 over its recorded jobs, at least one); the through-date is the exchange's own local date from
-the cached exchange row. Serves BT-1204, BT-1205. Decisions: 0022.
+the cached exchange row. Serves BT-1204, BT-1205. Decisions: 0022. DS-09's intraday job has the same two costs: every existing file spends one request (five calls) per run just to read its last bar back, about 50,000 calls a night for a US-sized 5m dataset that is already current, so files whose last bar reaches the latest expected session close (the scan's expected session) are skipped without a call; and a no-bars symbol is skipped for one run only, so it joins the same skip list with the same retry interval.
 **Done when:** `tests/provider_eod_job.rs` proves a no-history symbol costs one call on the first
 run and none on the second, and a call again after the interval; a budget unit test proves the
 split allowance is in the mandatory estimate; a job test on an exchange whose local date is ahead
-of New York plans the extra session.
+of New York plans the extra session.; `tests/provider_intraday_job.rs` proves a current 5m file costs no request and a no-bars symbol is not asked again on the next run.
 
 ## Housekeeping
 
