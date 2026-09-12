@@ -2,7 +2,8 @@
 //!
 //! An axum server on a free port serves the recorded fixtures under `tests/fixtures/eodhd/`
 //! (token scrubbed, trimmed to a few rows) and records every query string it receives. The
-//! tests assert the parsed account, exchanges, and listings; that a 401 body is
+//! tests assert the parsed account, exchanges, and listings, and (DS-08) the bulk bars, one
+//! symbol's history, and the splits with the query each sends; that a 401 body is
 //! `CredentialsRejected`, that a 503 and a dropped connection are `Unreachable`, that a
 //! non-JSON body is `Malformed`; and that the token travels as the `api_token` query
 //! parameter while no error message (the only text the adapter hands anyone to log) carries
@@ -16,9 +17,13 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use tessera::provider::eodhd::Eodhd;
 use tessera::provider::{Provider, ProviderError};
+
+fn day(text: &str) -> NaiveDate {
+    NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+}
 
 /// A placeholder, never a real token. The stub accepts exactly this one.
 const TOKEN: &str = "stub-token-0000";
@@ -100,12 +105,83 @@ async fn symbols(
     }
 }
 
+/// `eod-bulk-last-day/{exchange}`: the recorded bars for US on 2026-09-11, the recorded
+/// splits with `type=splits`, an empty list for any other date (a holiday), the provider's
+/// 404 for another exchange.
+async fn bulk(
+    State(state): State<Stub>,
+    Path(exchange): Path<String>,
+    query: Query<Vec<(String, String)>>,
+) -> Response {
+    if let Some(rejected) = record(
+        &state,
+        &format!("/api/eod-bulk-last-day/{exchange}"),
+        &query,
+    ) {
+        return rejected;
+    }
+    let param = |name: &str| {
+        query
+            .0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    if exchange != "US" {
+        return json(
+            StatusCode::NOT_FOUND,
+            r#"{"message":"Unknown exchange"}"#.to_owned(),
+        );
+    }
+    let splits = param("type") == Some("splits");
+    if param("date") != Some("2026-09-11") {
+        return json(StatusCode::OK, "[]".to_owned());
+    }
+    if splits {
+        json(StatusCode::OK, fixture("eod-bulk-last-day-US-splits"))
+    } else {
+        json(StatusCode::OK, fixture("eod-bulk-last-day-US"))
+    }
+}
+
+/// `eod/{symbol}`: AAPL.US's recorded three rows, the rows from `from` on; 404 for another
+/// symbol, as the provider answers for one it does not know.
+async fn history(
+    State(state): State<Stub>,
+    Path(symbol): Path<String>,
+    query: Query<Vec<(String, String)>>,
+) -> Response {
+    if let Some(rejected) = record(&state, &format!("/api/eod/{symbol}"), &query) {
+        return rejected;
+    }
+    if symbol != "AAPL.US" {
+        return json(
+            StatusCode::NOT_FOUND,
+            r#"{"message":"Symbol not found"}"#.to_owned(),
+        );
+    }
+    let from = query
+        .0
+        .iter()
+        .find(|(k, _)| k == "from")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&fixture("eod-AAPL.US")).unwrap();
+    let kept: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter(|row| row["date"].as_str().unwrap() >= from.as_str())
+        .collect();
+    json(StatusCode::OK, serde_json::to_string(&kept).unwrap())
+}
+
 fn stub_router() -> (Router, Queries) {
     let queries: Queries = Arc::new(Mutex::new(Vec::new()));
     let router = Router::new()
         .route("/api/user", get(user))
         .route("/api/exchanges-list/", get(exchanges))
         .route("/api/exchange-symbol-list/{exchange}", get(symbols))
+        .route("/api/eod-bulk-last-day/{exchange}", get(bulk))
+        .route("/api/eod/{symbol}", get(history))
         .with_state(Stub {
             queries: queries.clone(),
         });
@@ -187,8 +263,11 @@ async fn exchanges_and_symbols_parse_the_recorded_lists() {
     assert_eq!(listings[0].name, "Apple Inc");
     assert_eq!(listings[0].kind, "Common Stock");
     assert_eq!(listings[0].currency, "USD");
+    assert_eq!(listings[0].country, "USA");
+    assert_eq!(listings[0].venue, "NASDAQ");
     assert_eq!(listings[1].code, "SPY");
     assert_eq!(listings[1].kind, "ETF");
+    assert_eq!(listings[1].venue, "NYSE ARCA");
     assert_eq!(listings[2].code, "BRK-B");
 
     let delisted = provider.symbols("US", true).await.unwrap();
@@ -207,6 +286,112 @@ async fn exchanges_and_symbols_parse_the_recorded_lists() {
     for line in &seen {
         assert!(line.contains(&format!("api_token={TOKEN}")), "{line}");
         assert!(line.contains("fmt=json"), "{line}");
+    }
+}
+
+/// DS-08: the three download calls parse the recorded answers and send the query the
+/// provider documents: `date=` for a bulk day, `type=splits&date=` for its splits, `from=`
+/// for a history; a date the provider has no bars for is an empty list, not an error.
+#[tokio::test]
+async fn bulk_bars_history_and_splits_parse_the_recorded_answers_and_send_their_queries() {
+    let (router, queries) = stub_router();
+    let base = serve(router).await;
+    let provider = Eodhd::new(&base, TOKEN);
+
+    let bars = provider.bulk_eod("US", day("2026-09-11")).await.unwrap();
+    assert_eq!(bars.len(), 3);
+    assert_eq!(
+        (bars[0].code.as_str(), bars[0].exchange.as_str()),
+        ("AAPL", "US")
+    );
+    assert_eq!(bars[0].bar.date, day("2026-09-11"));
+    assert_eq!(bars[0].bar.close, 232.5);
+    assert_eq!(bars[0].bar.volume, 51_234_567.0);
+    assert_eq!(bars[1].code, "SPY");
+    assert_eq!(bars[2].code, "BRK-B");
+    assert_eq!(bars[2].bar.low, 469.1);
+    let holiday = provider.bulk_eod("US", day("2026-09-12")).await.unwrap();
+    assert!(holiday.is_empty());
+
+    let history = provider
+        .eod_history("AAPL.US", day("2026-09-10"))
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].date, day("2026-09-10"));
+    assert_eq!(history[0].adjusted_close, 57.6);
+    assert_eq!(history[1].date, day("2026-09-11"));
+    assert_eq!((history[1].open, history[1].high), (230.1, 233.4));
+
+    let splits = provider.splits("US", day("2026-09-11")).await.unwrap();
+    assert_eq!(splits.len(), 1);
+    assert_eq!(
+        (splits[0].code.as_str(), splits[0].exchange.as_str()),
+        ("AAPL", "US")
+    );
+    assert_eq!(splits[0].date, day("2026-09-11"));
+    assert_eq!(splits[0].ratio, "4.000000/1.000000");
+    assert!(
+        provider
+            .splits("US", day("2026-09-10"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let seen = queries.lock().unwrap().clone();
+    assert_eq!(seen.len(), 5);
+    assert!(
+        seen[0].starts_with("/api/eod-bulk-last-day/US?"),
+        "{}",
+        seen[0]
+    );
+    assert!(seen[0].contains("date=2026-09-11"), "{}", seen[0]);
+    assert!(!seen[0].contains("type="), "{}", seen[0]);
+    assert!(seen[1].contains("date=2026-09-12"), "{}", seen[1]);
+    assert!(seen[2].starts_with("/api/eod/AAPL.US?"), "{}", seen[2]);
+    assert!(seen[2].contains("from=2026-09-10"), "{}", seen[2]);
+    assert!(seen[3].contains("type=splits"), "{}", seen[3]);
+    assert!(seen[3].contains("date=2026-09-11"), "{}", seen[3]);
+    for line in &seen {
+        assert!(line.contains(&format!("api_token={TOKEN}")), "{line}");
+        assert!(line.contains("fmt=json"), "{line}");
+    }
+
+    // A symbol the provider does not know is its 404: Malformed, not the network.
+    let err = provider
+        .eod_history("NOPE.US", day("2026-09-10"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Malformed(_)), "{err:?}");
+    assert!(err.to_string().contains("404"), "{err}");
+    assert_never_prints_token(&err, &[TOKEN]);
+    let err = provider
+        .bulk_eod("MARS", day("2026-09-11"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Malformed(_)), "{err:?}");
+    assert_never_prints_token(&err, &[TOKEN]);
+
+    // A wrong token is rejected on every download call, the token in no message.
+    let wrong = "wrong-token-9999";
+    let provider = Eodhd::new(&base, wrong);
+    for err in [
+        provider
+            .bulk_eod("US", day("2026-09-11"))
+            .await
+            .unwrap_err(),
+        provider
+            .eod_history("AAPL.US", day("2026-09-10"))
+            .await
+            .unwrap_err(),
+        provider.splits("US", day("2026-09-11")).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, ProviderError::CredentialsRejected(_)),
+            "{err:?}"
+        );
+        assert_never_prints_token(&err, &[TOKEN, wrong]);
     }
 }
 
