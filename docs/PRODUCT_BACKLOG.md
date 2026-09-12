@@ -7,31 +7,10 @@ Statuses: **Proposed**, **Ready**, **In progress**, **Complete**, or **Deferred*
 
 ## Locked product decisions
 
-- Position size is notional exposure as a percentage of current account equity.
-- Maximum leverage is a cap on total portfolio gross notional divided by current account equity.
-- A 100% position target means 1.0x account equity, regardless of how many instruments were selected.
-- With two 100% positions and a 2.0x gross limit, two simultaneous signals produce 2.0x gross
-  exposure. One signal produces 1.0x; unused capacity is not reassigned automatically.
-- A single instrument may target 200% with a 2.0x gross limit.
-- Position size and leverage are editable and eligible for deliberate sensitivity studies, but are
-  not optimizer-selected by default.
-- Signal parameters may declare whether they are editable and optimizer-eligible.
-- Strategies, data libraries, and the open-source engine/UI must become independently installable.
-- The Data workspace describes the market data currently registered and available to future runs.
-- A backtest's frozen data provenance and signal-session coverage belong on that run's detail page,
-  not in the primary Data inventory.
-- Data inventory segmentation follows the provider's instrument classifications, with Common Stock
-  and ETF kept distinct. Equity industry/sector classifications are not required initially.
-- The default coverage experience uses a persistent fast cache; deeper completeness analysis is
-  requested explicitly rather than repeated on every page load.
-- The Data workspace is organized into `Inventory`, `Instrument search`, and `Updates & schedules`.
-- Historical replay and future live operation use the same causal market and broker event contract;
-  strategies must not contain separate historical and live signal logic.
-- Strategy scope is explicit: isolated state per instrument or one synchronized portfolio instance.
-- Strategies emit broker-neutral order intents; execution, positions, cash, leverage, and costs are
-  owned by broker and portfolio adapters.
-- The presence of a live-broker interface is not live-trading readiness. Connectivity,
-  reconciliation, risk controls, and operational monitoring require separate acceptance.
+The locked product decisions are decision records under `docs/decisions/` (records 0004 to
+0018, one per decision, with their context, alternatives, consequences, and what would show
+each was wrong); see the index at [docs/decisions/README.md](decisions/README.md). A change
+is a new record that supersedes the old one, never an edit here.
 
 ## Epic A: Strategy, engine, and data separation
 

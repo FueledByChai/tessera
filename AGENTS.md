@@ -78,7 +78,9 @@ Bloomberg-style research console (Vite + React bundle served by the Rust service
   `src/sdk/`, service in `src/bin/tessera_ui.rs`, web app in `web/` (`web/app/page.tsx`,
   `web/app/globals.css`), docs in `docs/`, synthetic examples in `examples/`. Product intent
   and long-form acceptance criteria live in `docs/PRODUCT_BACKLOG.md`; the executable queue
-  is `BACKLOG.md`.
+  is `BACKLOG.md`. Product and architecture decisions are the records in `docs/decisions/`
+  (index in its `README.md`; the locked product decisions are 0004 to 0018): cite them by
+  number and never restate one in a doc or a ticket.
 - `../Tessera-private` is the private repo: strategies (`strategies/*.rs`, compiled in through
   `local.toml [strategies] dirs`), frozen configs, research scripts, the legacy crate, and the
   research log. Never copy private strategies, configs, or data paths into this repo.

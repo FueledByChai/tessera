@@ -187,7 +187,8 @@ noreply address, so it does not bite. Commits from another identity would.
   the same way, with the first screen sketched into its decision record. A prompt cannot be
   unit-tested, so `scripts/prompt-check.sh` (also in the check) fails when a prompt no longer
   carries a phrase that states one of its rules, and a prompt change's PR records one real
-  run. HK-33 moves the locked product decisions into `docs/decisions/`.
+  run. The locked product decisions from `docs/PRODUCT_BACKLOG.md` live there as records
+  0004 to 0018 (HK-33); the backlog section is a pointer at the index.
 
 ## Reviewing
 
