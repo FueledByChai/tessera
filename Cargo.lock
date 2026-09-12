@@ -3255,6 +3255,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "csv",
+ "libc",
  "polars",
  "rand 0.9.5",
  "rayon",
