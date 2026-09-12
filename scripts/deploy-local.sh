@@ -18,7 +18,14 @@
 #                                           docs change, a running job, the private checks
 #                                           failing (no restart) and passing (restart), and a
 #                                           restart that does not take because the old
-#                                           service still holds the port
+#                                           service still holds the port, a start_service
+#                                           that returns from inside $(...) with the pid
+#                                           file naming the live process, and a LaunchAgent
+#                                           that abandons its process group (HK-47)
+#   scripts/deploy-local.sh --start-service internal, the self-test's: start_service alone
+#                                           against $TESSERA_ADDR (refuses a port in use)
+#
+# TESSERA_DEPLOY_HEALTH_WAIT is the seconds start_service waits for /api/health (default 60).
 #
 # Decisions, in order: not on a clean main → refuse. origin/main not ahead → nothing new, exit
 # at once (saying so if the last engine build failed its private checks and the service is
@@ -43,6 +50,7 @@ for arg in "$@"; do
     --dry-run) MODE=dry ;;
     --launchd) MODE=launchd ;;
     --self-test) MODE=selftest ;;
+    --start-service) MODE=startservice ;;  # internal: the self-test's, see start_service
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
@@ -55,6 +63,8 @@ PORT="${ADDR##*:}"
 STUB="${TESSERA_DEPLOY_STUB:-}"
 LSOF="${TESSERA_LSOF:-/usr/sbin/lsof}"
 [ -x "$LSOF" ] || LSOF="$(command -v lsof || echo /usr/sbin/lsof)"
+# Seconds start_service waits for /api/health before printing the pid (the self-test sets 1).
+HEALTH_WAIT="${TESSERA_DEPLOY_HEALTH_WAIT:-60}"
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$ROOT/data/ui/deploy.log" >&2; }
 
@@ -99,8 +109,18 @@ private_checks() {
 # Starts a new service and prints its pid. In stub mode the new pid is the old one plus one;
 # with $STUB/sticky set the stub's listener stays the old pid, which is the case where the
 # old service was never stopped and the new one could not bind.
+#
+# The console is launched detached from this shell's file descriptors (HK-47). restart_service
+# calls this inside $(...), and the earlier form, `(cd "$ROOT" && nohup tessera-ui > log 2>&1 &
+# echo $! > pid)`, backgrounded the whole and-list: bash forked a subshell for it that stayed
+# alive as the console's parent with the command substitution's pipe still on its stdout (the
+# redirections applied to nohup alone), so $(...) never returned, and $! named that subshell,
+# not the console. Now the subshell gets the log, /dev/null, and nothing else, and execs the
+# console, so $! is the console's pid (setsid, when the platform has it, gives it its own
+# session; macOS has none, which is what AbandonProcessGroup in the LaunchAgent is for), and
+# nothing of this shell outlives the call. The pid file is written here, by the caller's side.
 start_service() {
-  local old="$1" new
+  local old="$1" new detach=""
   if [ -n "$STUB" ]; then
     new="$((${old:-1000} + 1))"
     echo "$new" >> "$STUB/started"
@@ -108,10 +128,13 @@ start_service() {
     echo "$new"
     return 0
   fi
-  (cd "$ROOT" && TESSERA_ROOT="$ROOT" nohup ./target/release/tessera-ui > data/ui/api.log 2>&1 &
-   echo $! > data/ui/api.pid)
-  for _ in $(seq 1 60); do curl -sf "http://$ADDR/api/health" >/dev/null 2>&1 && break; sleep 1; done
-  cat "$ROOT/data/ui/api.pid"
+  command -v setsid >/dev/null 2>&1 && detach=setsid
+  (cd "$ROOT" && TESSERA_ROOT="$ROOT" exec $detach nohup ./target/release/tessera-ui) \
+    > "$ROOT/data/ui/api.log" 2>&1 < /dev/null &
+  new=$!
+  echo "$new" > "$ROOT/data/ui/api.pid"
+  for _ in $(seq 1 "$HEALTH_WAIT"); do curl -sf "http://$ADDR/api/health" >/dev/null 2>&1 && break; sleep 1; done
+  echo "$new"
 }
 
 restart_service() {  # prints the new pid once the port's listener is that pid
@@ -222,6 +245,7 @@ launchd_plist() {
   <array><string>/bin/bash</string><string>$ROOT/scripts/deploy-local.sh</string></array>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
   <key>StandardOutPath</key><string>$ROOT/data/ui/deploy-launchd.log</string>
   <key>StandardErrorPath</key><string>$ROOT/data/ui/deploy-launchd.log</string>
   <key>EnvironmentVariables</key>
@@ -338,6 +362,34 @@ self_test() {
     # 11. The script calls lsof by its absolute path, and the LaunchAgent PATH has /usr/sbin.
     if grep -nE '(^|[ (;|])lsof -' "$script" | grep -q .; then echo "self-test: a bare lsof call remains:"; grep -nE '(^|[ (;|])lsof -' "$script"; exit 1; fi
     bash "$script" --launchd 2>/dev/null | grep -q '/usr/sbin' || { echo "self-test: the LaunchAgent PATH should include /usr/sbin"; exit 1; }
+    # 12. start_service returns from inside $(...) against a fake service that sleeps and serves
+    #     nothing: within five seconds, the pid file naming the live process (HK-47: the launcher
+    #     subshell used to outlive the call as the console's parent with the command
+    #     substitution's pipe on its stdout, so the loop sat until the console died). Under the
+    #     PATH bash and, when it exists, /bin/bash, the shell the LaunchAgent runs.
+    mkdir -p deploy/target/release
+    printf '#!/bin/sh\nexec sleep 300\n' > deploy/target/release/tessera-ui
+    chmod +x deploy/target/release/tessera-ui
+    for shell in bash /bin/bash; do
+      [ "$shell" = bash ] || [ -x "$shell" ] || continue
+      rm -f deploy/data/ui/api.pid "$dir/start.out"
+      (cd deploy && pid="$(TESSERA_DEPLOY_STUB= TESSERA_ADDR=127.0.0.1:9 TESSERA_DEPLOY_HEALTH_WAIT=1 "$shell" "$script" --start-service 2>"$dir/start.err")"; echo "$pid" > "$dir/start.out") &
+      waiter=$!
+      for _ in $(seq 1 50); do kill -0 "$waiter" 2>/dev/null || break; sleep 0.1; done
+      if kill -0 "$waiter" 2>/dev/null; then
+        kill "$waiter" 2>/dev/null || true
+        stale="$(cat deploy/data/ui/api.pid 2>/dev/null || true)"
+        [ -z "$stale" ] || { pkill -P "$stale" 2>/dev/null || true; kill "$stale" 2>/dev/null || true; }
+        echo "self-test: start_service under $shell did not return within five seconds inside \$(...)"; cat "$dir/start.err"; exit 1
+      fi
+      wait "$waiter" || true
+      pid="$(cat "$dir/start.out" 2>/dev/null || true)"
+      [ -n "$pid" ] && [ "$pid" = "$(cat deploy/data/ui/api.pid 2>/dev/null)" ] || { echo "self-test: start_service under $shell printed '$pid', the pid file says '$(cat deploy/data/ui/api.pid 2>/dev/null)'"; cat "$dir/start.err"; exit 1; }
+      ps -o command= -p "$pid" 2>/dev/null | grep -q 'sleep 300' || { echo "self-test: pid $pid from start_service under $shell is not the fake service"; exit 1; }
+      kill "$pid"
+    done
+    # 13. The LaunchAgent abandons the process group, so a stopped loop never stops the console.
+    bash "$script" --launchd 2>/dev/null | grep -q '<key>AbandonProcessGroup</key><true/>' || { echo "self-test: the LaunchAgent must set AbandonProcessGroup"; exit 1; }
     # 7. Not on main, or dirty: refuse.
     (cd deploy && git checkout -q -b elsewhere) ; rc=0; run || rc=$?
     [ "$rc" = 3 ] && grep -q 'not main' "$dir/last.err" || { echo "self-test: off-main run: rc $rc"; cat "$dir/last.err"; exit 1; }
@@ -352,4 +404,7 @@ case "$MODE" in
   dry) deploy 1 ;;
   launchd) launchd_plist ;;
   selftest) self_test ;;
+  startservice)  # internal: start_service alone, for the self-test; refuses a port in use
+    [ -z "$(listener_pid)" ] || { echo "refusing: $(listener_pid) already listens on $PORT" >&2; exit 3; }
+    start_service "" ;;
 esac

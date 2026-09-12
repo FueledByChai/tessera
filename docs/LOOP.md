@@ -87,7 +87,15 @@ How development and research run without a person in the middle of every step. T
   started: a health answer alone can come from the old service, which is how two restarts
   went unreported on 2026-09-10 while the console stayed on a stale engine (`lsof` was not on
   the LaunchAgent's PATH and is now called by absolute path; a restart that does not take
-  exits 4, marks `data/ui/restart.failed`, and repeats on every idle run; HK-30). Each run
+  exits 4, marks `data/ui/restart.failed`, and repeats on every idle run; HK-30). The console
+  is launched detached from the loop's file descriptors: the launcher subshell gets the log
+  and `/dev/null` and execs the console, so the pid file names the console itself and
+  nothing of the loop outlives the call (on 2026-09-12 the launcher stayed alive as the
+  console's parent holding the pipe of the `$(...)` that waited for it, the run sat for two
+  hours, launchd started no new run, and killing the stuck run took the console with it);
+  the LaunchAgent from `--launchd` sets `AbandonProcessGroup`, so a stopped or killed loop
+  never stops the console (HK-47; the self-test starts a fake service inside `$(...)` and
+  fails unless the call returns within five seconds). Each run
   is one line in `data/ui/deploy.log`. So a merged
   pull request reaches the console on the Mac mini without anyone touching it, and a merge
   that breaks the private crate or a private strategy test is caught here, the one place
