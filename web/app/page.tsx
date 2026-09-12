@@ -52,6 +52,15 @@ type Strategy = {
   base_strategy_id?: string;
   source_sha256?: string;
   custom: boolean;
+  run_count: number;
+  /** The newest completed run; null before the first completes (UI-06). */
+  last_run?: StrategyLastRun | null;
+};
+type StrategyLastRun = {
+  run_id: string;
+  created_at: string;
+  /** Null when the run's report yielded no cached metrics. */
+  metrics?: RunMetrics | null;
 };
 type Run = {
   id: string;
@@ -3659,8 +3668,7 @@ function CodeWorkspace({
 }
 
 type CatalogGroupBy = "asset" | "status" | "none";
-type CatalogSortKey = "name" | "version" | "status" | "asset" | "runs" | "last";
-type CatalogRunStats = { count: number; complete: number; last?: string };
+type CatalogSortKey = "name" | "asset" | "runs" | "cagr" | "sharpe" | "drawdown" | "last";
 type CatalogRow = { strategy: Strategy; depth: number };
 type CatalogGroup = { key: string; label: string; rows: CatalogRow[] };
 
@@ -3680,39 +3688,48 @@ function catalogStatusClass(status: string) {
   return "catalog-status blocked";
 }
 
-function catalogSortValue(
-  strategy: Strategy,
-  key: CatalogSortKey,
-  stats: Map<string, CatalogRunStats>,
-): string | number {
-  const runStats = stats.get(strategy.id);
+/** Max drawdown as the catalog shows it: a loss, so the shallowest sorts as the greatest. */
+function catalogDrawdown(strategy: Strategy): number | null {
+  const value = strategy.last_run?.metrics?.max_drawdown_percent;
+  return value == null ? null : -Math.abs(value);
+}
+
+/** The sort value for a column; null when the strategy has nothing to show there (a dash). */
+function catalogSortValue(strategy: Strategy, key: CatalogSortKey): string | number | null {
   switch (key) {
     case "name":
       return strategy.name.toLowerCase();
-    case "version":
-      return strategy.version.toLowerCase();
-    case "status":
-      return CATALOG_STATUS_RANK[strategy.status] ?? 9;
     case "asset":
       return strategy.asset_scope.toLowerCase();
     case "runs":
-      return runStats?.count ?? 0;
+      return strategy.run_count;
+    case "cagr":
+      return strategy.last_run?.metrics?.cagr_percent ?? null;
+    case "sharpe":
+      return strategy.last_run?.metrics?.sharpe ?? null;
+    case "drawdown":
+      return catalogDrawdown(strategy);
     case "last":
-      return runStats?.last ?? "";
+      return strategy.last_run?.created_at ?? null;
   }
 }
 
-/** Orders base strategies by the active sort and nests each custom release beneath its base. */
+/** Orders base strategies by the active sort and nests each custom release beneath its base.
+ *  A row with no value in the sort column (no completed run, no cached metrics) sorts last in
+ *  either direction, so the dashes never lead the scoreboard. */
 function orderCatalogRows(
   strategies: Strategy[],
   sortKey: CatalogSortKey,
   sortDir: "asc" | "desc",
-  stats: Map<string, CatalogRunStats>,
 ): CatalogRow[] {
   const ids = new Set(strategies.map((strategy) => strategy.id));
   const compare = (a: Strategy, b: Strategy) => {
-    const left = catalogSortValue(a, sortKey, stats);
-    const right = catalogSortValue(b, sortKey, stats);
+    const left = catalogSortValue(a, sortKey);
+    const right = catalogSortValue(b, sortKey);
+    if (left == null || right == null) {
+      if (left == null && right == null) return a.name.localeCompare(b.name);
+      return left == null ? 1 : -1;
+    }
     const order = left < right ? -1 : left > right ? 1 : a.name.localeCompare(b.name);
     return sortDir === "asc" ? order : -order;
   };
@@ -4059,13 +4076,11 @@ function InstrumentPicker({
 
 function StrategyCatalog({
   strategies,
-  runs,
   busy,
   onOpen,
   onCode,
 }: {
   strategies: Strategy[];
-  runs: Run[];
   busy: boolean;
   onOpen: (id: string) => void;
   onCode: (id: string) => void;
@@ -4078,19 +4093,6 @@ function StrategyCatalog({
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  const runStats = useMemo(() => {
-    const stats = new Map<string, CatalogRunStats>();
-    for (const run of runs) {
-      if (!run.strategy_id) continue;
-      const current = stats.get(run.strategy_id) ?? { count: 0, complete: 0 };
-      current.count += 1;
-      if (run.status === "Complete") current.complete += 1;
-      if (!current.last || run.created_at > current.last) current.last = run.created_at;
-      stats.set(run.strategy_id, current);
-    }
-    return stats;
-  }, [runs]);
 
   const statuses = useMemo(
     () =>
@@ -4124,7 +4126,7 @@ function StrategyCatalog({
         {
           key: "all",
           label: "All strategies",
-          rows: orderCatalogRows(visible, sortKey, sortDir, runStats),
+          rows: orderCatalogRows(visible, sortKey, sortDir),
         },
       ];
     }
@@ -4141,9 +4143,9 @@ function StrategyCatalog({
     return keys.map((key) => ({
       key,
       label: key,
-      rows: orderCatalogRows(buckets.get(key) ?? [], sortKey, sortDir, runStats),
+      rows: orderCatalogRows(buckets.get(key) ?? [], sortKey, sortDir),
     }));
-  }, [strategies, query, statusFilter, showArchived, groupBy, sortKey, sortDir, runStats]);
+  }, [strategies, query, statusFilter, showArchived, groupBy, sortKey, sortDir]);
 
   const visibleRows = useMemo(
     () => groups.flatMap((group) => (collapsed.includes(group.key) ? [] : group.rows)),
@@ -4154,7 +4156,6 @@ function StrategyCatalog({
     visibleRows.find((row) => row.strategy.id === selectedId)?.strategy ??
     visibleRows[0]?.strategy ??
     null;
-  const selectedStats = selected ? runStats.get(selected.id) : undefined;
   const selectedBase = selected?.base_strategy_id
     ? strategies.find((strategy) => strategy.id === selected.base_strategy_id)
     : undefined;
@@ -4163,7 +4164,8 @@ function StrategyCatalog({
     if (sortKey === key) setSortDir((dir) => (dir === "asc" ? "desc" : "asc"));
     else {
       setSortKey(key);
-      setSortDir(key === "runs" || key === "last" ? "desc" : "asc");
+      // Counts, dates, and metrics open best-first; text columns alphabetically.
+      setSortDir(key === "name" || key === "asset" ? "asc" : "desc");
     }
   }
   function toggleGroup(key: string) {
@@ -4278,17 +4280,20 @@ function StrategyCatalog({
                   <th className="catalog-sortable" onClick={() => toggleSort("name")}>
                     Strategy{sortMark("name")}
                   </th>
-                  <th className="catalog-sortable" onClick={() => toggleSort("version")}>
-                    Ver{sortMark("version")}
-                  </th>
-                  <th className="catalog-sortable" onClick={() => toggleSort("status")}>
-                    Status{sortMark("status")}
-                  </th>
                   <th className="catalog-sortable" onClick={() => toggleSort("asset")}>
                     Assets{sortMark("asset")}
                   </th>
                   <th className="catalog-sortable catalog-right" onClick={() => toggleSort("runs")}>
                     Runs{sortMark("runs")}
+                  </th>
+                  <th className="catalog-sortable catalog-right" onClick={() => toggleSort("cagr")}>
+                    CAGR %{sortMark("cagr")}
+                  </th>
+                  <th className="catalog-sortable catalog-right" onClick={() => toggleSort("sharpe")}>
+                    Sharpe{sortMark("sharpe")}
+                  </th>
+                  <th className="catalog-sortable catalog-right" onClick={() => toggleSort("drawdown")}>
+                    Max DD %{sortMark("drawdown")}
                   </th>
                   <th className="catalog-sortable catalog-right" onClick={() => toggleSort("last")}>
                     Last run{sortMark("last")}
@@ -4306,7 +4311,7 @@ function StrategyCatalog({
                           className="catalog-group"
                           onClick={() => toggleGroup(group.key)}
                         >
-                          <td colSpan={8}>
+                          <td colSpan={9}>
                             <span aria-hidden="true">{isCollapsed ? "▸" : "▾"}</span>
                             {group.label}
                             <small>{group.rows.length}</small>
@@ -4316,7 +4321,7 @@ function StrategyCatalog({
                       {!isCollapsed &&
                         group.rows.map(({ strategy, depth }) => {
                           rowNumber += 1;
-                          const stats = runStats.get(strategy.id);
+                          const metrics = strategy.last_run?.metrics;
                           const active = selected?.id === strategy.id;
                           return (
                             <tr
@@ -4337,26 +4342,39 @@ function StrategyCatalog({
                                   className="catalog-name"
                                   style={{ paddingLeft: `${depth * 18}px` }}
                                 >
-                                  {depth > 0 && <span className="catalog-branch">└</span>}
-                                  <strong>{strategy.name}</strong>
-                                  {strategy.custom && <i className="catalog-tag">custom</i>}
-                                  <small>{strategy.id}</small>
+                                  <span className="catalog-name-line">
+                                    {depth > 0 && <span className="catalog-branch">└</span>}
+                                    <strong title={strategy.id}>{strategy.name}</strong>
+                                    {strategy.custom && <i className="catalog-tag">custom</i>}
+                                  </span>
+                                  <span className="catalog-badges">
+                                    <span className="version">{strategy.version}</span>
+                                    <span className={catalogStatusClass(strategy.status)}>
+                                      {strategy.status}
+                                    </span>
+                                  </span>
                                 </div>
-                              </td>
-                              <td>
-                                <span className="version">{strategy.version}</span>
-                              </td>
-                              <td>
-                                <span className={catalogStatusClass(strategy.status)}>
-                                  {strategy.status}
-                                </span>
                               </td>
                               <td>{strategy.asset_scope}</td>
                               <td className="catalog-right catalog-numeric">
-                                {stats?.count ?? 0}
+                                {strategy.run_count}
+                              </td>
+                              <td
+                                className={`catalog-right catalog-numeric ${signClass(metrics?.cagr_percent)}`}
+                              >
+                                {formatNumber(metrics?.cagr_percent)}
                               </td>
                               <td className="catalog-right catalog-numeric">
-                                {formatDate(stats?.last)}
+                                {formatRatio(metrics?.sharpe)}
+                              </td>
+                              <td className="catalog-right catalog-numeric metric-neg">
+                                {formatNumber(catalogDrawdown(strategy))}
+                              </td>
+                              <td
+                                className="catalog-right catalog-numeric"
+                                title={strategy.last_run?.run_id}
+                              >
+                                {formatDate(strategy.last_run?.created_at)}
                               </td>
                               <td className="catalog-right">
                                 <button
@@ -4379,7 +4397,7 @@ function StrategyCatalog({
                 })}
                 {!matchCount && (
                   <tr>
-                    <td colSpan={8} className="catalog-empty">
+                    <td colSpan={9} className="catalog-empty">
                       No strategies match “{query}”.
                     </td>
                   </tr>
@@ -4449,8 +4467,8 @@ function StrategyCatalog({
                 <div>
                   <dt>Runs</dt>
                   <dd>
-                    {selectedStats
-                      ? `${selectedStats.count} total · ${selectedStats.complete} complete · last ${formatDate(selectedStats.last)}`
+                    {selected.run_count
+                      ? `${selected.run_count} total · last completed ${formatDate(selected.last_run?.created_at)}`
                       : "None in the UI catalog"}
                   </dd>
                 </div>
@@ -6480,7 +6498,6 @@ export default function Home() {
           {view === "strategies" && (
             <StrategyCatalog
               strategies={dashboard.strategies}
-              runs={runs}
               busy={busy}
               onOpen={(id) => void openStrategy(id)}
               onCode={(id) => void openCode(id)}
