@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
 use chrono_tz::America::Los_Angeles;
@@ -21,6 +21,8 @@ use tessera::local_config::LocalConfig;
 use tessera::portfolio::{
     CapitalMode, PortfolioComponentConfig, PortfolioConfig, RebalanceMethod, combine_portfolio,
 };
+use tessera::provider::eodhd::Eodhd;
+use tessera::provider::{Provider, ProviderError};
 use tessera::report::{ReportView, generate_report, load_report_view};
 use tessera::sdk::manifest::Manifest as SdkManifest;
 use tessera::sdk::runner::{
@@ -42,6 +44,9 @@ struct AppState {
         Arc<Mutex<std::collections::HashMap<PathBuf, (std::time::SystemTime, Vec<SdkManifest>)>>>,
     /// Inventory of configured data sources (sizes and coverage), refreshed every ten minutes.
     data_sources: Arc<Mutex<Option<(std::time::Instant, DataSourcesResponse)>>>,
+    /// Where the EODHD adapter's calls go: the public API unless `TESSERA_EODHD_BASE_URL`
+    /// points a scratch console at a stub (the service tests do the same in memory).
+    eodhd_base_url: Arc<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -610,6 +615,10 @@ async fn main() -> Result<()> {
         instruments: Arc::new(Mutex::new(None)),
         sdk_manifests: Arc::new(Mutex::new(std::collections::HashMap::new())),
         data_sources: Arc::new(Mutex::new(None)),
+        eodhd_base_url: Arc::new(
+            std::env::var("TESSERA_EODHD_BASE_URL")
+                .unwrap_or_else(|_| tessera::provider::eodhd::DEFAULT_BASE_URL.to_owned()),
+        ),
     };
     import_legacy_reports(&state)?;
     let metrics_state = state.clone();
@@ -634,7 +643,7 @@ async fn main() -> Result<()> {
             "http://127.0.0.1:5173".parse::<HeaderValue>()?,
             "http://localhost:5173".parse::<HeaderValue>()?,
         ])
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
     let web_dist = state.root.join("web").join("dist");
     let web_ready = web_dist.join("index.html").is_file();
@@ -645,7 +654,29 @@ async fn main() -> Result<()> {
             web_dist.join("index.html"),
         ));
 
-    let app = Router::new()
+    let app = api_router()
+        .fallback_service(static_site)
+        .layer(cors)
+        .with_state(state);
+
+    // TESSERA_ADDR moves a scratch instance off the real console's port (scripts/scratch-console.sh).
+    let address = std::env::var("TESSERA_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_owned());
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    if web_ready {
+        println!("Tessera console at http://{address}/ (API under /api)");
+    } else {
+        println!(
+            "Tessera API listening on http://{address}; console bundle not built yet (run `npm run build` in web/)"
+        );
+    }
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The API routes, without the static site, so the service tests serve exactly what the
+/// console talks to.
+fn api_router() -> Router<AppState> {
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/dashboard", get(dashboard))
         .route("/api/strategies/{id}", get(strategy_detail))
@@ -713,22 +744,10 @@ async fn main() -> Result<()> {
             post(build_strategy_draft),
         )
         .route("/api/data/update-eod", post(start_eod_update))
-        .fallback_service(static_site)
-        .layer(cors)
-        .with_state(state);
-
-    // TESSERA_ADDR moves a scratch instance off the real console's port (scripts/scratch-console.sh).
-    let address = std::env::var("TESSERA_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_owned());
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    if web_ready {
-        println!("Tessera console at http://{address}/ (API under /api)");
-    } else {
-        println!(
-            "Tessera API listening on http://{address}; console bundle not built yet (run `npm run build` in web/)"
-        );
-    }
-    axum::serve(listener, app).await?;
-    Ok(())
+        .route("/api/sources", get(list_sources).post(create_source))
+        .route("/api/sources/{id}", delete(delete_source))
+        .route("/api/sources/{id}/token", put(replace_token))
+        .route("/api/sources/{id}/verify", post(verify_source))
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -921,6 +940,19 @@ fn migrate(connection: &Connection) -> Result<()> {
              finished_at TEXT,
              log_path TEXT NOT NULL,
              error TEXT
+         );
+         CREATE TABLE IF NOT EXISTS data_sources (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             root TEXT NOT NULL,
+             catalog_dir TEXT NOT NULL,
+             reserve_pct REAL NOT NULL DEFAULT 5,
+             token_set_at TEXT,
+             verified_at TEXT,
+             verify_state TEXT NOT NULL DEFAULT 'unverified',
+             verify_message TEXT,
+             created_at TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at DESC);
@@ -4278,6 +4310,504 @@ async fn run_eod_update(state: AppState, id: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Registered data sources (DS-03, decisions 0020 and 0021): a row per provider account in
+// the catalog, its token in a 0600 file under data/ui/secrets/ that no response, log line,
+// or error message names.
+// ---------------------------------------------------------------------------
+
+/// The provider kinds compiled in, as `data_sources.kind` names them; the console's Add
+/// source form offers exactly these.
+const PROVIDER_KINDS: &[&str] = &["eodhd"];
+
+/// Default share of the daily limit kept back from jobs (decision 0022).
+const DEFAULT_RESERVE_PCT: f64 = 5.0;
+
+/// A source's connection state, as the card shows it.
+const VERIFY_CONNECTED: &str = "connected";
+const VERIFY_REJECTED: &str = "credentials_rejected";
+const VERIFY_UNREACHABLE: &str = "unreachable";
+
+/// Where a source's token file lives, relative to the service root.
+const SECRETS_DIR: &str = "data/ui/secrets";
+
+/// The adapters compiled in, keyed by a source's `kind`. The `Provider` trait's futures are
+/// return-position impl-trait, so it is not object-safe; this enum holds each adapter
+/// concretely and a new provider adds a variant.
+enum SourceAdapter {
+    Eodhd(Eodhd),
+}
+
+impl SourceAdapter {
+    fn new(state: &AppState, kind: &str, token: &str) -> Result<Self> {
+        match kind {
+            "eodhd" => Ok(SourceAdapter::Eodhd(Eodhd::new(
+                &state.eodhd_base_url,
+                token,
+            ))),
+            other => bail!(
+                "unknown provider kind {other:?}; compiled in: {}",
+                PROVIDER_KINDS.join(", ")
+            ),
+        }
+    }
+
+    async fn verify(&self, token: &str) -> Result<tessera::provider::Account, ProviderError> {
+        match self {
+            SourceAdapter::Eodhd(eodhd) => eodhd.verify(token).await,
+        }
+    }
+}
+
+/// The root volume's figures from statvfs, in bytes.
+#[derive(Debug, Clone, Serialize)]
+struct VolumeFigures {
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+}
+
+/// A source card: everything the console shows. The token and its file's path are not here.
+#[derive(Debug, Clone, Serialize)]
+struct SourceCard {
+    id: String,
+    name: String,
+    kind: String,
+    root: String,
+    catalog_dir: String,
+    reserve_pct: f64,
+    root_exists: bool,
+    volume: Option<VolumeFigures>,
+    /// Whether a token file exists for the source (a restored catalog may have the row and
+    /// not the file; the token then has to be entered again).
+    token_set: bool,
+    token_set_at: Option<String>,
+    verified_at: Option<String>,
+    verify_state: String,
+    verify_message: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SourcesResponse {
+    kinds: Vec<&'static str>,
+    sources: Vec<SourceCard>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSourceRequest {
+    kind: String,
+    name: String,
+    root: String,
+    catalog_dir: String,
+    token: String,
+    #[serde(default = "default_reserve_pct")]
+    reserve_pct: f64,
+}
+
+fn default_reserve_pct() -> f64 {
+    DEFAULT_RESERVE_PCT
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenRequest {
+    token: String,
+}
+
+struct SourceRow {
+    id: String,
+    name: String,
+    kind: String,
+    root: String,
+    catalog_dir: String,
+    reserve_pct: f64,
+    token_set_at: Option<String>,
+    verified_at: Option<String>,
+    verify_state: String,
+    verify_message: Option<String>,
+    created_at: String,
+}
+
+const SOURCE_COLUMNS: &str = "id, name, kind, root, catalog_dir, reserve_pct, token_set_at, \
+     verified_at, verify_state, verify_message, created_at";
+
+fn map_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceRow> {
+    Ok(SourceRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        root: row.get(3)?,
+        catalog_dir: row.get(4)?,
+        reserve_pct: row.get(5)?,
+        token_set_at: row.get(6)?,
+        verified_at: row.get(7)?,
+        verify_state: row.get(8)?,
+        verify_message: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+fn load_source_rows(state: &AppState) -> Result<Vec<SourceRow>> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    let mut statement = connection.prepare(&format!(
+        "SELECT {SOURCE_COLUMNS} FROM data_sources ORDER BY created_at, id"
+    ))?;
+    let rows = statement
+        .query_map([], map_source)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn load_source_row(state: &AppState, id: &str) -> Result<Option<SourceRow>> {
+    let connection = state.database.lock().expect("database lock poisoned");
+    Ok(connection
+        .query_row(
+            &format!("SELECT {SOURCE_COLUMNS} FROM data_sources WHERE id = ?1"),
+            [id],
+            map_source,
+        )
+        .optional()?)
+}
+
+/// The card for a row: the root's presence and volume figures, and whether its token file
+/// exists, read at the time of the call.
+fn card_of(state: &AppState, row: SourceRow) -> SourceCard {
+    let root = Path::new(&row.root);
+    let root_exists = root.is_dir();
+    let volume = if root_exists {
+        volume_figures(root)
+    } else {
+        None
+    };
+    let token_set = token_path(state, &row.id).is_file();
+    SourceCard {
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        root: row.root,
+        catalog_dir: row.catalog_dir,
+        reserve_pct: row.reserve_pct,
+        root_exists,
+        volume,
+        token_set,
+        token_set_at: row.token_set_at,
+        verified_at: row.verified_at,
+        verify_state: row.verify_state,
+        verify_message: row.verify_message,
+        created_at: row.created_at,
+    }
+}
+
+fn load_source_card(state: &AppState, id: &str) -> Result<SourceCard, ApiError> {
+    let row = load_source_row(state, id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    Ok(card_of(state, row))
+}
+
+/// statvfs on `path`: the volume's total size, what is used, and what is free to this
+/// process. `None` when the path cannot be stat'ed (an unmounted root).
+fn volume_figures(path: &Path) -> Option<VolumeFigures> {
+    use std::os::unix::ffi::OsStrExt;
+    // The field types differ by platform (u32 counts on macOS, u64 on Linux).
+    fn wide<T: Into<u64>>(n: T) -> u64 {
+        n.into()
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: statvfs reads a NUL-terminated path and writes the whole struct on success.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: a zero return means statvfs filled the struct.
+    let stat = unsafe { stat.assume_init() };
+    let fragment = wide(stat.f_frsize);
+    let blocks = wide(stat.f_blocks);
+    Some(VolumeFigures {
+        total_bytes: blocks.saturating_mul(fragment),
+        used_bytes: blocks
+            .saturating_sub(wide(stat.f_bfree))
+            .saturating_mul(fragment),
+        free_bytes: wide(stat.f_bavail).saturating_mul(fragment),
+    })
+}
+
+/// Whether any regular file lies under `root` (the dataset folders live under it). A
+/// missing or unreadable root holds none; symlinks are not followed.
+fn holds_files(root: &Path) -> bool {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_file() {
+                return true;
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    false
+}
+
+fn secrets_dir(state: &AppState) -> PathBuf {
+    state.root.join(SECRETS_DIR)
+}
+
+fn token_path(state: &AppState, id: &str) -> PathBuf {
+    secrets_dir(state).join(format!("{id}.token"))
+}
+
+/// Writes `token` for source `id` to a file only the service's user can read (0600 in a
+/// 0700 folder), through a part file renamed over any earlier token so a replacement is
+/// atomic. The errors name neither the token nor the path.
+fn write_token(state: &AppState, id: &str, token: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let dir = secrets_dir(state);
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent).context("create the UI state folder")?;
+    }
+    if !dir.is_dir() {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .context("create the secrets folder")?;
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        .context("restrict the secrets folder")?;
+    let part = dir.join(format!("{id}.token.part"));
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&part)
+            .context("create the token file")?;
+        file.write_all(token.as_bytes())
+            .context("write the token file")?;
+        file.sync_all().context("flush the token file")?;
+    }
+    fs::set_permissions(&part, fs::Permissions::from_mode(0o600))
+        .context("restrict the token file")?;
+    fs::rename(&part, token_path(state, id)).context("place the token file")?;
+    Ok(())
+}
+
+/// The token on file for source `id`; an error, never naming the path, when there is none.
+fn read_token(state: &AppState, id: &str) -> Result<String> {
+    let text = fs::read_to_string(token_path(state, id))
+        .map_err(|_| anyhow::anyhow!("no token is set for source {id:?}; replace it"))?;
+    Ok(text.trim().to_owned())
+}
+
+fn remove_token(state: &AppState, id: &str) -> Result<()> {
+    match fs::remove_file(token_path(state, id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => bail!("could not remove the token file for source {id:?}"),
+    }
+}
+
+/// The card state and message a verification outcome records.
+fn verify_state_of(error: &ProviderError) -> (&'static str, String) {
+    match error {
+        ProviderError::CredentialsRejected(message) => (VERIFY_REJECTED, message.clone()),
+        other => (VERIFY_UNREACHABLE, other.to_string()),
+    }
+}
+
+/// The refusal for a token that could not be verified while registering or replacing:
+/// 422 with the provider's message for a rejected token, 502 when the provider could not
+/// be asked. Nothing is saved either way.
+fn refused(error: ProviderError) -> ApiError {
+    match error {
+        ProviderError::CredentialsRejected(_) => {
+            api_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
+        _ => api_error(StatusCode::BAD_GATEWAY, error.to_string()),
+    }
+}
+
+fn validate_source_request(request: &CreateSourceRequest) -> Result<()> {
+    if !PROVIDER_KINDS.contains(&request.kind.as_str()) {
+        bail!(
+            "unknown provider kind {:?}; compiled in: {}",
+            request.kind,
+            PROVIDER_KINDS.join(", ")
+        );
+    }
+    if request.name.trim().is_empty() {
+        bail!("name is required");
+    }
+    if request.name.chars().count() > 80 {
+        bail!("name must be at most 80 characters");
+    }
+    for (label, value) in [
+        ("root", &request.root),
+        ("catalog folder", &request.catalog_dir),
+    ] {
+        if value.trim().is_empty() {
+            bail!("{label} is required");
+        }
+        if !Path::new(value).is_absolute() {
+            bail!("{label} must be an absolute path");
+        }
+    }
+    if request.token.trim().is_empty() {
+        bail!("token is required");
+    }
+    if !(0.0..=100.0).contains(&request.reserve_pct) || request.reserve_pct.is_nan() {
+        bail!("reserve_pct must be between 0 and 100");
+    }
+    Ok(())
+}
+
+async fn list_sources(State(state): State<AppState>) -> Result<Json<SourcesResponse>, ApiError> {
+    let worker = state.clone();
+    let sources = tokio::task::spawn_blocking(move || -> Result<Vec<SourceCard>> {
+        let rows = load_source_rows(&worker)?;
+        Ok(rows.into_iter().map(|row| card_of(&worker, row)).collect())
+    })
+    .await
+    .context("sources task failed")??;
+    Ok(Json(SourcesResponse {
+        kinds: PROVIDER_KINDS.to_vec(),
+        sources,
+    }))
+}
+
+async fn create_source(
+    State(state): State<AppState>,
+    Json(request): Json<CreateSourceRequest>,
+) -> Result<(StatusCode, Json<SourceCard>), ApiError> {
+    validate_source_request(&request)?;
+    let token = request.token.trim().to_owned();
+    let adapter = SourceAdapter::new(&state, &request.kind, &token)?;
+    adapter.verify(&token).await.map_err(refused)?;
+    let now = Utc::now();
+    let id = format!("source-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
+    let stamp = now.to_rfc3339();
+    write_token(&state, &id, &token)?;
+    let inserted = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "INSERT INTO data_sources
+             (id, name, kind, root, catalog_dir, reserve_pct, token_set_at, verified_at,
+              verify_state, verify_message, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, NULL, ?7)",
+            params![
+                id,
+                request.name.trim(),
+                request.kind,
+                request.root.trim(),
+                request.catalog_dir.trim(),
+                request.reserve_pct,
+                stamp,
+                VERIFY_CONNECTED,
+            ],
+        )
+    };
+    if let Err(error) = inserted {
+        let _ = remove_token(&state, &id);
+        return Err(anyhow::Error::from(error)
+            .context("record the source")
+            .into());
+    }
+    let card = load_source_card(&state, &id)?;
+    Ok((StatusCode::CREATED, Json(card)))
+}
+
+async fn replace_token(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<TokenRequest>,
+) -> Result<Json<SourceCard>, ApiError> {
+    let row = load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    let token = request.token.trim().to_owned();
+    require_api(!token.is_empty(), "token is required")?;
+    let adapter = SourceAdapter::new(&state, &row.kind, &token)?;
+    adapter.verify(&token).await.map_err(refused)?;
+    write_token(&state, &id, &token)?;
+    let stamp = Utc::now().to_rfc3339();
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "UPDATE data_sources
+             SET token_set_at = ?2, verified_at = ?2, verify_state = ?3, verify_message = NULL
+             WHERE id = ?1",
+            params![id, stamp, VERIFY_CONNECTED],
+        )?;
+    }
+    Ok(Json(load_source_card(&state, &id)?))
+}
+
+/// Re-checks the token on file and records the outcome on the card; the response is the
+/// card whatever the provider said, since the check itself succeeded.
+async fn verify_source(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<SourceCard>, ApiError> {
+    let row = load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    let token =
+        read_token(&state, &id).map_err(|e| api_error(StatusCode::CONFLICT, e.to_string()))?;
+    let adapter = SourceAdapter::new(&state, &row.kind, &token)?;
+    let (verify_state, message) = match adapter.verify(&token).await {
+        Ok(_) => (VERIFY_CONNECTED, None),
+        Err(error) => {
+            let (verify_state, message) = verify_state_of(&error);
+            (verify_state, Some(message))
+        }
+    };
+    let stamp = Utc::now().to_rfc3339();
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "UPDATE data_sources SET verified_at = ?2, verify_state = ?3, verify_message = ?4
+             WHERE id = ?1",
+            params![id, stamp, verify_state, message],
+        )?;
+    }
+    Ok(Json(load_source_card(&state, &id)?))
+}
+
+/// Removes the record and its token file. Refused while any file lies under the root: the
+/// console never deletes data files (decision 0022).
+async fn delete_source(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let row = load_source_row(&state, &id)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("no source {id:?}")))?;
+    let root = PathBuf::from(&row.root);
+    let occupied = tokio::task::spawn_blocking(move || holds_files(&root))
+        .await
+        .context("dataset scan failed")?;
+    if occupied {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "source {:?} still has files under {}; the console never deletes data files",
+                row.name, row.root
+            ),
+        ));
+    }
+    {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute("DELETE FROM data_sources WHERE id = ?1", [&id])?;
+    }
+    remove_token(&state, &id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
 // Feature studies on the tick lake (feature vs forward return).
 // ---------------------------------------------------------------------------
 
@@ -6421,23 +6951,29 @@ fn active_worker_count(state: &AppState) -> usize {
     2usize.saturating_sub(state.workers.available_permits())
 }
 
+/// An API failure: the status to answer with and the error. Any error converts to a 400;
+/// `api_error` names another status (404, 409, 422, 502).
 #[derive(Debug)]
-struct ApiError(anyhow::Error);
+struct ApiError(StatusCode, anyhow::Error);
 
 impl<E> From<E> for ApiError
 where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self(StatusCode::BAD_REQUEST, error.into())
     }
+}
+
+fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
+    ApiError(status, anyhow::anyhow!(message.into()))
 }
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("{:#}", self.0) })),
+            self.0,
+            Json(serde_json::json!({ "error": format!("{:#}", self.1) })),
         )
             .into_response()
     }
@@ -6920,5 +7456,348 @@ mod tests {
         assert!(validate_strategy_slug("Gap Fade v2").is_err());
         assert!(validate_strategy_slug("../gap_fade").is_err());
         assert!(validate_strategy_slug("2bad").is_err());
+    }
+
+    /// DS-03 (decisions 0020, 0021): sources are registered through the service against the
+    /// DS-02 stub, the token lives in a 0600 file under a 0700 folder, and neither the token
+    /// nor its path appears in any `/api/sources` or `/api/data` response.
+    mod sources {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use axum::extract::Query as AxumQuery;
+        use axum::response::Response;
+
+        /// Placeholders, never real tokens. The stub accepts exactly these two.
+        const TOKEN: &str = "stub-token-0000";
+        const REPLACEMENT: &str = "stub-token-1111";
+
+        #[derive(Clone)]
+        struct Stub {
+            down: Arc<AtomicBool>,
+        }
+
+        async fn stub_user(
+            State(stub): State<Stub>,
+            AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+        ) -> Response {
+            if stub.down.load(Ordering::SeqCst) {
+                return (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").into_response();
+            }
+            let token = query
+                .iter()
+                .find(|(k, _)| k == "api_token")
+                .map(|(_, v)| v.as_str());
+            if token != Some(TOKEN) && token != Some(REPLACEMENT) {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [("content-type", "application/json")],
+                    r#"{"message":"Unauthenticated","code":401}"#,
+                )
+                    .into_response();
+            }
+            let body = fs::read_to_string(format!(
+                "{}/tests/fixtures/eodhd/user.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            (StatusCode::OK, [("content-type", "application/json")], body).into_response()
+        }
+
+        async fn serve(router: Router) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            format!("http://{addr}")
+        }
+
+        /// The DS-02 stub's `/api/user`, with a switch that makes it answer 503.
+        async fn stub() -> (String, Arc<AtomicBool>) {
+            let down = Arc::new(AtomicBool::new(false));
+            let router = Router::new()
+                .route("/api/user", get(stub_user))
+                .with_state(Stub { down: down.clone() });
+            (serve(router).await, down)
+        }
+
+        /// A service over an in-memory catalog, a scratch root, and the stub as EODHD.
+        fn test_state(root: &Path, eodhd_base_url: &str) -> AppState {
+            let connection = Connection::open_in_memory().unwrap();
+            migrate(&connection).unwrap();
+            AppState {
+                root: root.to_path_buf(),
+                local: Arc::new(LocalConfig::bundled_example(Path::new(env!(
+                    "CARGO_MANIFEST_DIR"
+                )))),
+                database: Arc::new(Mutex::new(connection)),
+                workers: Arc::new(Semaphore::new(2)),
+                instruments: Arc::new(Mutex::new(None)),
+                sdk_manifests: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                data_sources: Arc::new(Mutex::new(None)),
+                eodhd_base_url: Arc::new(eodhd_base_url.to_owned()),
+            }
+        }
+
+        fn source_count(state: &AppState) -> i64 {
+            state
+                .database
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM data_sources", [], |row| row.get(0))
+                .unwrap()
+        }
+
+        fn mode_of(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        fn scratch_root(tag: &str) -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "tessera-ds03-{tag}-{}-{}",
+                std::process::id(),
+                Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            ))
+        }
+
+        #[tokio::test]
+        async fn a_registered_sources_token_and_file_stay_out_of_every_response() {
+            let (eodhd, down) = stub().await;
+            let root = scratch_root("service");
+            let library = root.join("library");
+            fs::create_dir_all(&library).unwrap();
+            let state = test_state(&root, &eodhd);
+            let api = serve(api_router().with_state(state.clone())).await;
+            let client = reqwest::Client::new();
+            let secrets_dir = root.join("data/ui/secrets");
+            let secrets_path = secrets_dir.display().to_string();
+            let leaks = [TOKEN, REPLACEMENT, secrets_path.as_str(), "data/ui/secrets"];
+            let mut responses: Vec<(String, String)> = Vec::new();
+
+            // A rejected token is refused with the provider's message: no row, no file.
+            let response = client
+                .post(format!("{api}/api/sources"))
+                .json(&serde_json::json!({
+                    "kind": "eodhd", "name": "EODHD", "root": library,
+                    "catalog_dir": library.join("catalog"), "token": "wrong-token-9999"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = response.text().await.unwrap();
+            assert!(body.contains("Unauthenticated"), "{body}");
+            responses.push(("POST rejected".into(), body));
+            assert_eq!(source_count(&state), 0);
+            assert!(
+                !secrets_dir.exists() || fs::read_dir(&secrets_dir).unwrap().next().is_none(),
+                "a rejected token left a file"
+            );
+
+            // A kind that is not compiled in is refused before any call.
+            let response = client
+                .post(format!("{api}/api/sources"))
+                .json(&serde_json::json!({
+                    "kind": "quandl", "name": "Q", "root": library,
+                    "catalog_dir": library.join("catalog"), "token": TOKEN
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            responses.push(("POST unknown kind".into(), response.text().await.unwrap()));
+            assert_eq!(source_count(&state), 0);
+
+            // A verified token registers the source: a row, a 0600 file in a 0700 folder.
+            let response = client
+                .post(format!("{api}/api/sources"))
+                .json(&serde_json::json!({
+                    "kind": "eodhd", "name": "EODHD", "root": library,
+                    "catalog_dir": library.join("catalog"), "token": TOKEN
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body = response.text().await.unwrap();
+            let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+            responses.push(("POST created".into(), body));
+            let id = card["id"].as_str().unwrap().to_owned();
+            assert_eq!(card["kind"], "eodhd");
+            assert_eq!(card["verify_state"], "connected");
+            assert_eq!(card["token_set"], true);
+            assert!(card["token_set_at"].is_string() && card["verified_at"].is_string());
+            assert_eq!(card["root_exists"], true);
+            assert_eq!(card["reserve_pct"], 5.0);
+            let volume = &card["volume"];
+            assert!(volume["total_bytes"].as_u64().unwrap() > 0, "{volume}");
+            assert!(
+                volume["used_bytes"].as_u64().unwrap() + volume["free_bytes"].as_u64().unwrap()
+                    <= volume["total_bytes"].as_u64().unwrap(),
+                "{volume}"
+            );
+            assert_eq!(source_count(&state), 1);
+            let token_file = secrets_dir.join(format!("{id}.token"));
+            assert_eq!(fs::read_to_string(&token_file).unwrap(), TOKEN);
+            assert_eq!(mode_of(&token_file), 0o600);
+            assert_eq!(mode_of(&secrets_dir), 0o700);
+
+            // A rejected replacement changes nothing; an accepted one rewrites the file 0600.
+            let response = client
+                .put(format!("{api}/api/sources/{id}/token"))
+                .json(&serde_json::json!({ "token": "wrong-token-9999" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            responses.push(("PUT token rejected".into(), response.text().await.unwrap()));
+            assert_eq!(fs::read_to_string(&token_file).unwrap(), TOKEN);
+            let response = client
+                .put(format!("{api}/api/sources/{id}/token"))
+                .json(&serde_json::json!({ "token": REPLACEMENT }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.text().await.unwrap();
+            let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+            responses.push(("PUT token".into(), body));
+            assert_eq!(card["verify_state"], "connected");
+            assert_eq!(fs::read_to_string(&token_file).unwrap(), REPLACEMENT);
+            assert_eq!(mode_of(&token_file), 0o600);
+            assert_eq!(
+                fs::read_dir(&secrets_dir).unwrap().count(),
+                1,
+                "the replacement left a part file behind"
+            );
+
+            // Re-verifying with the provider down records Unreachable and keeps the source.
+            down.store(true, Ordering::SeqCst);
+            let response = client
+                .post(format!("{api}/api/sources/{id}/verify"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.text().await.unwrap();
+            let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+            responses.push(("POST verify down".into(), body));
+            assert_eq!(card["verify_state"], "unreachable");
+            assert!(
+                card["verify_message"].as_str().unwrap().contains("503"),
+                "{card}"
+            );
+            down.store(false, Ordering::SeqCst);
+            let response = client
+                .post(format!("{api}/api/sources/{id}/verify"))
+                .send()
+                .await
+                .unwrap();
+            let body = response.text().await.unwrap();
+            let card: serde_json::Value = serde_json::from_str(&body).unwrap();
+            responses.push(("POST verify up".into(), body));
+            assert_eq!(card["verify_state"], "connected");
+            assert!(card["verify_message"].is_null(), "{card}");
+
+            // The list carries the card and the kinds compiled in.
+            let body = client
+                .get(format!("{api}/api/sources"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+            responses.push(("GET sources".into(), body));
+            assert_eq!(list["kinds"], serde_json::json!(["eodhd"]));
+            assert_eq!(list["sources"].as_array().unwrap().len(), 1);
+            assert_eq!(list["sources"][0]["id"], id.as_str());
+            assert_eq!(list["sources"][0]["name"], "EODHD");
+            assert_eq!(
+                list["sources"][0]["root"],
+                library.display().to_string().as_str()
+            );
+
+            // The Data page's other responses stay clean as well.
+            for path in ["/api/data/sources?refresh=1", "/api/data/status"] {
+                let response = client.get(format!("{api}{path}")).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                responses.push((format!("GET {path}"), response.text().await.unwrap()));
+            }
+
+            // A file under the root refuses the delete; without one, row and file go.
+            fs::create_dir_all(library.join("eod")).unwrap();
+            fs::write(library.join("eod/SPY.US.csv"), "Date,Close\n2026-01-02,1\n").unwrap();
+            let response = client
+                .delete(format!("{api}/api/sources/{id}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            responses.push(("DELETE refused".into(), response.text().await.unwrap()));
+            assert_eq!(source_count(&state), 1);
+            assert!(token_file.is_file());
+            fs::remove_dir_all(library.join("eod")).unwrap();
+            let response = client
+                .delete(format!("{api}/api/sources/{id}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(source_count(&state), 0);
+            assert!(!token_file.exists(), "the token file outlived its source");
+            assert!(
+                library.is_dir(),
+                "the console must never remove data folders"
+            );
+            let response = client
+                .delete(format!("{api}/api/sources/{id}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            responses.push(("DELETE missing".into(), response.text().await.unwrap()));
+
+            for (label, body) in &responses {
+                for leak in &leaks {
+                    assert!(!body.contains(leak), "{label} carries {leak:?}: {body}");
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn the_root_volume_is_measured_and_a_missing_root_has_none() {
+            let here = volume_figures(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+            assert!(here.total_bytes > 0);
+            assert!(here.used_bytes <= here.total_bytes);
+            assert!(here.free_bytes <= here.total_bytes);
+            assert!(volume_figures(Path::new("/nonexistent/tessera-ds03")).is_none());
+        }
+
+        #[test]
+        fn a_root_holds_files_only_when_a_regular_file_lies_under_it() {
+            let root = scratch_root("holds");
+            assert!(!holds_files(&root));
+            fs::create_dir_all(root.join("eod/nested")).unwrap();
+            assert!(!holds_files(&root));
+            fs::write(root.join("eod/nested/x.csv"), "a").unwrap();
+            assert!(holds_files(&root));
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn provider_errors_map_to_the_card_states_and_refusal_statuses() {
+            let rejected = ProviderError::CredentialsRejected("Unauthenticated".into());
+            let unreachable = ProviderError::Unreachable("HTTP 503".into());
+            let malformed = ProviderError::Malformed("not json".into());
+            assert_eq!(verify_state_of(&rejected).0, VERIFY_REJECTED);
+            assert_eq!(verify_state_of(&unreachable).0, VERIFY_UNREACHABLE);
+            assert_eq!(verify_state_of(&malformed).0, VERIFY_UNREACHABLE);
+            assert_eq!(refused(rejected).0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(refused(unreachable).0, StatusCode::BAD_GATEWAY);
+            assert_eq!(refused(malformed).0, StatusCode::BAD_GATEWAY);
+        }
     }
 }
