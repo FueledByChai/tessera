@@ -3,6 +3,8 @@
 // terminal and modern mode, through the run overview, a strategy page, and the studies page,
 // and fails when the page body scrolls horizontally or an element's right edge passes the
 // viewport without a scrolling ancestor (a wide table must scroll inside its own wrapper).
+// On the strategy page it also counts the fields in the first row of the Data and sizing grid
+// and fails under six (UI-04: numeric fields take one auto-fit track, dates and selects two).
 //
 //   node web/scripts/layout-check.mjs                  this checkout's web/dist, API from the
 //                                                      console at LAYOUT_CONSOLE (127.0.0.1:8787)
@@ -67,6 +69,33 @@ function measure() {
     innerWidth: vw,
     offenders: [...new Set(offenders)].slice(0, 10),
     clipped: [...new Set(clipped)].slice(0, 10),
+  };
+}
+
+/** The strategy page's form grids are tracks sized so a row holds at least this many fields (UI-04). */
+const FIELDS_PER_ROW = 6;
+
+/**
+ * Runs in the page: the fields in the first row of the Data and sizing grid, the grid's direct
+ * children grouped by their top edge. Null when the page has no such grid (a strategy without
+ * the SDK form), so the caller can say so instead of passing vacuously.
+ */
+function countFirstRow() {
+  const section = [...document.querySelectorAll(".form-section")].find((s) =>
+    /^Data and sizing/.test(s.querySelector("h3")?.textContent?.trim() ?? ""),
+  );
+  const grid = section?.querySelector(".field-grid");
+  if (!grid) return null;
+  const tops = [...grid.children]
+    .map((el) => el.getBoundingClientRect())
+    .filter((r) => r.width > 0 && r.height > 0)
+    .map((r) => Math.round(r.top));
+  if (!tops.length) return { first: 0, total: 0, width: Math.round(grid.getBoundingClientRect().width) };
+  const top = Math.min(...tops);
+  return {
+    first: tops.filter((t) => Math.abs(t - top) <= 1).length,
+    total: tops.length,
+    width: Math.round(grid.getBoundingClientRect().width),
   };
 }
 
@@ -177,6 +206,16 @@ try {
         }
         if (wide) failures.push(`${label}: page scrolls horizontally (${result.scrollWidth} > ${result.innerWidth})`);
         for (const note of notes) failures.push(`${label}: ${note}`);
+        if (name === "strategy page") {
+          const row = await page.evaluate(countFirstRow);
+          if (!row) failures.push(`${label}: no Data and sizing grid to count (the first strategy in the catalog has no SDK form)`);
+          else {
+            if (verbose) console.log(`${label}: Data and sizing grid ${row.width}px, ${row.first} of ${row.total} fields in the first row`);
+            if (row.first < FIELDS_PER_ROW) {
+              failures.push(`${label}: Data and sizing grid holds ${row.first} field(s) in its first row, under ${FIELDS_PER_ROW} (grid ${row.width}px, ${row.total} fields)`);
+            }
+          }
+        }
       }
       await context.close();
     }
@@ -193,5 +232,5 @@ if (failures.length) {
 }
 const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, Data and sizing rows hold ${FIELDS_PER_ROW}+ fields`}, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );
