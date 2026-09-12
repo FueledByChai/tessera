@@ -4499,9 +4499,14 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 }
 /* The dialog: the whole run form as four labelled rows, each row's label in a column on the
    left of its grid, wide enough that the Data row keeps six fields at 1280 px (UI-04) and never
-   taller than the viewport, the rows scrolling inside it when a strategy declares many
-   parameters. web/scripts/layout-check.mjs opens it at 1280 and 1440 px in both modes and fails
-   when it passes the viewport; web/scripts/run-form-check.mjs drives it. */
+   taller than the viewport. At 1280x800 the whole form shows for a strategy declaring up to
+   eight parameters, the symbol picker open, in either mode (UI-07): the head and foot are as
+   dense in modern mode as in terminal mode, and a hint under a control is clamped at two lines
+   with the full text as its tooltip, since a 92 px numeric track wraps a sentence to five. Past
+   eight parameters the rows scroll inside it. web/scripts/layout-check.mjs opens it at 1280 and
+   1440 px in both modes, for the console's first strategy and an eight-parameter fixture, and
+   fails when it passes the viewport or its rows scroll; web/scripts/run-form-check.mjs drives
+   it. */
 .run-dialog {
   box-sizing: border-box;
   width: min(1200px, calc(100vw - 48px));
@@ -4529,7 +4534,7 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 6px 18px;
+  padding: 4px 18px;
   border-bottom: 1px solid var(--line);
 }
 .run-dialog-head h2 {
@@ -4623,6 +4628,13 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 .run-dialog .form-section:last-child {
   border-bottom: 0;
 }
+/* A hint under a control shows two lines at most, the whole text on hover (UI-07). */
+.run-dialog .field-grid label > small {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
 .run-dialog-foot {
   display: flex;
   align-items: center;
@@ -4634,6 +4646,11 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
   margin: 0 auto 0 0;
   color: var(--muted);
   font-size: 12px;
+}
+/* The foot's buttons at the terminal foot's height in modern mode too (UI-07). */
+.run-dialog-foot .secondary-action,
+.run-dialog-foot .primary-action {
+  padding: 5px 14px;
 }
 /* Terminal mode: dark-red bars with white titles like every panel head, the preset an amber tag,
    the dialog's title bar amber with black text (decision 0003). */

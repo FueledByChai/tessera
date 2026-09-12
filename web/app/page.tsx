@@ -5318,7 +5318,7 @@ function SdkForm({
               value={(parameters.max_gross_exposure as number | undefined) ?? Math.max(1, ((parameters.position_percent as number | undefined) ?? 1) * Math.max(1, maxOpen))}
               onChange={(event) => setParam("max_gross_exposure", +event.target.value)}
             />
-            <small>buying power × equity</small>
+            <small>buying power</small>
           </label>
           <label>
             Tie-break
@@ -5339,7 +5339,7 @@ function SdkForm({
               disabled={tieBreak !== "random"}
               onChange={(event) => setParam("random_seed", Math.max(0, Math.round(+event.target.value)))}
             />
-            <small>reproducible shuffles</small>
+            <small>for Random</small>
           </label>
         </div>
       </div>
@@ -5387,6 +5387,10 @@ function SdkForm({
                 );
               }
               const step = param.step ?? (param.kind === "int" ? 1 : 0.1);
+              // The hint shows two lines in its track; the whole text is the tooltip (UI-07).
+              const hint =
+                param.help ||
+                (param.min != null || param.max != null ? `${param.min ?? "…"} to ${param.max ?? "…"}` : "");
               return (
                 <label key={param.name} className="numeric">
                   {param.label}
@@ -5406,11 +5410,7 @@ function SdkForm({
                       )
                     }
                   />
-                  <small>
-                    {param.help || (param.min != null || param.max != null
-                      ? `${param.min ?? "…"} to ${param.max ?? "…"}`
-                      : "")}
-                  </small>
+                  <small title={hint || undefined}>{hint}</small>
                 </label>
               );
             })}
@@ -5983,7 +5983,7 @@ function StrategyWorkspace({
                   />
                 </label>
                 <label>
-                  Run name <span>optional</span>
+                  Run name · optional
                   <input
                     name="name"
                     value={identity.name}
