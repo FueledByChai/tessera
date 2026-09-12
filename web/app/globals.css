@@ -2394,13 +2394,28 @@ nav {
   text-transform: uppercase;
   letter-spacing: 0.09em;
 }
+/* Form grids auto-fill (UI-04). The track is a six-character number box: six 18px monospace
+   characters (65px) plus the control's 10px padding each side and its borders, so a row holds
+   as many fields as fit the panel. A numeric field (label.numeric, the type="number" inputs)
+   takes one track; a date, select, or text field keeps its width on two. auto-fill rather
+   than auto-fit: the empty tracks of a short row stay, so two parameters remain two narrow
+   boxes instead of stretching across the panel. The track stays a literal length:
+   web/scripts/theme-check.mjs reads the minmax() and would see a bare 1fr behind a var().
+   web/scripts/layout-check.mjs counts the first row of the strategy page's Data and sizing
+   grid at 1280px and fails under six fields. */
 .field-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
   gap: 11px;
 }
-.field-grid.five {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+.field-grid > * {
+  grid-column: span 2;
+}
+.field-grid > .numeric {
+  grid-column: span 1;
+}
+.field-grid > .instrument-field {
+  grid-column: 1 / -1;
 }
 .field-grid label {
   color: var(--muted);
@@ -2996,6 +3011,9 @@ nav {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.35fr) auto;
   align-items: end;
 }
+.watchlist-generator .field-grid > * {
+  grid-column: auto;
+}
 .generate-action {
   display: flex;
   align-items: end;
@@ -3057,10 +3075,6 @@ nav {
   }
   .run-setup .run-name {
     grid-column: span 1;
-  }
-  .field-grid.five,
-  .field-grid.four {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .run-kpis {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3161,10 +3175,11 @@ nav {
   .catalog-inspector {
     position: static;
   }
-  .field-grid,
-  .field-grid.five,
-  .field-grid.four {
+  .field-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+  .field-grid > * {
+    grid-column: auto;
   }
   .strategy-hero,
   .run-title,

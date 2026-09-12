@@ -3274,18 +3274,18 @@ function CostsWorkspace({
             minimum_commission: Number(form.get("minimum_commission")),
           });
         }}>
-          <div className="field-grid four">
+          <div className="field-grid">
             <label>Profile name<input name="name" required maxLength={100} placeholder="US equities · conservative" /></label>
             <label>Asset class<select name="asset_class"><option>US equities</option><option>US futures</option><option>Spot FX</option><option>Crypto spot</option><option>Any</option></select></label>
             <label>Model<select name="model"><option value="all_in_bps">All-in basis points</option><option value="fixed_tick_per_unit">Fixed tick + per unit</option><option value="none">Costs off</option></select></label>
-            <label>Tick size<input name="tick_size" type="number" step="0.0001" defaultValue="0.01" /></label>
-            <label>Entry bps<input name="entry_bps" type="number" step="0.1" min="0" defaultValue="5" /></label>
-            <label>Exit bps<input name="exit_bps" type="number" step="0.1" min="0" defaultValue="5" /></label>
-            <label>Entry slippage ticks<input name="entry_slippage_ticks" type="number" min="0" defaultValue="0" /></label>
-            <label>Exit slippage ticks<input name="exit_slippage_ticks" type="number" min="0" defaultValue="0" /></label>
-            <label>Entry commission / unit<input name="entry_commission_per_unit" type="number" step="0.001" min="0" defaultValue="0" /></label>
-            <label>Exit commission / unit<input name="exit_commission_per_unit" type="number" step="0.001" min="0" defaultValue="0" /></label>
-            <label>Minimum commission<input name="minimum_commission" type="number" step="0.01" min="0" defaultValue="0" /></label>
+            <label className="numeric">Tick size<input name="tick_size" type="number" step="0.0001" defaultValue="0.01" /></label>
+            <label className="numeric">Entry bps<input name="entry_bps" type="number" step="0.1" min="0" defaultValue="5" /></label>
+            <label className="numeric">Exit bps<input name="exit_bps" type="number" step="0.1" min="0" defaultValue="5" /></label>
+            <label className="numeric">Entry slippage ticks<input name="entry_slippage_ticks" type="number" min="0" defaultValue="0" /></label>
+            <label className="numeric">Exit slippage ticks<input name="exit_slippage_ticks" type="number" min="0" defaultValue="0" /></label>
+            <label className="numeric">Entry commission / unit<input name="entry_commission_per_unit" type="number" step="0.001" min="0" defaultValue="0" /></label>
+            <label className="numeric">Exit commission / unit<input name="exit_commission_per_unit" type="number" step="0.001" min="0" defaultValue="0" /></label>
+            <label className="numeric">Minimum commission<input name="minimum_commission" type="number" step="0.01" min="0" defaultValue="0" /></label>
           </div>
           <div className="run-submit"><p>Existing profiles are never edited; create a new version when assumptions change.</p><button className="primary-action" disabled={busy}>{busy ? "Saving…" : "Save immutable profile →"}</button></div>
         </form>
@@ -4819,7 +4819,7 @@ function SdkForm({
     <>
       <div className="form-section">
         <h3>Data and sizing</h3>
-        <div className="field-grid five">
+        <div className="field-grid">
           <label>
             Universe
             <select
@@ -4846,19 +4846,6 @@ function SdkForm({
                 : "explicit lists load every symbol up front; no cap. Intraday bars across a whole universe exceed memory for long windows, and the engine refuses such runs up front"}
             </small>
           </label>
-          {!universe && (
-            <div className="instrument-field">
-              <span className="instrument-label">
-                Symbols<small>one instance per symbol, shared account · list order is priority</small>
-              </span>
-              <InstrumentPicker
-                requirement={requirement}
-                value={explicitSymbols}
-                onChange={(next) => setParam("symbols", next)}
-                disabled={busy}
-              />
-            </div>
-          )}
           <label>
             Bar resolution
             <select
@@ -4887,7 +4874,7 @@ function SdkForm({
             </select>
             <small>09:30–16:00 ET or all bars</small>
           </label>
-          <label>
+          <label className="numeric">
             Position size %
             <input
               type="number"
@@ -4899,7 +4886,7 @@ function SdkForm({
             />
             <small>of equity per Size::Default entry</small>
           </label>
-          <label>
+          <label className="numeric">
             Minimum price
             <input
               type="number"
@@ -4910,7 +4897,7 @@ function SdkForm({
             />
             <small>skip entries below this price · 0 disables</small>
           </label>
-          <label>
+          <label className="numeric">
             Initial capital
             <input
               type="number"
@@ -4926,11 +4913,24 @@ function SdkForm({
             <small>declared by the strategy</small>
           </label>
         </div>
+        {!universe && (
+          <div className="instrument-field">
+            <span className="instrument-label">
+              Symbols<small>one instance per symbol, shared account · list order is priority</small>
+            </span>
+            <InstrumentPicker
+              requirement={requirement}
+              value={explicitSymbols}
+              onChange={(next) => setParam("symbols", next)}
+              disabled={busy}
+            />
+          </div>
+        )}
       </div>
       <div className="form-section">
         <h3>Entry limits</h3>
-        <div className="field-grid five">
-          <label>
+        <div className="field-grid">
+          <label className="numeric">
             Max entries per day
             <input
               type="number"
@@ -4941,7 +4941,7 @@ function SdkForm({
             />
             <small>0 = unlimited · applied at fill time across all symbols</small>
           </label>
-          <label>
+          <label className="numeric">
             Max open positions
             <input
               type="number"
@@ -4952,7 +4952,7 @@ function SdkForm({
             />
             <small>0 = unlimited</small>
           </label>
-          <label>
+          <label className="numeric">
             Max gross exposure ×
             <input
               type="number"
@@ -4972,7 +4972,7 @@ function SdkForm({
             </select>
             <small>when more signals than slots on one bar</small>
           </label>
-          <label>
+          <label className="numeric">
             Random seed
             <input
               type="number"
@@ -4992,7 +4992,7 @@ function SdkForm({
           {hidden > 0 && <small className="sdk-hidden-note"> · {hidden} advanced hidden</small>}
         </h3>
         {visible.length ? (
-          <div className="field-grid five">
+          <div className="field-grid">
             {visible.map((param) => {
               const current = value(param);
               const unit = param.unit ? ` (${param.unit})` : "";
@@ -5031,7 +5031,7 @@ function SdkForm({
               }
               const step = param.step ?? (param.kind === "int" ? 1 : 0.1);
               return (
-                <label key={param.name}>
+                <label key={param.name} className="numeric">
                   {param.label}
                   {unit}
                   <input
