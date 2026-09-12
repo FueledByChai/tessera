@@ -126,11 +126,11 @@ carries it or the file's path; a catalog restored from a backup shows its source
 | Endpoint | Does | Refuses with |
 |---|---|---|
 | `GET /api/sources` | the cards, plus `kinds`, the provider kinds compiled in (`eodhd`); each card's usage is refreshed through its adapter unless the source was checked within the last minute, `?refresh=1` asks regardless | a provider that cannot be reached leaves the last figures with their time on the card and sets its state |
-| `POST /api/sources` | verifies the token through the kind's adapter, writes the file, inserts the row with the usage that call reported; 201 with the card | 422 with the provider's message for a rejected token, 502 when the provider could not be asked; nothing saved either way. 400 for an unknown kind, a relative root or catalog folder, an empty name or token, a reserve outside 0 to 100 |
+| `POST /api/sources` | verifies the token through the kind's adapter, writes the file, inserts the row with the usage that call reported; 201 with the card | 409 for a root another source already covers (one source per root, checked before the provider is asked); 422 with the provider's message for a rejected token, 502 when the provider could not be asked; nothing saved either way. 400 for an unknown kind, a relative root or catalog folder, an empty name or token, a reserve outside 0 to 100 |
 | `PUT /api/sources/{id}` | sets `reserve_pct`, the share of the daily limit jobs leave untouched (decision 0022, default 5); 200 with the card, the reserve in calls recomputed | 400 outside 0 to 100, 404 for an unknown source |
 | `PUT /api/sources/{id}/token` | verifies the new token and replaces the file (written as a part file and renamed, so the old token stays until the new one is on disk), recording the usage that call reported | 422 / 502 as above, the old token untouched |
 | `POST /api/sources/{id}/verify` | re-checks the token on file and records `verified_at`, `verify_state` (`connected`, `credentials_rejected`, `unreachable`), and the provider's message, plus the usage on success; 200 with the card whatever the provider said | 409 when no token file exists |
-| `DELETE /api/sources/{id}` | removes the row and the token file; 204 | 409 while any regular file lies under the source's root: the console never deletes data files (decision 0022) |
+| `DELETE /api/sources/{id}` | removes the row, the token file, and the source's datasets with their scans; 204 | 409 while any regular file lies under one of the source's dataset folders, or under the root while it has no datasets: the console never deletes data files (decision 0022) |
 
 A card also reports `root_exists` and, for a root that is mounted, the volume's
 `total_bytes`, `used_bytes`, and `free_bytes` from statvfs (free is what this process may
@@ -139,9 +139,10 @@ time, so the adapter derives 00:00 UTC after the day the count is for, and the c
 it "resets 00:00 UTC"), `checked_at` (when the provider reported these figures; a later
 failed check leaves them and this time in place), `reserve_calls` (`reserve_pct` of the
 limit, rounded up), and `available_calls` (what a job may still spend); `null` until the
-provider has answered once. A verify and a usage refresh are the same `/api/user` call, so
-`verified_at` is the time of the last check either way and `verify_state` says whether it
-succeeded. The adapter for a card is chosen by its `kind`; `TESSERA_EODHD_BASE_URL` points
+provider has answered once, and its datasets with their last scan (`datasets`,
+`uncataloged`, `scanned_at`, `scanning`; the next sections). A verify and a usage refresh
+are the same `/api/user` call, so `verified_at` is the time of the last check either way
+and `verify_state` says whether it succeeded. The adapter for a card is chosen by its `kind`; `TESSERA_EODHD_BASE_URL` points
 the EODHD adapter at a stub server for a scratch console, and the service tests in
 `src/bin/tessera_ui.rs` (`tests::sources`) register a known placeholder token over the
 DS-02 stub and fail if the token or the secrets path appears in any `/api/sources` or
@@ -157,19 +158,80 @@ JSON list, fetched_at) and `provider_listings` (source_id, exchange, code, name,
 currency, delisted, fetched_at), with `provider_refreshes` (source_id, attempted_at,
 error) recording the last refresh attempt. A refresh fetches the exchange list and then
 the active listing of every exchange with a dataset registered against the source (the
-`datasets` table, once it exists), or of the one exchange the body names; a provider call
-that fails leaves every row fetched before in place, its time included, and records the
-failure as the table's `unreachable` note, so the console shows a stale table with a note,
-never an empty one. The tables go with their source when it is deleted.
+`datasets` table), or of the one exchange the body names, and the delisted listing as well
+(one more call per exchange, cached apart with `delisted = 1`) where the body says
+`"delisted": true` or, when it says nothing, where a dataset of the exchange includes
+delisted symbols; a provider call that fails leaves every row fetched before in place, its
+time included, and records the failure as the table's `unreachable` note, so the console
+shows a stale table with a note, never an empty one. The tables go with their source when
+it is deleted.
 
 | Endpoint | Does | Refuses with |
 |---|---|---|
-| `GET /api/sources/{id}/availability` | the cached table: `fetched_at` (the exchange list's), `refreshed_at` (the last attempt), `unreachable` (why it failed, else null), and `exchanges`, each with code, name, country, resolutions, `fetched_at`, `listings_fetched_at` (null until its listing is cached), `listed`, and `types`, the active listing counted per type under the provider's own type names, largest first | 404 for an unknown source |
-| `POST /api/sources/{id}/availability/refresh` | fetches the exchange list and the listings (`{"exchange": "US"}` names one; an empty body means every exchange with a dataset), caches them, and answers 200 with the table whatever the provider said | 409 when no token file exists; 400 for an exchange the provider does not list, the cache untouched |
+| `GET /api/sources/{id}/availability` | the cached table: `fetched_at` (the exchange list's), `refreshed_at` (the last attempt), `unreachable` (why it failed, else null), and `exchanges`, each with code, name, country, resolutions, `fetched_at`, `listings_fetched_at` (null until its listing is cached), `listed`, `types`, the active listing counted per type under the provider's own type names, largest first, and `delisted` with `delisted_fetched_at` (the delisted listing's count and time, 0 and null until it is cached) | 404 for an unknown source |
+| `POST /api/sources/{id}/availability/refresh` | fetches the exchange list and the listings (`{"exchange": "US"}` names one; an empty body means every exchange with a dataset; `"delisted": true` or `false` asks for or skips the delisted listing, else it follows the datasets), caches them, and answers 200 with the table whatever the provider said | 409 when no token file exists; 400 for an exchange the provider does not list, the cache untouched |
 
 The service test in `src/bin/tessera_ui.rs` (`tests::sources`) refreshes over the DS-02 stub,
 asserts the four exchange rows and the US type counts, then makes the stub answer 503 and
 asserts the rows and `fetched_at` unchanged with the note set.
+
+### Datasets and the scan cache (`/api/sources/{id}/datasets`, `/api/sources/{id}/scan`)
+
+A dataset is what a source keeps current: one exchange, a set of the provider's types
+(decision 0012: Common Stock and ETF stay distinct), a resolution, a from-date, a folder,
+and whether delisted symbols are included. It is a row of `datasets` (id, source_id,
+exchange, types_json, resolution, from_date, folder, include_delisted, created_at) and its
+figures are a row of `dataset_scans` (dataset_id, scanned_at, listed, on_disk, latest_date,
+current_count, bytes, uncataloged_json, state, error), written only by a scan (decision
+0013: the page reads the cache and shows its time; walking the files is an explicit action).
+Both go with their source.
+
+| Endpoint | Does | Refuses with |
+|---|---|---|
+| `POST /api/sources/{id}/datasets` | registers a dataset (`exchange`, `types`, `resolution`, `from_date`, optional `folder`, absolute or relative to the root, default `<root>/eod` for daily bars and `<root>/<resolution>` otherwise, optional `include_delisted`, default on for daily bars) against the cached availability; 201 with the row, state Unknown until a scan runs | 400 for an exchange not in the source's list, a resolution the provider does not offer there, a type not in the exchange's cached listing, a from-date that is not a date, or no types; 409 while the exchange's listing is not cached, and for a dataset of the source already covering one of the types on that exchange at that resolution; 404 for an unknown source |
+| `DELETE /api/datasets/{id}` | removes the registration and its scan row; 200 with the source card | 409 while a file exists for any of its listed symbols (with no listing cached, while any file lies in its folder): files are never deleted (decision 0022) |
+| `POST /api/sources/{id}/scan` | starts the source's scan job in the background; 202 with `{"source_id", "scanning": true}`, and the card says `scanning` until every dataset's row is written | 409 while a scan of the source runs; 404 for an unknown source |
+
+The scan reads each dataset's listing under one short catalog lock (the codes of its types
+on its exchange in `provider_listings`, the delisted ones included when the dataset includes
+them) and then walks the disk without it. Per dataset it counts the files named for those
+symbols in its folder (`<code>.<exchange>.csv`; part files and anything else are not among
+them), their bytes, the latest of their last dates (each tail-read through
+`last_csv_row_date`), and how many are current through the latest expected session: for
+daily bars the calendar symbol's last date (`[data] calendar_symbol`, its file looked for
+in the dataset's folder, then the source's daily dataset folders, then `daily_dir`); for
+intraday bars that session's close in New York, which a file reaches when its last bar
+starts at the close less one bar. Files under the root that no dataset's folder (nor the
+catalog folder) is at or under are counted per folder as Uncataloged, loose files directly
+under the root under `.`, and stored on every row of the scan; the card serves the newest
+row's list with its time. A dataset whose root or folder is missing is Unavailable and a
+folder that cannot be read is Failed with the reason on the row: either keeps the previous
+figures under the new time, and a dataset never scanned before gets zeros.
+
+The states (BT-605), as the scan assigns them:
+
+| State | Meaning |
+|---|---|
+| `Current` | files reach the latest expected session and exist for at least 95% of the listed symbols (a listing always carries a few symbols with no history) |
+| `Updating` | an update job is running on the dataset (the native jobs, BT-1205 onward; the scan itself never assigns it) |
+| `Stale` | files exist but none reaches the latest expected session: the last update did not run or did not finish |
+| `Partial` | files exist for under 95% of the listed symbols; a dataset with no files yet is Partial |
+| `Failed` | the last scan could not read the folder (`error` says why), or, once the jobs exist, the last update job failed; the figures are the previous scan's |
+| `Unknown` | never scanned, or nothing to judge against: no listing cached for the exchange, or no calendar file to set the expected session |
+| `Unavailable` | the root or the dataset's folder was not there when scanned (an unmounted drive); the figures are the previous scan's |
+
+`GET /api/sources` returns each card with `datasets` (the row and its `scan`: `scanned_at`,
+`listed`, `on_disk`, `latest_date`, `current_count`, `bytes`, `error`, null until one has
+run, and the `state`), `uncataloged` (`folder`, `files`, `bytes` per folder), `scanned_at`,
+and `scanning`. The service test in `src/bin/tessera_ui.rs` (`tests::sources::datasets`)
+builds a root with `eod/` holding files for three listed symbols, a part file, a stray
+folder, and a loose file, registers a US EOD dataset over the stub's listing of five symbols
+(three active, two delisted), scans, and asserts listed 5, on disk 3, the latest date, the
+bytes of the three files, the part file excluded, the stray folder Uncataloged with its
+count, and state Partial; removes the folder, rescans, and asserts Unavailable with the
+previous counts kept; and asserts the dataset's DELETE is 409 with files and 200 without,
+that a second source over the same root is 409, and that the source's guard is its dataset
+folders, not the root.
 
 ## Environment overrides
 
