@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -3920,6 +3921,8 @@ function InstrumentPicker({
       event.preventDefault();
       if (open && hits[cursor]) add(hits[cursor]);
     } else if (event.key === "Escape") {
+      // Escape closes the results first; inside a dialog the next one closes the dialog.
+      if (open) event.preventDefault();
       setOpen(false);
     } else if (event.key === "Backspace" && !query && value.length && !single) {
       remove(value[value.length - 1]);
@@ -4818,7 +4821,7 @@ function SdkForm({
   return (
     <>
       <div className="form-section">
-        <h3>Data and sizing</h3>
+        <h3>Data</h3>
         <div className="field-grid">
           <label>
             Universe
@@ -4843,7 +4846,7 @@ function SdkForm({
             <small>
               {manifest.screen_universe
                 ? "daily screen picks the intraday candidates"
-                : "explicit lists load every symbol up front; no cap. Intraday bars across a whole universe exceed memory for long windows, and the engine refuses such runs up front"}
+                : "every symbol loads up front"}
             </small>
           </label>
           <label>
@@ -4860,7 +4863,7 @@ function SdkForm({
               <option value="5s">5 second (tick lake)</option>
               <option value="1s">1 second (tick lake)</option>
             </select>
-            <small>the strategy is resolution-agnostic; second bars need EXCHANGE:SYMBOL tick-lake instruments</small>
+            <small>second bars need tick-lake instruments</small>
           </label>
           <label>
             Session
@@ -4884,7 +4887,7 @@ function SdkForm({
               value={((parameters.position_percent as number | undefined) ?? 1) * 100}
               onChange={(event) => setParam("position_percent", +event.target.value / 100)}
             />
-            <small>of equity per Size::Default entry</small>
+            <small>of equity</small>
           </label>
           <label className="numeric">
             Minimum price
@@ -4895,7 +4898,7 @@ function SdkForm({
               value={(parameters.min_price as number | undefined) ?? 1}
               onChange={(event) => setParam("min_price", +event.target.value)}
             />
-            <small>skip entries below this price · 0 disables</small>
+            <small>0 disables</small>
           </label>
           <label className="numeric">
             Initial capital
@@ -4907,10 +4910,10 @@ function SdkForm({
               onChange={(event) => setParam("initial_capital", +event.target.value)}
             />
           </label>
-          <label>
-            Warm-up
-            <input type="text" value={`${manifest.warmup_bars} bars`} readOnly />
-            <small>declared by the strategy</small>
+          <label className="numeric">
+            Warm-up bars
+            <input type="text" value={manifest.warmup_bars} readOnly />
+            <small>read-only</small>
           </label>
         </div>
         {!universe && (
@@ -4928,10 +4931,10 @@ function SdkForm({
         )}
       </div>
       <div className="form-section">
-        <h3>Entry limits</h3>
+        <h3>Limits</h3>
         <div className="field-grid">
           <label className="numeric">
-            Max entries per day
+            Entries per day
             <input
               type="number"
               min="0"
@@ -4939,10 +4942,10 @@ function SdkForm({
               value={maxEntries}
               onChange={(event) => setParam("max_entries_per_day", Math.max(0, Math.round(+event.target.value)))}
             />
-            <small>0 = unlimited · applied at fill time across all symbols</small>
+            <small>0 = unlimited</small>
           </label>
           <label className="numeric">
-            Max open positions
+            Open positions
             <input
               type="number"
               min="0"
@@ -4953,7 +4956,7 @@ function SdkForm({
             <small>0 = unlimited</small>
           </label>
           <label className="numeric">
-            Max gross exposure ×
+            Max gross ×
             <input
               type="number"
               min="0.1"
@@ -4961,7 +4964,7 @@ function SdkForm({
               value={(parameters.max_gross_exposure as number | undefined) ?? Math.max(1, ((parameters.position_percent as number | undefined) ?? 1) * Math.max(1, maxOpen))}
               onChange={(event) => setParam("max_gross_exposure", +event.target.value)}
             />
-            <small>buying power as a multiple of equity · fills beyond it are cut or rejected</small>
+            <small>buying power × equity</small>
           </label>
           <label>
             Tie-break
@@ -4970,7 +4973,7 @@ function SdkForm({
               <option value="random">Random (seeded)</option>
               <option value="alphabetical">Alphabetical</option>
             </select>
-            <small>when more signals than slots on one bar</small>
+            <small>more signals than slots</small>
           </label>
           <label className="numeric">
             Random seed
@@ -4988,7 +4991,7 @@ function SdkForm({
       </div>
       <div className="form-section">
         <h3>
-          Strategy parameters
+          Parameters
           {hidden > 0 && <small className="sdk-hidden-note"> · {hidden} advanced hidden</small>}
         </h3>
         {visible.length ? (
@@ -5066,6 +5069,289 @@ function SdkForm({
   );
 }
 
+/** The identity of a run: the strip shows these and both Run buttons send them (UI-05). */
+type RunIdentity = {
+  research_label: string;
+  start_date: string;
+  end_date: string;
+  name: string;
+};
+
+const RESEARCH_LABELS = ["Development", "Validation", "Final holdout", "Post-selection", "Research"];
+/** The strip's preset name for the frozen strategy config, and the mark once a field changed. */
+const DEFAULT_PRESET = "Production defaults";
+const EDITED = " · edited";
+const UNIVERSE_NAMES: Record<string, string> = {
+  "universe:stocks": "All US common stocks",
+  "universe:etfs": "All US ETFs",
+  "universe:all": "Stocks and ETFs",
+};
+const RESOLUTION_NAMES: Record<string, string> = {
+  daily: "Daily",
+  "5m": "5 minute",
+  "1m": "1 minute",
+  "30s": "30 second",
+  "15s": "15 second",
+  "5s": "5 second",
+  "1s": "1 second",
+};
+/** The platform's own keys in a run's parameter map; every other key is the strategy's. */
+const PLATFORM_KEYS = new Set([
+  "symbols",
+  "asset",
+  "resolution",
+  "session",
+  "position_percent",
+  "min_price",
+  "initial_capital",
+  "max_entries_per_day",
+  "max_open_positions",
+  "max_gross_exposure",
+  "tie_break",
+  "random_seed",
+  "slippage_ticks",
+  "commission_per_share",
+  "all_in_round_trip_bps",
+  "entry_slippage_ticks",
+  "exit_slippage_ticks",
+  "commission_per_share_per_fill",
+]);
+
+function formatParamValue(value: unknown): string {
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(4)));
+  if (typeof value === "boolean") return value ? "on" : "off";
+  if (Array.isArray(value)) return value.join(", ");
+  return String(value ?? "");
+}
+
+/**
+ * One item of the summary strip. `field` is the path of the value in the request body a Run
+ * sends (`parameters.length`); `data-value` carries the value as JSON only when the body
+ * carries it (`claimed`), so web/scripts/run-form-check.mjs can hold the strip to its word.
+ * A strategy parameter left at its manifest default is shown but not claimed: the engine
+ * applies the default, the body does not repeat it.
+ */
+function StripItem({
+  label,
+  field,
+  value,
+  text,
+  claimed = true,
+}: {
+  label: string;
+  field: string;
+  value?: unknown;
+  text: string;
+  claimed?: boolean;
+}) {
+  return (
+    <div className="run-strip-item">
+      <span>{label}</span>
+      <strong data-field={field} data-value={claimed ? JSON.stringify(value) : undefined}>
+        {text}
+      </strong>
+    </div>
+  );
+}
+
+/**
+ * The current configuration in one strip with Configure run and Run (decision 0003): the
+ * identity, the data, the limits, every strategy parameter with its value, and the preset it
+ * came from. The Run here sends exactly what the strip shows.
+ */
+function RunSummaryStrip({
+  detail,
+  parameters,
+  identity,
+  costsEnabled,
+  costProfiles,
+  selectedCostProfileId,
+  activePreset,
+  busy,
+  connected,
+  onConfigure,
+  onRun,
+}: {
+  detail: StrategyDetail;
+  parameters: Overrides;
+  identity: RunIdentity;
+  costsEnabled: boolean;
+  costProfiles: CostProfile[];
+  selectedCostProfileId: string;
+  activePreset: string;
+  busy: boolean;
+  connected: boolean;
+  onConfigure: () => void;
+  onRun: () => void;
+}) {
+  const sdk = detail.sdk ?? null;
+  const symbols = parameters.symbols;
+  const universe = symbols?.find((symbol) => symbol.startsWith("universe:"));
+  const symbolsText = !symbols
+    ? "strategy default"
+    : universe
+      ? (UNIVERSE_NAMES[universe] ?? universe)
+      : symbols.length > 4
+        ? `${symbols.slice(0, 4).join(", ")} +${symbols.length - 4}`
+        : symbols.join(", ") || "none";
+  const resolution = parameters.resolution as string | undefined;
+  const session = parameters.session as string | undefined;
+  const capital = parameters.initial_capital as number | undefined;
+  const size = parameters.position_percent as number | undefined;
+  const minPrice = parameters.min_price as number | undefined;
+  const perDay = parameters.max_entries_per_day as number | undefined;
+  const maxOpen = parameters.max_open_positions as number | undefined;
+  const gross = parameters.max_gross_exposure as number | undefined;
+  const tieBreak = parameters.tie_break as string | undefined;
+  const seed = parameters.random_seed as number | undefined;
+  const profile = costProfiles.find((item) => item.id === selectedCostProfileId);
+  const strategyParams = sdk
+    ? sdk.params.map((param) => ({
+        key: param.name,
+        label: param.label,
+        unit: param.unit,
+        value: parameters[param.name] ?? param.default,
+        claimed: parameters[param.name] !== undefined,
+      }))
+    : Object.entries(parameters)
+        .filter(([key, value]) => !PLATFORM_KEYS.has(key) && value !== undefined)
+        .map(([key, value]) => ({ key, label: key, unit: "", value, claimed: true }));
+  return (
+    <section className="panel run-strip">
+      <div className="run-strip-head">
+        <h2>Run</h2>
+        <span className="run-strip-preset">
+          preset <strong data-field="preset">{activePreset}</strong>
+        </span>
+        <div className="run-strip-actions">
+          <button type="button" className="secondary-action run-strip-configure" onClick={onConfigure}>
+            Configure run
+          </button>
+          <button
+            type="button"
+            className="primary-action run-strip-run"
+            disabled={busy || !connected}
+            onClick={onRun}
+          >
+            {busy ? "Queueing…" : "Run"}
+          </button>
+        </div>
+      </div>
+      <div className="run-strip-line">
+        <StripItem label="Label" field="research_label" value={identity.research_label} text={identity.research_label} />
+        <div className="run-strip-item">
+          <span>Window</span>
+          <strong>
+            <span data-field="start_date" data-value={JSON.stringify(identity.start_date)}>
+              {identity.start_date}
+            </span>
+            {" → "}
+            <span data-field="end_date" data-value={JSON.stringify(identity.end_date)}>
+              {identity.end_date}
+            </span>
+          </strong>
+        </div>
+        {identity.name && <StripItem label="Name" field="name" value={identity.name} text={identity.name} />}
+        <StripItem
+          label="Universe"
+          field="parameters.symbols"
+          value={symbols}
+          text={symbolsText}
+          claimed={symbols !== undefined}
+        />
+        <StripItem
+          label="Bars"
+          field="parameters.resolution"
+          value={resolution}
+          text={RESOLUTION_NAMES[resolution ?? ""] ?? resolution ?? "strategy default"}
+          claimed={resolution !== undefined}
+        />
+        {resolution && resolution !== "daily" && (
+          <StripItem
+            label="Session"
+            field="parameters.session"
+            value={session}
+            text={session === "extended" ? "Extended hours" : "Regular hours"}
+            claimed={session !== undefined}
+          />
+        )}
+        <StripItem
+          label="Capital"
+          field="parameters.initial_capital"
+          value={capital}
+          text={capital === undefined ? "strategy default" : `$${capital.toLocaleString()}`}
+          claimed={capital !== undefined}
+        />
+        {size !== undefined && (
+          <StripItem
+            label="Size"
+            field="parameters.position_percent"
+            value={size}
+            text={`${formatParamValue(size * 100)}% of equity`}
+          />
+        )}
+        {minPrice !== undefined && (
+          <StripItem label="Min price" field="parameters.min_price" value={minPrice} text={`$${formatParamValue(minPrice)}`} />
+        )}
+        <StripItem
+          label="Costs"
+          field={costsEnabled ? "cost_profile_id" : "costs_enabled"}
+          value={costsEnabled ? selectedCostProfileId : false}
+          text={costsEnabled ? (profile?.name ?? selectedCostProfileId) : "gross · no costs"}
+        />
+      </div>
+      <div className="run-strip-line">
+        {perDay !== undefined && (
+          <StripItem
+            label="Entries"
+            field="parameters.max_entries_per_day"
+            value={perDay}
+            text={perDay ? `${perDay}/day` : "no daily cap"}
+          />
+        )}
+        {maxOpen !== undefined && (
+          <StripItem
+            label="Open"
+            field="parameters.max_open_positions"
+            value={maxOpen}
+            text={maxOpen ? `${maxOpen} max` : "unlimited"}
+          />
+        )}
+        {gross !== undefined && (
+          <StripItem label="Gross" field="parameters.max_gross_exposure" value={gross} text={`${formatParamValue(gross)}× equity`} />
+        )}
+        {tieBreak !== undefined && (
+          <StripItem label="Tie-break" field="parameters.tie_break" value={tieBreak} text={tieBreak} />
+        )}
+        {tieBreak === "random" && seed !== undefined && (
+          <StripItem label="Seed" field="parameters.random_seed" value={seed} text={String(seed)} />
+        )}
+        {strategyParams.map((param) => (
+          <StripItem
+            key={param.key}
+            label={param.label}
+            field={`parameters.${param.key}`}
+            value={param.value}
+            text={`${formatParamValue(param.value)}${param.unit ? ` ${param.unit}` : ""}${param.claimed ? "" : " (default)"}`}
+            claimed={param.claimed}
+          />
+        ))}
+        {!strategyParams.length && (
+          <div className="run-strip-item">
+            <span>Parameters</span>
+            <strong>none declared</strong>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * The strategy page (BT-1101, decision 0003): the hero, the Production rules folded, the
+ * summary strip with its Run, and the history; the whole run form lives in the Configure run
+ * dialog, a native modal whose edits stay in memory when it closes without a Run.
+ */
 function StrategyWorkspace({
   detail,
   parameters,
@@ -5077,6 +5363,7 @@ function StrategyWorkspace({
   busy,
   connected,
   presetName,
+  activePreset,
   setPresetName,
   setAdvanced,
   setSelectedCostProfileId,
@@ -5099,6 +5386,7 @@ function StrategyWorkspace({
   busy: boolean;
   connected: boolean;
   presetName: string;
+  activePreset: string;
   setPresetName: (value: string) => void;
   setAdvanced: (value: boolean) => void;
   setSelectedCostProfileId: (value: string) => void;
@@ -5108,7 +5396,7 @@ function StrategyWorkspace({
   ) => void;
   applyPreset: (preset?: Preset) => void;
   savePreset: () => void;
-  submitRun: (event: FormEvent<HTMLFormElement>) => void;
+  submitRun: (identity: RunIdentity) => void;
   viewCode: () => void;
   openRun: (id: string) => void;
   toggleStar: (run: Run) => void;
@@ -5125,6 +5413,29 @@ function StrategyWorkspace({
         sdk.screen_universe ? "screened universe" : `${sdk.params.length} parameters`,
       ]
     : [detail.strategy.asset_scope, detail.strategy.status];
+  // The identity fields live here: they survive the dialog closing and reset with the page.
+  const [identity, setIdentity] = useState<RunIdentity>({
+    research_label: "Development",
+    start_date: "2020-01-01",
+    end_date: today,
+    name: "",
+  });
+  const setField = (key: keyof RunIdentity, value: string) =>
+    setIdentity((current) => ({ ...current, [key]: value }));
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const openDialog = () => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+  };
+  const closeDialog = () => dialogRef.current?.close();
+  const run = () => submitRun(identity);
+  const profileOptions = costProfiles.filter(
+    (profile) =>
+      sdk ||
+      profile.asset_class === detail.strategy.asset_scope ||
+      profile.asset_class === "Any" ||
+      (detail.strategy.asset_scope.includes("US") && profile.asset_class === "US equities"),
+  );
   return (
     <>
       <section className="strategy-hero">
@@ -5140,210 +5451,237 @@ function StrategyWorkspace({
         </div>
         <div className="strategy-hero-actions">
           {sdk ? (
-          <div className="strategy-badges">
-            <span>{sdk.asset_scope}</span>
-            <span>{(parameters.resolution as string | undefined) ?? "any bars"}</span>
-            <span>{sdk.allows_short ? "long/short" : "long/cash"}</span>
-            {sdk.screen_universe && <span>screened universe</span>}
-            {sdk.daily_context && !sdk.screen_universe && <span>daily context</span>}
-            {sdk.default_max_entries_per_day ? (
-              <span>{sdk.default_max_entries_per_day}/day cap</span>
-            ) : null}
-          </div>
-        ) : (
-          <div className="strategy-badges">
-            {badges.map((badge) => (
-              <span key={badge}>{badge}</span>
-            ))}
-          </div>
-        )}
-          <button className="secondary-action" type="button" onClick={viewCode}>
-            View source code →
-          </button>
-        </div>
-      </section>
-      <div className="strategy-layout">
-        <section className="panel rules-panel">
-          <div className="panel-head">
-            <div>
-              <p className="eyebrow">Human-readable definition</p>
-              <h2>Production rules</h2>
+            <div className="strategy-badges">
+              <span>{sdk.asset_scope}</span>
+              <span>{(parameters.resolution as string | undefined) ?? "any bars"}</span>
+              <span>{sdk.allows_short ? "long/short" : "long/cash"}</span>
+              {sdk.screen_universe && <span>screened universe</span>}
+              {sdk.daily_context && !sdk.screen_universe && <span>daily context</span>}
+              {sdk.default_max_entries_per_day ? (
+                <span>{sdk.default_max_entries_per_day}/day cap</span>
+              ) : null}
             </div>
-          </div>
-          <ol>
-            {detail.rules.map((rule, index) => (
-              <li key={rule}>
-                <span>{String(index + 1).padStart(2, "0")}</span>
-                <p>{rule}</p>
-              </li>
-            ))}
-          </ol>
-          <div className="assumption-strip">
-            <div>
-              <span>Entry</span>
-              <strong>Per strategy rules</strong>
+          ) : (
+            <div className="strategy-badges">
+              {badges.map((badge) => (
+                <span key={badge}>{badge}</span>
+              ))}
             </div>
-            <div>
-              <span>Exit</span>
-              <strong>Per strategy rules</strong>
-            </div>
-            <div>
-              <span>Default costs</span>
-              <strong>{costProfiles.find((profile) => profile.id === selectedCostProfileId)?.name ?? "Strategy default"}</strong>
-            </div>
-          </div>
-        </section>
-        <section className="panel preset-panel">
-          <div className="panel-head">
-            <div>
-              <p className="eyebrow">Reusable configurations</p>
-              <h2>Presets</h2>
-            </div>
-          </div>
-          <div className="preset-save">
-            <input
-              value={presetName}
-              maxLength={80}
-              placeholder="Name current settings"
-              onChange={(event) => setPresetName(event.target.value)}
-            />
-            <button className="text-action" type="button" onClick={savePreset}>
-              Save +
-            </button>
-          </div>
-          <button className="preset-row active" onClick={() => applyPreset()}>
-            <span>
-              <strong>Production defaults</strong>
-              <small>Frozen strategy config</small>
-            </span>
-            <em>BASE</em>
-          </button>
-          {detail.presets.map((preset) => (
-            <button
-              className="preset-row"
-              key={preset.id}
-              onClick={() => applyPreset(preset)}
-            >
-              <span>
-                <strong>{preset.name}</strong>
-                <small>{new Date(preset.created_at).toLocaleString()}</small>
-              </span>
-              <em>{preset.costs_enabled ? "NET" : "GROSS"}</em>
-            </button>
-          ))}
-        </section>
-      </div>
-      <section className="panel config-panel">
-        <div className="panel-head">
-          <div>
-            <p className="eyebrow">Controlled research</p>
-            <h2>Configure immutable run</h2>
-          </div>
-          <div className="mode-switch">
-            <button
-              className={!advanced ? "active" : ""}
-              type="button"
-              onClick={() => setAdvanced(false)}
-            >
-              Simple
-            </button>
-            <button
-              className={advanced ? "active" : ""}
-              type="button"
-              onClick={() => setAdvanced(true)}
-            >
-              Advanced
-            </button>
-          </div>
-        </div>
-        <form onSubmit={submitRun} noValidate>
-          <div className="form-section">
-            <h3>Research identity</h3>
-            <div className="field-grid">
-              <label>
-                Research label
-                <select name="research_label" defaultValue="Development">
-                  <option>Development</option>
-                  <option>Validation</option>
-                  <option>Final holdout</option>
-                  <option>Post-selection</option>
-                  <option>Research</option>
-                </select>
-              </label>
-              <label>
-                Start
-                <input
-                  name="start_date"
-                  type="date"
-                  defaultValue="2020-01-01"
-                  required
-                />
-              </label>
-              <label>
-                End
-                <input
-                  name="end_date"
-                  type="date"
-                  defaultValue={today}
-                  required
-                />
-              </label>
-              <label>
-                Run name <span>optional</span>
-                <input
-                  name="name"
-                  placeholder={`${detail.strategy.name} · development baseline`}
-                />
-              </label>
-              <label>
-                Cost profile
-                <select
-                  value={selectedCostProfileId}
-                  disabled={!costsEnabled}
-                  onChange={(event) => setSelectedCostProfileId(event.target.value)}
-                >
-                  {costProfiles
-                    .filter((profile) => sdk || profile.asset_class === detail.strategy.asset_scope || profile.asset_class === "Any" ||
-                      (detail.strategy.asset_scope.includes("US") && profile.asset_class === "US equities"))
-                    .map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}
-                </select>
-              </label>
-            </div>
-          </div>
-          {sdk && (
-            <SdkForm
-              manifest={sdk}
-              detail={detail}
-              parameters={parameters}
-              setParam={setParam}
-              advanced={advanced}
-              busy={busy}
-            />
           )}
-          <div className="run-submit">
-            <div>
-              <strong>Write-once output</strong>
-              <p>
-                The exact parameters, costs, dates, logs, trades, coverage,
-                equity, and report are preserved together.
-              </p>
-            </div>
-            <button
-              className="primary-action"
-              type="submit"
-              disabled={busy || !connected}
-            >
-              {busy ? "Queueing…" : "Queue backtest →"}
+          <div className="strategy-hero-buttons">
+            <button className="secondary-action" type="button" onClick={viewCode}>
+              View source code →
+            </button>
+            <button className="secondary-action" type="button" onClick={openDialog}>
+              Configure run
             </button>
           </div>
-        </form>
+        </div>
       </section>
+      <details className="panel rules-panel rules-fold">
+        <summary className="rules-fold-summary">
+          <div>
+            <p className="eyebrow">Human-readable definition</p>
+            <h2>Production rules ({detail.rules.length})</h2>
+          </div>
+          <span className="history-toggle">Show / hide</span>
+        </summary>
+        <ol>
+          {detail.rules.map((rule, index) => (
+            <li key={rule}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              <p>{rule}</p>
+            </li>
+          ))}
+        </ol>
+        <div className="assumption-strip">
+          <div>
+            <span>Entry</span>
+            <strong>Per strategy rules</strong>
+          </div>
+          <div>
+            <span>Exit</span>
+            <strong>Per strategy rules</strong>
+          </div>
+          <div>
+            <span>Default costs</span>
+            <strong>{costProfiles.find((profile) => profile.id === selectedCostProfileId)?.name ?? "Strategy default"}</strong>
+          </div>
+        </div>
+      </details>
+      <RunSummaryStrip
+        detail={detail}
+        parameters={parameters}
+        identity={identity}
+        costsEnabled={costsEnabled}
+        costProfiles={costProfiles}
+        selectedCostProfileId={selectedCostProfileId}
+        activePreset={activePreset}
+        busy={busy}
+        connected={connected}
+        onConfigure={openDialog}
+        onRun={run}
+      />
       <RunHistoryTable
         runs={detail.runs}
         onOpen={openRun}
         onToggleStar={toggleStar}
         busy={busy}
       />
+      <dialog className="run-dialog" ref={dialogRef} aria-labelledby="run-dialog-title">
+        <form
+          noValidate
+          onSubmit={(event) => {
+            event.preventDefault();
+            closeDialog();
+            run();
+          }}
+        >
+          <div className="run-dialog-head">
+            <h2 id="run-dialog-title">Configure run</h2>
+            <span className="run-dialog-strategy">{detail.strategy.name}</span>
+            <div className="mode-switch">
+              <button
+                className={!advanced ? "active" : ""}
+                type="button"
+                onClick={() => setAdvanced(false)}
+              >
+                Simple
+              </button>
+              <button
+                className={advanced ? "active" : ""}
+                type="button"
+                onClick={() => setAdvanced(true)}
+              >
+                Advanced
+              </button>
+            </div>
+            <button type="button" className="run-dialog-close" aria-label="Close" onClick={closeDialog}>
+              ×
+            </button>
+          </div>
+          <div className="run-dialog-presets">
+            <span className="run-dialog-presets-label">Presets</span>
+            <button
+              type="button"
+              className={`preset-chip${activePreset === DEFAULT_PRESET ? " active" : ""}`}
+              onClick={() => applyPreset()}
+            >
+              Production defaults <em>BASE</em>
+            </button>
+            {detail.presets.map((preset) => (
+              <button
+                type="button"
+                className={`preset-chip${activePreset === preset.name ? " active" : ""}`}
+                key={preset.id}
+                title={new Date(preset.created_at).toLocaleString()}
+                onClick={() => applyPreset(preset)}
+              >
+                {preset.name} <em>{preset.costs_enabled ? "NET" : "GROSS"}</em>
+              </button>
+            ))}
+            <span className="preset-save">
+              <input
+                value={presetName}
+                maxLength={80}
+                placeholder="Preset name to save"
+                onChange={(event) => setPresetName(event.target.value)}
+              />
+              <button className="text-action" type="button" onClick={savePreset}>
+                Save +
+              </button>
+            </span>
+          </div>
+          <div className="run-dialog-body">
+            <div className="form-section">
+              <h3>Identity</h3>
+              <div className="field-grid">
+                <label>
+                  Research label
+                  <select
+                    name="research_label"
+                    value={identity.research_label}
+                    onChange={(event) => setField("research_label", event.target.value)}
+                  >
+                    {RESEARCH_LABELS.map((label) => (
+                      <option key={label}>{label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Start
+                  <input
+                    name="start_date"
+                    type="date"
+                    value={identity.start_date}
+                    required
+                    onChange={(event) => setField("start_date", event.target.value)}
+                  />
+                </label>
+                <label>
+                  End
+                  <input
+                    name="end_date"
+                    type="date"
+                    value={identity.end_date}
+                    required
+                    onChange={(event) => setField("end_date", event.target.value)}
+                  />
+                </label>
+                <label>
+                  Run name <span>optional</span>
+                  <input
+                    name="name"
+                    value={identity.name}
+                    placeholder={`${detail.strategy.name} · development baseline`}
+                    onChange={(event) => setField("name", event.target.value)}
+                  />
+                </label>
+                <label>
+                  Cost profile
+                  <select
+                    value={selectedCostProfileId}
+                    disabled={!costsEnabled}
+                    onChange={(event) => setSelectedCostProfileId(event.target.value)}
+                  >
+                    {profileOptions.map((profile) => (
+                      <option value={profile.id} key={profile.id}>
+                        {profile.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+            {sdk && (
+              <SdkForm
+                manifest={sdk}
+                detail={detail}
+                parameters={parameters}
+                setParam={setParam}
+                advanced={advanced}
+                busy={busy}
+              />
+            )}
+          </div>
+          <div className="run-dialog-foot">
+            <p>
+              Write-once output: the exact parameters, costs, dates, logs, trades, coverage,
+              equity, and report are preserved together.
+            </p>
+            <button type="button" className="secondary-action run-dialog-cancel" onClick={closeDialog}>
+              Cancel
+            </button>
+            <button
+              className="primary-action run-dialog-run"
+              type="submit"
+              disabled={busy || !connected}
+            >
+              {busy ? "Queueing…" : "Run"}
+            </button>
+          </div>
+        </form>
+      </dialog>
     </>
   );
 }
@@ -5417,6 +5755,8 @@ export default function Home() {
   const [costsEnabled, setCostsEnabled] = useState(true);
   const [advanced, setAdvanced] = useState(false);
   const [presetName, setPresetName] = useState("");
+  // The preset the strategy page's parameters came from, "· edited" once a field changed.
+  const [activePreset, setActivePreset] = useState(DEFAULT_PRESET);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
@@ -5459,6 +5799,7 @@ export default function Home() {
       if (!response.ok) throw new Error(body.error);
       setStrategyDetail(body);
       setParameters(body.default_parameters);
+      setActivePreset(DEFAULT_PRESET);
       setCostOverridesDirty(false);
       setCostsEnabled(true);
       setSelectedCostProfileId("us-equities-default");
@@ -6103,6 +6444,7 @@ export default function Home() {
       setCostOverridesDirty(true);
     }
     setParameters((current) => ({ ...current, [key]: value }));
+    setActivePreset((current) => (current.endsWith(EDITED) ? current : `${current}${EDITED}`));
   }
   function applyPreset(preset?: Preset) {
     if (!strategyDetail) return;
@@ -6110,6 +6452,7 @@ export default function Home() {
       ...(strategyDetail.default_parameters as Overrides),
       ...(preset?.parameters ?? {}),
     });
+    setActivePreset(preset?.name ?? DEFAULT_PRESET);
     setCostsEnabled(preset?.costs_enabled ?? true);
     setCostOverridesDirty(
       Boolean(
@@ -6157,9 +6500,8 @@ export default function Home() {
       setBusy(false);
     }
   }
-  async function submitRun(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
+  /** Queues a run from the page state and the identity fields: the strip's Run and the dialog's Run both come here. */
+  async function submitRun(identity: RunIdentity) {
     setBusy(true);
     setError("");
     setNotice("");
@@ -6184,10 +6526,10 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           strategy_id: strategyDetail?.strategy.id,
-          start_date: form.get("start_date"),
-          end_date: form.get("end_date"),
-          research_label: form.get("research_label"),
-          name: form.get("name"),
+          start_date: identity.start_date,
+          end_date: identity.end_date,
+          research_label: identity.research_label,
+          name: identity.name,
           parameters: submittedParameters,
           costs_enabled: costsEnabled,
           cost_profile_id: selectedCostProfileId,
@@ -6499,13 +6841,14 @@ export default function Home() {
               busy={busy}
               connected={connected}
               presetName={presetName}
+              activePreset={activePreset}
               setPresetName={setPresetName}
               setAdvanced={setAdvanced}
               setSelectedCostProfileId={setSelectedCostProfileId}
               setParam={setParam}
               applyPreset={applyPreset}
               savePreset={() => void savePreset()}
-              submitRun={submitRun}
+              submitRun={(identity) => void submitRun(identity)}
               viewCode={() => void openCode(strategyDetail.strategy.id)}
               openRun={(id) => void openRun(id)}
               toggleStar={(run) => void toggleRunStar(run)}

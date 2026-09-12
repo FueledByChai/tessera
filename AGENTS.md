@@ -163,6 +163,10 @@ worktree's engine; `scripts/check.sh --resolve` shows what a run would use.
   page must keep rendering every chart from `web/fixtures/study-result.json`:
   `web/scripts/chart-check.mjs` (run by `scripts/check.sh`) fails on a missing chart, a console
   error, or a chart placed above the results grid.
+- The strategy page is a summary strip with a Run button over its history; the run form lives in
+  the Configure run dialog, the console's one modal (decision 0003). `web/scripts/run-form-check.mjs`
+  (run by `scripts/check.sh`) drives it from `web/fixtures/strategy-detail.json` and fails unless
+  the strip's Run and the dialog's Run both post exactly the values the strip shows.
 - Relative API origin (`import.meta.env.VITE_API_ORIGIN ?? ""`); dev server on 5173 proxies `/api`.
 
 ### Docs to keep current

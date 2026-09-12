@@ -2507,7 +2507,8 @@ nav {
 .strategy-run-history {
   margin-top: 16px;
 }
-.strategy-run-history-summary {
+.strategy-run-history-summary,
+.rules-fold-summary {
   list-style: none;
   padding: 18px 20px;
   display: flex;
@@ -2517,13 +2518,16 @@ nav {
   cursor: pointer;
   user-select: none;
 }
-.strategy-run-history-summary::-webkit-details-marker {
+.strategy-run-history-summary::-webkit-details-marker,
+.rules-fold-summary::-webkit-details-marker {
   display: none;
 }
-.strategy-run-history-summary h2 {
+.strategy-run-history-summary h2,
+.rules-fold-summary h2 {
   margin: 4px 0 0;
 }
-.strategy-run-history-summary:hover {
+.strategy-run-history-summary:hover,
+.rules-fold-summary:hover {
   background: rgba(255, 255, 255, 0.018);
 }
 .strategy-run-history-meta {
@@ -2540,10 +2544,12 @@ nav {
 .history-toggle::after {
   content: " ↓";
 }
-.strategy-run-history[open] .history-toggle::after {
+.strategy-run-history[open] .history-toggle::after,
+.rules-fold[open] .history-toggle::after {
   content: " ↑";
 }
-.strategy-run-history[open] .strategy-run-history-summary {
+.strategy-run-history[open] .strategy-run-history-summary,
+.rules-fold[open] .rules-fold-summary {
   border-bottom: 1px solid var(--line-soft);
 }
 .strategy-run-history td:last-child,
@@ -3498,17 +3504,20 @@ nav {
 .app-shell[data-theme="terminal"] .panel-head .eyebrow {
   display: none;
 }
-.app-shell[data-theme="terminal"] .strategy-run-history-summary {
+.app-shell[data-theme="terminal"] .strategy-run-history-summary,
+.app-shell[data-theme="terminal"] .rules-fold-summary {
   padding: 6px 12px;
 }
-.app-shell[data-theme="terminal"] .strategy-run-history-summary h2 {
+.app-shell[data-theme="terminal"] .strategy-run-history-summary h2,
+.app-shell[data-theme="terminal"] .rules-fold-summary h2 {
   margin: 0;
   color: var(--accent);
   font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.app-shell[data-theme="terminal"] .strategy-run-history-summary .eyebrow {
+.app-shell[data-theme="terminal"] .strategy-run-history-summary .eyebrow,
+.app-shell[data-theme="terminal"] .rules-fold-summary .eyebrow {
   display: none;
 }
 /* Actions: outlined amber for primary, plain for secondary, blue text links. */
@@ -3714,7 +3723,8 @@ nav {
 .app-shell[data-theme="terminal"] .function-bar,
 .app-shell[data-theme="terminal"] .panel-head,
 .app-shell[data-theme="terminal"] .terminal-panel-title,
-.app-shell[data-theme="terminal"] .strategy-run-history-summary {
+.app-shell[data-theme="terminal"] .strategy-run-history-summary,
+.app-shell[data-theme="terminal"] .rules-fold-summary {
   border-color: var(--bar-red);
   background: var(--bar-red);
   color: #fff;
@@ -3723,7 +3733,8 @@ nav {
 .app-shell[data-theme="terminal"] .function-bar strong,
 .app-shell[data-theme="terminal"] .panel-head h2,
 .app-shell[data-theme="terminal"] .terminal-panel-title,
-.app-shell[data-theme="terminal"] .strategy-run-history-summary h2 {
+.app-shell[data-theme="terminal"] .strategy-run-history-summary h2,
+.app-shell[data-theme="terminal"] .rules-fold-summary h2 {
   color: #fff;
 }
 .app-shell[data-theme="terminal"] .section-intro .eyebrow,
@@ -3740,10 +3751,12 @@ nav {
 .app-shell[data-theme="terminal"] .terminal-panel-title .text-action,
 .app-shell[data-theme="terminal"] .panel-head .text-action,
 .app-shell[data-theme="terminal"] .strategy-run-history-summary .history-toggle,
+.app-shell[data-theme="terminal"] .rules-fold-summary .history-toggle,
 .app-shell[data-theme="terminal"] .strategy-run-history-summary .market-date {
   color: #ffd39a;
 }
-.app-shell[data-theme="terminal"] .strategy-run-history-summary:hover {
+.app-shell[data-theme="terminal"] .strategy-run-history-summary:hover,
+.app-shell[data-theme="terminal"] .rules-fold-summary:hover {
   background: #b81028;
 }
 /* Column headers: gray bars with white text; group rows a lighter gray. */
@@ -4333,6 +4346,303 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
   .app-shell .runs-table td.run-name {
     max-width: 230px;
   }
+}
+
+/* The strategy page (UI-05, decision 0003): the hero's two buttons, the Production rules
+   fold (its bar shares the run-history fold's styling above), the summary strip with its Run,
+   and the Configure run dialog, the console's one modal. Black frames, gray lines, amber
+   captions: web/scripts/theme-check.mjs allows no blue background or border here. */
+.strategy-hero-buttons {
+  display: flex;
+  gap: 8px;
+}
+.rules-fold {
+  margin-bottom: 16px;
+}
+.rules-fold-summary h2 {
+  font-size: 16px;
+  letter-spacing: -0.025em;
+}
+.run-strip {
+  margin-bottom: 16px;
+}
+.run-strip-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.run-strip-head h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: -0.025em;
+}
+.run-strip-preset {
+  color: var(--muted);
+  font: 700 12px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.run-strip-preset strong {
+  margin-left: 6px;
+  color: var(--accent);
+}
+.run-strip-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+.run-strip-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  padding: 10px 18px;
+}
+.run-strip-line + .run-strip-line {
+  border-top: 1px solid var(--line-soft);
+}
+.run-strip-item {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.run-strip-item > span {
+  color: var(--muted);
+  font: 700 11px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.run-strip-item > strong {
+  font-size: 15px;
+  white-space: nowrap;
+}
+/* The dialog: the whole run form as four labelled rows, each row's label in a column on the
+   left of its grid, wide enough that the Data row keeps six fields at 1280 px (UI-04) and never
+   taller than the viewport, the rows scrolling inside it when a strategy declares many
+   parameters. web/scripts/layout-check.mjs opens it at 1280 and 1440 px in both modes and fails
+   when it passes the viewport; web/scripts/run-form-check.mjs drives it. */
+.run-dialog {
+  box-sizing: border-box;
+  width: min(1200px, calc(100vw - 48px));
+  max-height: calc(100vh - 24px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  overflow: hidden;
+}
+.run-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.run-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.72);
+}
+.run-dialog form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.run-dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.run-dialog-head h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: -0.025em;
+}
+.run-dialog-strategy {
+  color: var(--muted);
+  font: 700 12px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.run-dialog-head .mode-switch {
+  margin-left: auto;
+}
+.run-dialog-close {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  width: 30px;
+  height: 30px;
+  cursor: pointer;
+  font: 700 18px var(--font-geist-mono);
+  line-height: 1;
+}
+.run-dialog-close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.run-dialog-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.run-dialog-presets-label {
+  color: var(--muted);
+  font: 700 11px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.preset-chip {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  padding: 6px 10px;
+  cursor: pointer;
+  font: 700 12px var(--font-geist-mono);
+}
+.preset-chip em {
+  margin-left: 6px;
+  color: var(--accent);
+  font: normal 700 10px var(--font-geist-mono);
+}
+.preset-chip:hover,
+.preset-chip.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.run-dialog-presets .preset-save {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  grid-template-columns: 240px auto;
+}
+.run-dialog-presets .preset-save input {
+  padding: 6px 9px;
+}
+.run-dialog-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.run-dialog .form-section {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 10px 14px;
+  align-items: start;
+  padding: 8px 18px;
+}
+.run-dialog .form-section > h3 {
+  margin: 0;
+  padding-top: 4px;
+}
+.run-dialog .form-section > :not(h3) {
+  grid-column: 2;
+}
+.run-dialog .form-section:last-child {
+  border-bottom: 0;
+}
+.run-dialog-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 18px;
+  border-top: 1px solid var(--line);
+}
+.run-dialog-foot p {
+  margin: 0 auto 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+/* Terminal mode: dark-red bars with white titles like every panel head, the preset an amber tag,
+   the dialog's title bar amber with black text (decision 0003). */
+.app-shell[data-theme="terminal"] .run-strip-head {
+  min-height: 30px;
+  padding: 4px 10px;
+  border-color: var(--bar-red);
+  background: var(--bar-red);
+  color: #fff;
+}
+.app-shell[data-theme="terminal"] .run-strip-head h2 {
+  color: #fff;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.app-shell[data-theme="terminal"] .run-strip-preset {
+  color: #ffd39a;
+}
+.app-shell[data-theme="terminal"] .run-strip-preset strong {
+  padding: 1px 6px;
+  background: var(--accent);
+  color: #000;
+}
+.app-shell[data-theme="terminal"] .run-strip-line {
+  padding: 6px 10px;
+}
+.app-shell[data-theme="terminal"] .run-strip-item > span {
+  color: var(--accent);
+}
+.app-shell[data-theme="terminal"] .run-strip-item > strong {
+  color: #f0f0f0;
+}
+.app-shell[data-theme="terminal"] .rules-fold-summary h2,
+.app-shell[data-theme="terminal"] .run-dialog-head h2 {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.app-shell[data-theme="terminal"] .run-dialog {
+  border-color: var(--accent);
+  background: #050505;
+}
+.app-shell[data-theme="terminal"] .run-dialog-head {
+  min-height: 30px;
+  padding: 4px 10px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #000;
+}
+.app-shell[data-theme="terminal"] .run-dialog-head h2,
+.app-shell[data-theme="terminal"] .run-dialog-strategy {
+  color: #000;
+}
+.app-shell[data-theme="terminal"] .run-dialog-head .mode-switch {
+  border-color: #000;
+}
+.app-shell[data-theme="terminal"] .run-dialog-head .mode-switch button {
+  color: #3a2a00;
+}
+.app-shell[data-theme="terminal"] .run-dialog-head .mode-switch button.active {
+  background: #000;
+  color: var(--accent);
+}
+.app-shell[data-theme="terminal"] .run-dialog-close {
+  border-color: #000;
+  color: #000;
+}
+.app-shell[data-theme="terminal"] .run-dialog-close:hover {
+  background: #000;
+  color: var(--accent);
+}
+.app-shell[data-theme="terminal"] .run-dialog-presets,
+.app-shell[data-theme="terminal"] .run-dialog-foot,
+.app-shell[data-theme="terminal"] .run-dialog .form-section {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+.app-shell[data-theme="terminal"] .preset-chip {
+  border-color: #555;
+  color: #f0f0f0;
+}
+.app-shell[data-theme="terminal"] .preset-chip:hover,
+.app-shell[data-theme="terminal"] .preset-chip.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.app-shell[data-theme="terminal"] .run-dialog-foot p {
+  color: #a5a5a5;
 }
 
 /* Form control sizing, both display modes (UI-01, UI-02): every text field, date, number, and
