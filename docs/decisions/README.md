@@ -22,3 +22,6 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0017](0017-strategies-emit-broker-neutral-order-intents-adapters-own-ex.md) Strategies emit broker-neutral order intents; adapters own execution and accounting — accepted
 - [0018](0018-a-live-broker-interface-is-not-live-trading-readiness.md) A live-broker interface is not live-trading readiness — accepted
 - [0019](0019-the-console-s-left-menu-collapses-to-an-icon-rail-the-choice.md) The console's left menu collapses to an icon rail; the choice is per-browser — accepted
+- [0020](0020-provider-adapters-are-native-rust-modules-in-the-service-beh.md) Provider adapters are native Rust modules in the service behind one trait — accepted
+- [0021](0021-data-sources-and-datasets-are-registered-from-the-console-cr.md) Data sources and datasets are registered from the console; credentials live in a 0600 file per source, never in the database — accepted
+- [0022](0022-a-provider-download-job-is-budgeted-exclusive-per-source-and.md) A provider download job is budgeted, exclusive per source, and fails closed on its folder — accepted

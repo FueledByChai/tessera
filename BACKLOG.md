@@ -335,6 +335,167 @@ show-all, clicking the alert row puts that study's IC-by-horizon chart on the pa
 console error appears; a service test shows one log line per new alert and none for a
 repeat; `docs/LOCAL_UI.md` names the panel.
 
+## Data sources
+
+### DS-01 The Data page is three views: Inventory, Instrument search, Updates & schedules
+`view === "data"` in `web/app/page.tsx` renders `DataSourcesPanel`, the DATA LIBRARY metrics,
+`DataCoverage`, and `AutomationsWorkspace` in one column. A tab strip under the title selects a
+`dataView` (inventory, instruments, updates) remembered in browser storage; Inventory keeps the
+sources panel and the library metrics with the run-coverage panel folded closed at the bottom
+(BT-607 moves it later); Instrument search is a query box over `GET /api/instruments` listing
+symbol, name, venue, class, currency, status, and the resolution flags, with query and
+selection held in app state so they survive leaving the workspace; Updates & schedules holds
+`AutomationsWorkspace`. Each view opens at the top. `docs/LOCAL_UI.md` describes the three
+views. Serves BT-608. Wireframe: BT-608. Decisions: 0010, 0014.
+**Done when:** `web/scripts/data-page-check.mjs` (new; `npm run data-page-check`, run by
+`scripts/check.sh`) serves the bundle with `/api/data/sources`, `/api/data/status`,
+`/api/automations`, and `/api/instruments` answered from `web/fixtures/data-sources.json` and
+fails unless each view opens at the top, Inventory shows the sources panel first, and a query
+typed in Instrument search is still there after opening Studies and coming back;
+`web/scripts/layout-check.mjs` measures the three views at 1280 and 1440 px in both modes.
+
+### DS-02 A Provider trait and the EODHD adapter's read-only calls
+New `src/provider/mod.rs` in the library crate: `trait Provider` with `verify(token)` returning
+an account (requests today, daily limit, resets at, plan), `exchanges()` returning code, name,
+country, and resolutions, and `symbols(exchange, delisted)` returning code, name, type, and
+currency; errors distinguish CredentialsRejected, Unreachable, and Malformed.
+`src/provider/eodhd.rs` implements it over reqwest (rustls) with a configurable base URL
+(the user, exchanges-list, and exchange-symbol-list endpoints). No service wiring yet.
+`docs/DATA_SOURCES.md` gains a Providers section. Decisions: 0020.
+**Done when:** `tests/provider_eodhd.rs` starts a stub axum server on a free port serving
+`tests/fixtures/eodhd/{user,exchanges-list,exchange-symbol-list-US}.json` (recorded once,
+token scrubbed, trimmed to a few rows) and asserts the parsed account, exchanges, and
+listings; a 401 body yields CredentialsRejected, a 503 and a dropped connection yield
+Unreachable, and the token travels as a query parameter that no log line prints.
+
+### DS-03 Sources are registered from the console; the token lives in a 0600 file — Blocked by DS-02
+Table `data_sources` (id, name, kind, root, catalog_dir, reserve_pct, token_set_at,
+verified_at, verify_state, verify_message, created_at) in `src/bin/tessera_ui.rs`.
+`POST /api/sources` verifies the token through the adapter and refuses a rejected one (422
+with the provider's message, nothing saved), writes `data/ui/secrets/<id>.token` with mode
+0600, then inserts; `GET /api/sources` lists cards with the root volume's used, free, and
+total (statvfs on the root) and the connection state; `PUT /api/sources/{id}/token`
+replaces; `POST /api/sources/{id}/verify` re-checks; `DELETE /api/sources/{id}` refuses (409)
+when any file lies under the root's dataset folders. The token and its path appear in no
+response. Serves BT-1201. Decisions: 0020, 0021.
+**Done when:** a `#[cfg(test)]` service test against an in-memory catalog and the DS-02 stub
+registers a source with a known token, fetches every `/api/sources` and `/api/data` response,
+and fails if the token string or the secrets path appears; asserts the file mode is 0600;
+asserts a rejected token leaves no row and no file; asserts DELETE returns 409 with a file
+under the root and removes row and file without one.
+
+### DS-04 The provider's availability is cached and served — Blocked by DS-03
+Tables `provider_exchanges` (source_id, code, name, country, resolutions, fetched_at) and
+`provider_listings` (source_id, exchange, code, name, type, currency, delisted, fetched_at).
+`POST /api/sources/{id}/availability/refresh` fetches the exchange list and the listings of
+every exchange with a dataset (or the one named in the body); `GET
+/api/sources/{id}/availability` returns the cached table with per-type counts, `fetched_at`,
+and an unreachable note when the last refresh failed, keeping the previous rows. Serves
+BT-1202. Decisions: 0013, 0020.
+**Done when:** a service test seeds a source over the stub, refreshes, and asserts the
+exchange rows and the US type counts; makes the stub return 503, refreshes again, and asserts
+the rows and `fetched_at` are unchanged with the note set.
+
+### DS-05 Datasets, the scan cache, and disk usage — Blocked by DS-04
+Table `datasets` (id, source_id, exchange, types_json, resolution, from_date, folder,
+include_delisted, created_at) and `dataset_scans` (dataset_id, scanned_at, listed, on_disk,
+latest_date, current_count, bytes, uncataloged_json, state, error). `POST
+/api/sources/{id}/datasets` validates against the cached listing; `DELETE /api/datasets/{id}`
+refuses (409) with files present. `POST /api/sources/{id}/scan` runs a background scan job:
+per dataset, the files for its listed symbols (last date tail-read through
+`last_csv_row_date`), bytes, the count current through the latest expected session (the
+calendar symbol's last date for daily, the last session's close for intraday), Uncataloged
+files per folder under the root, and the BT-605 state; a failed scan keeps the previous row.
+`GET /api/sources` returns each dataset with its last scan. Serves BT-1203. Decisions: 0012,
+0013, 0021.
+**Done when:** a service test builds a temp root with `eod/` holding files for three listed
+symbols, one `.part`, and a stray folder, registers a US EOD dataset over the stub listing of
+five symbols, scans, and asserts listed 5, on disk 3, the latest date, bytes, the `.part`
+excluded, the stray folder Uncataloged with its count, and state Partial; removes the folder,
+rescans, and asserts Unavailable with the previous counts kept; asserts DELETE is 409 with
+files and 200 without.
+
+### DS-06 The Inventory view: source cards, datasets, add forms, and the availability panel — Blocked by DS-05
+`DataSourcesPanel` in `web/app/page.tsx` becomes source cards from `GET /api/sources`: header,
+connection state, volume line, credits line (a placeholder until DS-07), the datasets table
+(dense under 1500 px), the Uncataloged line, Add dataset inline; Add source inline (kind,
+name, root, catalog, token as a password field); Replace token; Rescan per source; the
+"Available from <source>" panel with filter, expand-to-fetch, and Refresh. The token field is
+cleared after save and never rendered again. `docs/LOCAL_UI.md` and `docs/DATA_SOURCES.md`
+describe registering a source and adding a dataset. Serves BT-1201, BT-1202, BT-1203.
+Wireframes: BT-1201, BT-1202, BT-1203. Decisions: 0003, 0014, 0021.
+**Done when:** `web/fixtures/data-sources.json` seeds two sources (one Credentials rejected),
+five datasets, an Uncataloged folder, and the US and LSE availability rows;
+`web/scripts/data-page-check.mjs` fails unless the panels appear in wireframe order, the
+rejected source shows its state, the datasets table shows every column, the availability
+panel shows "listed <time>", and no element's text contains the fixture's token or secrets
+path; `web/scripts/layout-check.mjs` passes at 1280 and 1440 px.
+
+### DS-07 Credits: usage on the card and a call budget every job obeys — Blocked by DS-03
+`src/provider/budget.rs`: `CallBudget { limit, used, reserve }` with estimate helpers,
+`can_start(mandatory_calls)`, `charge(n)`, and `at_reserve()`; the source record stores
+requests today, daily limit, resets at, and when usage was checked, refreshed by `GET
+/api/sources` (through the adapter, cached for a minute) and after every job; `PUT
+/api/sources/{id}` sets `reserve_pct`. The card renders used / limit, the reset time, and the
+reserve field. Serves BT-1204. Decisions: 0022.
+**Done when:** unit tests in `budget.rs` cover `can_start` at the boundary, `charge` past the
+reserve, and a limit of zero; a service test asserts `GET /api/sources` shows the stub's usage
+and, with the stub down, the last value with its time; `data-page-check.mjs` asserts the
+credits line.
+
+### DS-08 The native EOD download job — Blocked by DS-05, DS-07
+`Provider` gains `bulk_eod(exchange, date)`, `eod_history(symbol, from)`, and
+`splits(exchange, date)`; `src/provider/jobs/eod.rs` runs a dataset: the sessions after its
+latest date (bulk, one call each, refused when the calendar symbol is missing or the rows are
+under the dataset's minimum), one appended row per file, backfill of missing symbols
+(delisted once), refetch and replace of split symbols, regeneration of `catalog.csv`,
+`stocks.txt`, and `etfs.txt` in the source's catalog folder, part-then-rename throughout,
+progress and counts on the record. Table `dataset_jobs` (id, dataset_id, kind, state,
+percent, started_at, finished_at, calls, added, updated, skipped_json, error, log_path);
+`POST /api/datasets/{id}/update` queues one; a second on the same source is 409 naming the
+running id; a missing, unwritable, or unmounted folder is refused before any call. Serves
+BT-1205. Decisions: 0020, 0022.
+**Done when:** `tests/provider_eod_job.rs` over the stub and a temp root proves: two sessions
+appended to three files; a fourth listed symbol backfilled from the from-date; a seeded split
+rewrites that symbol's whole file on the new basis; a bulk day without SPY writes nothing and
+the job is Failed with the count; a rerun adds and updates zero; a reserve that admits only
+one backfill leaves no `.part` visible and the rerun continues from the missing symbol; a
+removed folder is refused with no call made; the catalog files match the listing.
+
+### DS-09 The native intraday increment job — Blocked by DS-08
+`Provider` gains `intraday(symbol, resolution, from, to)`; `src/provider/jobs/intraday.rs`
+extends every existing file from its last timestamp in the provider's window for the
+resolution (five calls a request), then backfills missing symbols, budgeted, part-then-rename,
+skipping a symbol with no rows for the rest of the job, writing today's intraday columns.
+Serves BT-1206. Decisions: 0020, 0022.
+**Done when:** `tests/provider_intraday_job.rs` over the stub proves a 5m file is extended
+across two windows with the right call count, a missing symbol is backfilled, a no-rows symbol
+is skipped with its reason, a rerun writes nothing, and the reserve stops the backfill cleanly.
+
+### DS-10 Per-dataset schedules and the Updates & schedules view — Blocked by DS-08
+`automation_schedules` gains `dataset_id`; kind `dataset_update` queues the dataset's job
+from `execute_automation`, or records "skipped: job <id> running" when the source is busy;
+`automation_runs` (schedule_id, ran_at, status) keeps the last seven outcomes served on each
+schedule; `GET /api/datasets/jobs` lists jobs newest first with a cap. The view renders the
+Updates table and the Schedules table with Run now, Pause, the seven marks, and Add schedule
+inline listing the registered datasets; the log opens from the row. `docs/LOCAL_UI.md`
+describes the view. Serves BT-1207. Wireframe: BT-1207. Decisions: 0001, 0014.
+**Done when:** a service test with an in-memory catalog seeds a `dataset_update` schedule,
+runs `execute_automation` with the source idle and asserts a queued job and a mark, then
+with a running job and asserts the skipped status and no second job; `data-page-check.mjs`
+asserts both tables, the seven marks, and that Add schedule lists the fixture's datasets.
+
+### DS-11 Retire the update command, the freshness file, and the DATA LIBRARY panel — Blocked by DS-10
+Remove `update_command`, `freshness_file`, and `provider` from `LocalConfig`
+(`src/local_config.rs`) and `local.example.toml`, the `data_updates` table and
+`queue_eod_update`, `run_eod_update`, and `start_eod_update`, the `data_update` schedule kind
+and its seed, and the DATA LIBRARY panel; the status strip's latest EOD date comes from the
+calendar symbol's file. `docs/DATA_SOURCES.md` and `docs/LOCAL_UI.md` describe sources only.
+Serves BT-1207. Decisions: 0001, 0021.
+**Done when:** `grep` finds none of the removed keys under `src/`, `web/app/`, `docs/`, or
+`local.example.toml`; the config tests in `local_config.rs` pass without them;
+`data-page-check.mjs` no longer expects the panel. No new test: removal only.
+
 ## Housekeeping
 
 ### HK-01 Required symbols from the manifest
