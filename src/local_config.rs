@@ -31,14 +31,6 @@ pub struct DataLibrary {
     /// Daily file whose dates define the trading calendar for screened runs.
     #[serde(default = "default_calendar_symbol")]
     pub calendar_symbol: String,
-    /// Optional JSON written by the provider's refresh job, read for freshness display.
-    #[serde(default)]
-    pub freshness_file: Option<PathBuf>,
-    /// Optional shell command the Data workspace may run to refresh the library.
-    #[serde(default)]
-    pub update_command: Option<String>,
-    #[serde(default = "default_provider_name")]
-    pub provider: String,
     /// Optional parquet tick lake (trades, book snapshots, book events) laid out as
     /// `<lake>/<feed>/exchange=<EX>/symbol=<SYM>/date=<YYYY-MM-DD>/*.parquet`. Enables
     /// `EXCHANGE:SYMBOL` instruments and second resolutions.
@@ -52,9 +44,6 @@ pub struct DataLibrary {
 
 fn default_calendar_symbol() -> String {
     "SPY.US".to_owned()
-}
-fn default_provider_name() -> String {
-    "csv-folders".to_owned()
 }
 
 impl DataLibrary {
@@ -135,9 +124,6 @@ impl LocalConfig {
                 one_minute_dir: data.join("1m"),
                 catalog_dir: data.join("catalog"),
                 calendar_symbol: "DEMO.US".to_owned(),
-                freshness_file: None,
-                update_command: None,
-                provider: "bundled-example".to_owned(),
                 lake_dir: None,
                 series: Vec::new(),
             },
@@ -156,9 +142,6 @@ impl LocalConfig {
         fix(&mut self.data.five_minute_dir);
         fix(&mut self.data.one_minute_dir);
         fix(&mut self.data.catalog_dir);
-        if let Some(path) = self.data.freshness_file.as_mut() {
-            fix(path);
-        }
         if let Some(path) = self.data.lake_dir.as_mut() {
             fix(path);
         }
@@ -218,9 +201,6 @@ mod tests {
                 one_minute_dir: PathBuf::new(),
                 catalog_dir: PathBuf::from("data/catalog"),
                 calendar_symbol: "SPY.US".to_owned(),
-                freshness_file: None,
-                update_command: None,
-                provider: "csv-folders".to_owned(),
                 lake_dir: None,
                 series: Vec::new(),
             },

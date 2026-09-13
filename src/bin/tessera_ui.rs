@@ -482,25 +482,15 @@ struct ImportResponse {
     imported: usize,
 }
 
+/// What the status strip shows (`GET /api/data/status`): the latest session in the calendar
+/// symbol's daily file, the file the library's currency is read from (DS-11), how many daily
+/// files there are, and when that file last changed.
 #[derive(Debug, Serialize)]
 struct DataStatusResponse {
     latest_market_date: String,
     latest_spy_date: String,
-    symbols_on_latest_date: usize,
-    universe_symbols: usize,
+    daily_files: usize,
     updated_at_utc: String,
-    update_job: Option<DataUpdateRecord>,
-}
-
-#[derive(Debug, Serialize)]
-struct DataUpdateRecord {
-    id: String,
-    status: String,
-    created_at: String,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-    log_path: String,
-    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -649,11 +639,7 @@ async fn main() -> Result<()> {
     seed_feature_presets(&connection)?;
 
     let local = LocalConfig::load(&root)?;
-    eprintln!(
-        "data library: {} ({})",
-        local.data.daily_dir.display(),
-        local.data.provider
-    );
+    eprintln!("data library: {}", local.data.daily_dir.display());
     let state = AppState {
         root,
         local: Arc::new(local),
@@ -792,7 +778,6 @@ fn api_router() -> Router<AppState> {
             "/api/strategy-drafts/{id}/build",
             post(build_strategy_draft),
         )
-        .route("/api/data/update-eod", post(start_eod_update))
         .route("/api/sources", get(list_sources).post(create_source))
         .route(
             "/api/sources/{id}",
@@ -878,15 +863,6 @@ fn migrate(connection: &Connection) -> Result<()> {
              accepted INTEGER NOT NULL DEFAULT 0,
              created_at TEXT NOT NULL,
              promoted_at TEXT
-         );
-         CREATE TABLE IF NOT EXISTS data_updates (
-             id TEXT PRIMARY KEY,
-             status TEXT NOT NULL,
-             created_at TEXT NOT NULL,
-             started_at TEXT,
-             finished_at TEXT,
-             log_path TEXT NOT NULL,
-             error TEXT
          );
          CREATE TABLE IF NOT EXISTS watchlist_runs (
              id TEXT PRIMARY KEY,
@@ -1022,8 +998,6 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_presets_strategy_created
          ON strategy_presets(strategy_id, created_at DESC);
-         CREATE INDEX IF NOT EXISTS idx_data_updates_created
-         ON data_updates(created_at DESC);
          CREATE INDEX IF NOT EXISTS idx_watchlist_runs_generated
          ON watchlist_runs(generated_at DESC);
          CREATE INDEX IF NOT EXISTS idx_sweeps_created
@@ -1123,6 +1097,12 @@ fn migrate(connection: &Connection) -> Result<()> {
     )?;
     // DS-10: the dataset a `dataset_update` schedule queues the job for.
     ensure_column(connection, "automation_schedules", "dataset_id", "TEXT")?;
+    // DS-11: the legacy update command's table and its schedule kind are retired; a catalog
+    // from before drops the table and the seeded schedule (its runs cascade with it).
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS data_updates;
+         DELETE FROM automation_schedules WHERE kind = 'data_update';",
+    )?;
     ensure_column(
         connection,
         "jobs",
@@ -1360,13 +1340,6 @@ fn seed_automation_schedules(connection: &Connection) -> Result<()> {
     connection.execute(
         "INSERT OR IGNORE INTO automation_schedules
          (id, name, kind, enabled, local_time, weekdays, created_at)
-         VALUES ('weekday-eod-refresh', 'Weekday US EOD refresh', 'data_update', 0,
-                 '19:15', 'mon,tue,wed,thu,fri', ?1)",
-        [&now],
-    )?;
-    connection.execute(
-        "INSERT OR IGNORE INTO automation_schedules
-         (id, name, kind, enabled, local_time, weekdays, created_at)
          VALUES ('weekday-overnight-watchlist', 'Weekday Overnight Attention watchlist',
                  'watchlist', 0, '20:15', 'mon,tue,wed,thu,fri', ?1)",
         [&now],
@@ -1477,8 +1450,7 @@ fn validate_automation_request(request: &CreateAutomationScheduleRequest) -> Res
         "automation name must contain 1 to 100 characters"
     );
     anyhow::ensure!(
-        ["data_update", "watchlist", AUTOMATION_KIND_DATASET_UPDATE]
-            .contains(&request.kind.as_str()),
+        ["watchlist", AUTOMATION_KIND_DATASET_UPDATE].contains(&request.kind.as_str()),
         "unsupported automation kind"
     );
     anyhow::ensure!(
@@ -1659,9 +1631,6 @@ async fn execute_automation(state: &AppState, id: &str) -> Result<()> {
         )?;
     }
     let outcome = match schedule.kind.as_str() {
-        "data_update" => {
-            queue_eod_update(state).map(|record| (format!("queued {}", record.id), None))
-        }
         AUTOMATION_KIND_DATASET_UPDATE => run_dataset_schedule(state, &schedule).await,
         _ => bail!("unsupported automation kind"),
     };
@@ -1717,12 +1686,6 @@ fn recover_incomplete_jobs(connection: &Connection) -> Result<()> {
     connection.execute(
         "UPDATE runs SET status='Interrupted'
          WHERE id IN (SELECT run_id FROM jobs WHERE status='failed' AND finished_at=?1)",
-        [&finished_at],
-    )?;
-    connection.execute(
-        "UPDATE data_updates SET status='failed', finished_at=?1,
-         error='Local service restarted before this data update finished; inspect the preserved log.'
-         WHERE status IN ('queued', 'running')",
         [&finished_at],
     )?;
     connection.execute(
@@ -4124,13 +4087,9 @@ struct CatalogInventory {
 
 #[derive(Debug, Clone, Serialize)]
 struct CsvLibraryInventory {
-    provider: String,
     calendar_symbol: String,
     feeds: Vec<FeedInventory>,
     catalog: CatalogInventory,
-    freshness_file: Option<String>,
-    freshness: Option<serde_json::Value>,
-    update_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4276,22 +4235,10 @@ fn build_data_sources(state: &AppState) -> Result<DataSourcesResponse> {
         etfs: count_lines(&data.etf_universe()),
         extra_lists,
     };
-    let freshness = data
-        .freshness_file
-        .as_ref()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok());
     let csv_library = CsvLibraryInventory {
-        provider: data.provider.clone(),
         calendar_symbol: data.calendar_symbol.clone(),
         feeds,
         catalog,
-        freshness_file: data
-            .freshness_file
-            .as_ref()
-            .map(|p| p.display().to_string()),
-        freshness,
-        update_command: data.update_command.clone(),
     };
     let lake = data.lake_dir.as_ref().map(|root| {
         let mut feeds = Vec::new();
@@ -4382,7 +4329,8 @@ fn build_data_sources(state: &AppState) -> Result<DataSourcesResponse> {
         config: ConfigInventory {
             local_toml: local_toml.display().to_string(),
             local_toml_exists: local_toml.is_file(),
-            bundled_example: data.provider == "bundled-example",
+            // The loader falls back to examples/data exactly when the file is missing.
+            bundled_example: !local_toml.is_file(),
             env_overrides,
             memory_budget_gb,
         },
@@ -4424,69 +4372,13 @@ async fn data_status(State(state): State<AppState>) -> Result<Json<DataStatusRes
     Ok(Json(load_data_status(&state)?))
 }
 
-async fn start_eod_update(
-    State(state): State<AppState>,
-) -> Result<(StatusCode, Json<DataUpdateRecord>), ApiError> {
-    let record = queue_eod_update(&state)?;
-    Ok((StatusCode::ACCEPTED, Json(record)))
-}
-
-fn queue_eod_update(state: &AppState) -> Result<DataUpdateRecord> {
-    let active = {
-        let connection = state.database.lock().expect("database lock poisoned");
-        connection.query_row(
-            "SELECT COUNT(*) FROM data_updates WHERE status IN ('queued', 'running')",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?
-    };
-    if active != 0 {
-        return Err(anyhow::anyhow!("a US EOD update is already running").into());
-    }
-    let now = Utc::now();
-    let id = format!("data-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
-    let log_path = format!("data/ui/logs/{id}.log");
-    {
-        let connection = state.database.lock().expect("database lock poisoned");
-        connection.execute(
-            "INSERT INTO data_updates (id, status, created_at, log_path)
-             VALUES (?1, 'queued', ?2, ?3)",
-            params![id, now.to_rfc3339(), log_path],
-        )?;
-    }
-    let worker_state = state.clone();
-    let worker_id = id.clone();
-    tokio::spawn(async move {
-        if let Err(error) = run_eod_update(worker_state.clone(), &worker_id).await {
-            let connection = worker_state
-                .database
-                .lock()
-                .expect("database lock poisoned");
-            let _ = connection.execute(
-                "UPDATE data_updates SET status='failed', finished_at=?2, error=?3 WHERE id=?1",
-                params![worker_id, Utc::now().to_rfc3339(), format!("{error:#}")],
-            );
-        }
-    });
-    load_data_update(state, &id)
-}
-
+/// The status strip's figures, read from the calendar symbol's daily file under
+/// `daily_dir` (DS-11): its last dated row is the latest session, its modification time
+/// is when the library last changed. `unknown` where the file is missing.
 fn load_data_status(state: &AppState) -> Result<DataStatusResponse> {
     let data = &state.local.data;
-    let freshness: Option<serde_json::Value> = data
-        .freshness_file
-        .as_ref()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str(&text).ok());
-    let latest_calendar_date =
-        last_csv_date(&data.daily_dir.join(format!("{}.csv", data.calendar_symbol)))
-            .unwrap_or_else(|| "unknown".to_owned());
-    let latest_market_date = freshness
-        .as_ref()
-        .and_then(|value| value.get("last_market_date"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| latest_calendar_date.clone());
+    let calendar = data.daily_dir.join(format!("{}.csv", data.calendar_symbol));
+    let latest_calendar_date = last_csv_date(&calendar).unwrap_or_else(|| "unknown".to_owned());
     let daily_files = fs::read_dir(&data.daily_dir)
         .map(|entries| {
             entries
@@ -4495,39 +4387,15 @@ fn load_data_status(state: &AppState) -> Result<DataStatusResponse> {
                 .count()
         })
         .unwrap_or(0);
-    let update_job = {
-        let connection = state.database.lock().expect("database lock poisoned");
-        connection
-            .query_row(
-                "SELECT id, status, created_at, started_at, finished_at, log_path, error
-                 FROM data_updates ORDER BY created_at DESC LIMIT 1",
-                [],
-                map_data_update,
-            )
-            .optional()?
-    };
+    let updated_at_utc = fs::metadata(&calendar)
+        .and_then(|meta| meta.modified())
+        .map(|time| chrono::DateTime::<Utc>::from(time).to_rfc3339())
+        .unwrap_or_else(|_| "unknown".to_owned());
     Ok(DataStatusResponse {
-        latest_market_date,
+        latest_market_date: latest_calendar_date.clone(),
         latest_spy_date: latest_calendar_date,
-        symbols_on_latest_date: freshness
-            .as_ref()
-            .and_then(|value| value.get("eligible_rows"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(daily_files),
-        universe_symbols: freshness
-            .as_ref()
-            .and_then(|value| value.get("universe_symbols"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(daily_files),
-        updated_at_utc: freshness
-            .as_ref()
-            .and_then(|value| value.get("updated_at_utc"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
-        update_job,
+        daily_files,
+        updated_at_utc,
     })
 }
 
@@ -4540,80 +4408,6 @@ fn last_csv_date(path: &Path) -> Option<String> {
                 .map(|date| date.to_string())
         })
     })
-}
-
-fn map_data_update(row: &rusqlite::Row<'_>) -> rusqlite::Result<DataUpdateRecord> {
-    Ok(DataUpdateRecord {
-        id: row.get(0)?,
-        status: row.get(1)?,
-        created_at: row.get(2)?,
-        started_at: row.get(3)?,
-        finished_at: row.get(4)?,
-        log_path: row.get(5)?,
-        error: row.get(6)?,
-    })
-}
-
-fn load_data_update(state: &AppState, id: &str) -> Result<DataUpdateRecord> {
-    let connection = state.database.lock().expect("database lock poisoned");
-    Ok(connection.query_row(
-        "SELECT id, status, created_at, started_at, finished_at, log_path, error
-         FROM data_updates WHERE id=?1",
-        [id],
-        map_data_update,
-    )?)
-}
-
-async fn run_eod_update(state: AppState, id: &str) -> Result<()> {
-    let started_at = Utc::now().to_rfc3339();
-    {
-        let connection = state.database.lock().expect("database lock poisoned");
-        connection.execute(
-            "UPDATE data_updates SET status='running', started_at=?2 WHERE id=?1",
-            params![id, started_at],
-        )?;
-    }
-    let command = state
-        .local
-        .data
-        .update_command
-        .clone()
-        .context("no update_command is configured in local.toml for this data library")?;
-    let update = load_data_update(&state, id)?;
-    let output = Command::new("/bin/sh")
-        .current_dir(&state.root)
-        .arg("-c")
-        .arg(&command)
-        .output()
-        .await?;
-    let mut log = format!("--- {command} ---\n--- stdout ---\n").into_bytes();
-    log.extend_from_slice(&output.stdout);
-    log.extend_from_slice(b"\n--- stderr ---\n");
-    log.extend_from_slice(&output.stderr);
-    let log_path = state.root.join(&update.log_path);
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&log_path, &log)?;
-    let finished_at = Utc::now().to_rfc3339();
-    let connection = state.database.lock().expect("database lock poisoned");
-    if output.status.success() {
-        connection.execute(
-            "UPDATE data_updates SET status='complete', finished_at=?2 WHERE id=?1",
-            params![id, finished_at],
-        )?;
-    } else {
-        let error = format!(
-            "data update command exited with code {}; inspect {}",
-            output.status.code().unwrap_or(-1),
-            update.log_path
-        );
-        connection.execute(
-            "UPDATE data_updates SET status='failed', finished_at=?2, error=?3 WHERE id=?1",
-            params![id, finished_at, error],
-        )?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5360,9 +5154,9 @@ async fn verify_source(
     Ok(Json(load_source_card(&state, &id)?))
 }
 
-/// Removes the record and its token file. Refused while any file lies under the source's
-/// dataset folders, or under the root while it has no datasets: the console never deletes
-/// data files (decision 0022).
+/// Removes the record, its token file, and, with its datasets, their schedules (DS-11).
+/// Refused while any file lies under the source's dataset folders, or under the root while
+/// it has no datasets: the console never deletes data files (decision 0022).
 async fn delete_source(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -5407,6 +5201,11 @@ async fn delete_source(
     }
     {
         let connection = state.database.lock().expect("database lock poisoned");
+        let dataset_ids: Vec<String> = load_datasets(&connection, &id)?
+            .into_iter()
+            .map(|dataset| dataset.id)
+            .collect();
+        remove_dataset_schedules(&connection, &dataset_ids)?;
         connection.execute("DELETE FROM data_sources WHERE id = ?1", [&id])?;
     }
     remove_token(&state, &id)?;
@@ -6579,12 +6378,35 @@ async fn create_dataset(
     Ok((StatusCode::CREATED, Json(dataset)))
 }
 
-/// Removes a dataset's registration and its scan row. Refused while a file exists for any
-/// of its listed symbols: files are never deleted (decision 0022). 200 with the source card.
+/// `DELETE /api/datasets/{id}`'s answer: the source's card as it stands afterwards, and how
+/// many `dataset_update` schedules went with the dataset (DS-11).
+#[derive(Debug, Serialize)]
+struct DatasetRemoved {
+    schedules_removed: usize,
+    #[serde(flatten)]
+    source: SourceCard,
+}
+
+/// Removes the `dataset_update` schedules of `dataset_ids` with their runs (DS-11: a schedule
+/// whose dataset is gone would only fail) and answers how many schedules went.
+fn remove_dataset_schedules(connection: &Connection, dataset_ids: &[String]) -> Result<usize> {
+    let mut removed = 0;
+    for dataset_id in dataset_ids {
+        removed += connection.execute(
+            "DELETE FROM automation_schedules WHERE kind = ?1 AND dataset_id = ?2",
+            params![AUTOMATION_KIND_DATASET_UPDATE, dataset_id],
+        )?;
+    }
+    Ok(removed)
+}
+
+/// Removes a dataset's registration, its scan row, and its schedules with their runs
+/// (DS-11). Refused while a file exists for any of its listed symbols: files are never
+/// deleted (decision 0022). 200 with the source card and the count of schedules removed.
 async fn delete_dataset(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<SourceCard>, ApiError> {
+) -> Result<Json<DatasetRemoved>, ApiError> {
     let (dataset, symbols) = {
         let connection = state.database.lock().expect("database lock poisoned");
         let dataset = load_dataset(&connection, &id)?
@@ -6615,11 +6437,16 @@ async fn delete_dataset(
             ),
         ));
     }
-    {
+    let schedules_removed = {
         let connection = state.database.lock().expect("database lock poisoned");
+        let removed = remove_dataset_schedules(&connection, std::slice::from_ref(&id))?;
         connection.execute("DELETE FROM datasets WHERE id = ?1", [&id])?;
-    }
-    Ok(Json(load_source_card(&state, &dataset.source_id)?))
+        removed
+    };
+    Ok(Json(DatasetRemoved {
+        schedules_removed,
+        source: load_source_card(&state, &dataset.source_id)?,
+    }))
 }
 
 /// Starts the source's scan job in the background: 202 at once, the card says `scanning`
@@ -11926,6 +11753,154 @@ mod tests {
                 assert_eq!(intraday["last_job"]["id"], job_id.as_str());
                 assert_eq!(intraday["last_job"]["kind"], "intraday");
                 assert_eq!(intraday["scan"]["on_disk"], 2, "{intraday}");
+                let _ = fs::remove_dir_all(&root);
+            }
+
+            /// DS-11: `DELETE /api/datasets/{id}` takes the dataset's `dataset_update`
+            /// schedules and their runs with it and says how many went, leaving another
+            /// dataset's schedule; `DELETE /api/sources/{id}` takes the schedules of the
+            /// source's datasets the same way; and a catalog from before the native jobs
+            /// opens without the legacy `data_update` schedule kind or its table.
+            #[tokio::test]
+            async fn deleting_a_dataset_removes_its_schedules_and_reports_the_count() {
+                let (eodhd, _jobs) = job_stub().await;
+                let root = scratch_root("schedules-removed");
+                let library = root.join("library");
+                let catalog = library.join("catalog");
+                fs::create_dir_all(library.join("eod")).unwrap();
+                fs::create_dir_all(&catalog).unwrap();
+                let state = test_state_over(&root, &eodhd, &library);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+
+                let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                    &serde_json::json!({
+                        "kind": "eodhd", "name": "EODHD", "root": library,
+                        "catalog_dir": catalog, "token": TOKEN
+                    }),
+                ))
+                .await;
+                assert_eq!(status, StatusCode::CREATED, "{text}");
+                let source_id = card["id"].as_str().unwrap().to_owned();
+                let (status, _, text) = call(
+                    client
+                        .post(format!(
+                            "{api}/api/sources/{source_id}/availability/refresh"
+                        ))
+                        .json(&serde_json::json!({ "exchange": "US", "delisted": true })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                let mut dataset_ids = Vec::new();
+                for resolution in ["daily", "5m"] {
+                    let (status, dataset, text) = call(
+                        client
+                            .post(format!("{api}/api/sources/{source_id}/datasets"))
+                            .json(&serde_json::json!({
+                                "exchange": "US", "types": ["ETF"],
+                                "resolution": resolution, "from_date": "2020-01-01"
+                            })),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CREATED, "{text}");
+                    dataset_ids.push(dataset["id"].as_str().unwrap().to_owned());
+                }
+                let (daily_id, intraday_id) = (&dataset_ids[0], &dataset_ids[1]);
+
+                // Two schedules on the daily dataset, one on the intraday one; a run on the
+                // first, as a schedule that has run has.
+                let automations = format!("{api}/api/automations");
+                let mut schedule_ids = Vec::new();
+                for (dataset_id, local_time) in [
+                    (daily_id, "19:15"),
+                    (daily_id, "20:15"),
+                    (intraday_id, "20:30"),
+                ] {
+                    let (status, schedule, text) =
+                        call(client.post(&automations).json(&serde_json::json!({
+                            "kind": "dataset_update", "dataset_id": dataset_id,
+                            "local_time": local_time
+                        })))
+                        .await;
+                    assert_eq!(status, StatusCode::CREATED, "{text}");
+                    schedule_ids.push(schedule["id"].as_str().unwrap().to_owned());
+                }
+                {
+                    let connection = state.database.lock().unwrap();
+                    connection
+                        .execute(
+                            "INSERT INTO automation_runs (schedule_id, ran_at, status, job_id)
+                             VALUES (?1, ?2, 'complete', 'job-0')",
+                            params![schedule_ids[0], Utc::now().to_rfc3339()],
+                        )
+                        .unwrap();
+                }
+                assert_eq!(table_count(&state, "automation_runs"), 1);
+                let dataset_schedules = |listed: &serde_json::Value| -> Vec<String> {
+                    listed
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|item| item["kind"] == AUTOMATION_KIND_DATASET_UPDATE)
+                        .map(|item| item["id"].as_str().unwrap().to_owned())
+                        .collect()
+                };
+                let (_, listed, _) = call(client.get(&automations)).await;
+                assert_eq!(dataset_schedules(&listed), schedule_ids);
+
+                // The daily dataset goes with its two schedules and the run; the count says
+                // so, the card is the source without it, the intraday schedule stands.
+                let (status, removed, text) =
+                    call(client.delete(format!("{api}/api/datasets/{daily_id}"))).await;
+                assert_eq!(status, StatusCode::OK, "{text}");
+                assert_eq!(removed["schedules_removed"], 2, "{removed}");
+                assert_eq!(removed["id"], source_id.as_str(), "{removed}");
+                assert_eq!(
+                    removed["datasets"].as_array().unwrap().len(),
+                    1,
+                    "{removed}"
+                );
+                assert_eq!(removed["datasets"][0]["id"], intraday_id.as_str());
+                let (_, listed, _) = call(client.get(&automations)).await;
+                assert_eq!(dataset_schedules(&listed), vec![schedule_ids[2].clone()]);
+                assert_eq!(table_count(&state, "automation_runs"), 0);
+                assert_eq!(dataset_count(&state), 1);
+
+                // The source goes with its remaining dataset and that dataset's schedule.
+                let (status, _, text) =
+                    call(client.delete(format!("{api}/api/sources/{source_id}"))).await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+                assert_eq!(dataset_count(&state), 0);
+                let (_, listed, _) = call(client.get(&automations)).await;
+                assert!(dataset_schedules(&listed).is_empty(), "{listed}");
+                assert_eq!(table_count(&state, "automation_schedules"), 0);
+
+                // A catalog from before: the legacy schedule and its table are gone on open.
+                {
+                    let connection = state.database.lock().unwrap();
+                    connection
+                        .execute_batch(
+                            "CREATE TABLE data_updates (id TEXT PRIMARY KEY);
+                             INSERT INTO automation_schedules
+                             (id, name, kind, enabled, local_time, weekdays, created_at)
+                             VALUES ('weekday-eod-refresh', 'Weekday US EOD refresh',
+                                     'data_update', 1, '19:15', 'mon', '2026-01-01');
+                             INSERT INTO automation_runs (schedule_id, ran_at, status)
+                             VALUES ('weekday-eod-refresh', '2026-01-02', 'queued data-1');",
+                        )
+                        .unwrap();
+                    migrate(&connection).unwrap();
+                    let tables: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'data_updates'",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(tables, 0, "the data_updates table is dropped");
+                }
+                assert_eq!(table_count(&state, "automation_schedules"), 0);
+                assert_eq!(table_count(&state, "automation_runs"), 0);
                 let _ = fs::remove_dir_all(&root);
             }
 

@@ -8,7 +8,8 @@
 // and proves the three views:
 //   1. the page opens at the top on Inventory, whose panels come in wireframe order (BT-1201 to
 //      BT-1203): the source cards first, then Available from <source>, then the configured
-//      library's feeds, the library metrics, and the run-coverage fold, closed; every card
+//      library's feeds, and the run-coverage fold, closed (DS-11: no library metrics panel,
+//      the status strip reads the calendar symbol's file); every card
 //      shows its header, connection state, credits line (used / limit, "resets 00:00 UTC"),
 //      datasets table (every column of the wireframe) or "no datasets yet", and Uncataloged
 //      line in that order; the rejected source shows Credentials rejected with the provider's
@@ -17,15 +18,14 @@
 //      when expanded; Add dataset, Replace token, and Add source are inline forms (no dialog),
 //      Add source pre-filled with the configured library's root and catalog, the token a
 //      password field posted once and then gone: after a save no element's text or value
-//      carries the fixture's token or the secrets path; the library metrics show the
-//      freshness time as a date and time, not the raw ISO string;
+//      carries the fixture's token or the secrets path;
 //   2. scrolled to the bottom, switching to Instrument search lands at the top; a query typed
 //      there lists the fixture's matches under the ten columns (symbol, name, venue, class,
 //      currency, status, EOD, 5m, 1m, tick) and a clicked row is the selection;
 //   3. after opening Studies and coming back, the Data page is still on Instrument search with
 //      the same query, the same rows, and the same selection (BT-608);
-//   4. scrolled to the bottom, switching to Updates & schedules lands at the top and shows, above
-//      the legacy update command and its schedules, the native tables (DS-10, BT-1207): the jobs
+//   4. scrolled to the bottom, switching to Updates & schedules lands at the top and shows the
+//      two native tables and nothing else (DS-10, DS-11, BT-1207): the jobs
 //      newest first under the wireframe's nine columns, twelve of them until Show all, the log
 //      opening in a row under its job; the dataset schedules under the wireframe's columns with
 //      seven marks each (o complete, ~ queued, . skipped, x failed, - none), Run now posting a
@@ -51,7 +51,7 @@ const verbose = process.argv.includes("--verbose");
 const COLUMNS = ["Symbol", "Name", "Venue", "Class", "Ccy", "Status", "EOD", "5m", "1m", "Tick"];
 const DATASET_COLUMNS = ["Exchange", "Types", "Res", "From", "Folder", "Listed", "On disk", "Latest", "Current", "Size", "State"];
 const AVAILABILITY_COLUMNS = ["Exchange", "Name", "Country", "Types (listed)", "Res", "Here"];
-const PANEL_ORDER = ["data-sources-panel", "availability-panel", "data-library-feeds", "data-library-panel", "coverage-fold"];
+const PANEL_ORDER = ["data-sources-panel", "availability-panel", "data-library-feeds", "coverage-fold"];
 const CARD_ORDER = ["source-card-head", "source-state", "source-credits", "dataset-table", "source-uncataloged"];
 const QUERY = "IW";
 const PICK = "IWM.US";
@@ -114,11 +114,10 @@ function resetSources() {
   posted = { sources: [], tokens: [], datasets: [], refreshes: [], scans: [], reserves: [], automations: [], runs: [], toggles: [] };
 }
 const DATASET_SCHEDULES = fixture.automations.filter((a) => a.kind === "dataset_update");
-const LEGACY_SCHEDULES = fixture.automations.filter((a) => a.kind !== "dataset_update");
 const JOB_COLUMNS = ["Dataset", "Kind", "State", "Started", "Calls", "Added", "Updated", "Error", "Log"];
 const SCHEDULE_COLUMNS = ["Dataset", "Time PT", "Days", "On", "Last run", "Last status", "Last 7", ""];
 const JOBS_SHOWN = 12;
-const UPDATES_ORDER = ["dataset-jobs-panel", "dataset-schedules-panel", "data-updates-panel", "automation-panel"];
+const UPDATES_ORDER = ["dataset-jobs-panel", "dataset-schedules-panel"];
 /** The console's mark for a run's status, and a schedule's seven marks padded on the left. */
 const markOf = (status) => (status === "complete" ? "o" : status.startsWith("failed") ? "x" : status.startsWith("skipped") ? "." : status.startsWith("queued") ? "~" : "?");
 const marksOf = (runs) => `${"-".repeat(Math.max(0, 7 - runs.length))}${runs.slice(-7).map((r) => markOf(r.status)).join("")}`;
@@ -301,7 +300,7 @@ function readWorkspace() {
   const firstPanel = workspace ? [...workspace.children].find((el) => el.classList.contains("panel") || el.querySelector?.(".panel")) : null;
   const panel = firstPanel?.classList.contains("panel") ? firstPanel : firstPanel?.querySelector(".panel");
   const fold = document.querySelector("details.coverage-fold");
-  const known = ["data-sources-panel", "availability-panel", "data-library-feeds", "data-library-panel", "coverage-fold"];
+  const known = ["data-sources-panel", "availability-panel", "data-library-feeds", "coverage-fold"];
   const panels = workspace
     ? [...workspace.querySelectorAll(":scope > section, :scope > details")].map((el) => known.find((k) => el.classList.contains(k)) ?? el.className).filter(Boolean)
     : null;
@@ -371,7 +370,7 @@ function readAvailability() {
 function readUpdates() {
   const text = (el) => el?.textContent?.replace(/\s+/g, " ").trim() ?? "";
   const workspace = document.querySelector(".data-workspace");
-  const known = ["dataset-jobs-panel", "dataset-schedules-panel", "data-updates-panel", "automation-panel"];
+  const known = ["dataset-jobs-panel", "dataset-schedules-panel"];
   const jobsTable = document.querySelector("table.dataset-jobs-table");
   const schedulesTable = document.querySelector("table.dataset-schedules-table");
   return {
@@ -464,12 +463,8 @@ try {
       for (const feed of fixture.sources.csv_library.feeds) {
         if (!feeds.includes(feed.path)) fail(`the library feeds panel does not list the fixture feed ${feed.path}`);
       }
-      const latest = await page.locator(".data-library-metrics").textContent().catch(() => "");
-      if (!latest.includes(fixture.status.latest_market_date)) fail(`the library metrics do not show the fixture's latest market date ${fixture.status.latest_market_date}`);
-      const updated = fixture.status.updated_at_utc;
-      if (latest.includes(updated)) fail(`the library metrics show the raw freshness stamp ${updated}`);
-      if (!latest.includes(`${updated.slice(0, 10)} ${updated.slice(11, 16)}`)) fail(`the library metrics do not show the freshness time as a date and time (${updated.slice(0, 10)} ${updated.slice(11, 16)})`);
-      if (await page.locator(".data-workspace .automation-panel").count()) fail("Inventory shows the schedules");
+      if (await page.locator(".data-workspace .data-library-panel, .data-workspace .data-library-metrics").count()) fail("Inventory still shows the DATA LIBRARY panel (DS-11 retired it)");
+      if (await page.locator(".data-workspace .dataset-schedules-panel").count()) fail("Inventory shows the schedules");
       if (await page.locator("dialog[open]").count()) fail("Inventory opened a dialog");
 
       // The cards: header, state, credits, datasets, Uncataloged, in that order; the rejected
@@ -679,37 +674,28 @@ try {
       if (JSON.stringify(searchBack.rows) !== JSON.stringify(search.rows)) fail(`back from Studies the rows are ${JSON.stringify(searchBack.rows)}, before they were ${JSON.stringify(search.rows)}`);
       if (searchBack.selected !== PICK) fail(`back from Studies the selection is ${JSON.stringify(searchBack.selected)}, not ${PICK}`);
 
-      // 4. Updates & schedules: opens at the top with the update command's state and the schedules.
+      // 4. Updates & schedules: opens at the top with the jobs and the dataset schedules.
       await scrollToBottom(page);
       await page.waitForTimeout(100);
       await clickTab(page, "updates");
-      await page.locator(".data-workspace .automation-panel").waitFor({ timeout: 10000 });
+      await page.locator(".data-workspace .dataset-schedules-panel").waitFor({ timeout: 10000 });
       await page.waitForTimeout(300);
       const updates = await page.evaluate(readWorkspace);
       note(`updates ${JSON.stringify(updates)}`);
       if (updates.active !== "updates") fail(`after the click the active tab is ${JSON.stringify(updates.active)}`);
       if (updates.scrollY !== 0) fail(`Updates & schedules opened scrolled (scrollY ${updates.scrollY})`);
       if (await page.locator(".data-workspace .instrument-search-view").count()) fail("Updates & schedules still shows the instrument search");
-      const schedules = await page.locator(".data-workspace .automation-list article").allTextContents();
-      for (const schedule of LEGACY_SCHEDULES) {
-        if (!schedules.some((text) => text.includes(schedule.name))) fail(`Updates & schedules does not list the legacy schedule ${JSON.stringify(schedule.name)}`);
-      }
-      const jobs = await page.locator(".data-updates-panel").textContent().catch(() => null);
-      if (jobs == null) fail("Updates & schedules has no updates panel (.data-updates-panel)");
-      else {
-        if (!jobs.includes(fixture.sources.csv_library.update_command)) fail("the updates panel does not name the update command");
-        if (!jobs.includes(fixture.status.update_job.status)) fail(`the updates panel does not show the last update's state ${JSON.stringify(fixture.status.update_job.status)}`);
-      }
+      if (await page.locator(".data-workspace .data-updates-panel, .data-workspace .automation-panel").count()) fail("Updates & schedules still shows the legacy update command panel or its schedules (DS-11 retired them)");
 
       // The native tables (DS-10, BT-1207): the jobs newest first under the nine columns,
       // twelve until Show all, the log opening under its row; the schedules with their seven
-      // marks, Run now, Pause; Add schedule inline listing the registered datasets; all of it
-      // above the legacy panels.
+      // marks, Run now, Pause; Add schedule inline listing the registered datasets; and no
+      // other panel (DS-11).
       await page.locator("table.dataset-jobs-table tbody tr[data-job-id]").first().waitFor({ timeout: 10000 }).catch(() => fail("no jobs table (table.dataset-jobs-table) with rows on Updates & schedules"));
       await page.locator("table.dataset-schedules-table tbody tr[data-schedule-id]").first().waitFor({ timeout: 10000 }).catch(() => fail("no schedules table (table.dataset-schedules-table) with rows on Updates & schedules"));
       const native = await page.evaluate(readUpdates);
       note(`native ${JSON.stringify(native)}`);
-      if (JSON.stringify(native.panels) !== JSON.stringify(UPDATES_ORDER)) fail(`Updates & schedules' panels are ${JSON.stringify(native.panels)}, the wireframe orders them ${JSON.stringify(UPDATES_ORDER)} (the new tables above the legacy panels)`);
+      if (JSON.stringify(native.panels) !== JSON.stringify(UPDATES_ORDER)) fail(`Updates & schedules' panels are ${JSON.stringify(native.panels)}, the wireframe has ${JSON.stringify(UPDATES_ORDER)} and nothing else`);
       if (!native.jobColumns) fail("no jobs table");
       else if (native.jobColumns.join("|") !== JOB_COLUMNS.join("|")) fail(`the jobs table's columns are ${JSON.stringify(native.jobColumns)}, not ${JSON.stringify(JOB_COLUMNS)}`);
       const capped = Math.min(JOBS_SHOWN, fixture.jobs.length);
@@ -830,5 +816,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `data-page-check: ok (web/fixtures/data-sources.json, terminal and modern; three views each at the top, Inventory's panels in wireframe order with ${fixture.registered.sources.length} source cards (one Credentials rejected, ${CONNECTED.datasets.length} datasets and an Uncataloged folder on the first), the availability table listed 09-11 02:00 with LSE fetched on expand, Add dataset, Replace token, and Add source posted inline with the token nowhere after, ${JSON.stringify(QUERY)} listing ${expectedHits} of ${fixture.instruments.length} instruments with ${PICK} selected and kept across Studies, ${fixture.jobs.length} jobs on Updates (${JOBS_SHOWN} then Show all, the log opened from a row) over ${DATASET_SCHEDULES.length} dataset schedules with seven marks each, Run now and Pause posted, Add schedule posted inline for one of ${CONNECTED.datasets.length + 1} registered datasets, ${LEGACY_SCHEDULES.length} legacy schedules under them, the last view remembered; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `data-page-check: ok (web/fixtures/data-sources.json, terminal and modern; three views each at the top, Inventory's panels in wireframe order with ${fixture.registered.sources.length} source cards (one Credentials rejected, ${CONNECTED.datasets.length} datasets and an Uncataloged folder on the first), the availability table listed 09-11 02:00 with LSE fetched on expand, Add dataset, Replace token, and Add source posted inline with the token nowhere after, ${JSON.stringify(QUERY)} listing ${expectedHits} of ${fixture.instruments.length} instruments with ${PICK} selected and kept across Studies, ${fixture.jobs.length} jobs on Updates (${JOBS_SHOWN} then Show all, the log opened from a row) over ${DATASET_SCHEDULES.length} dataset schedules with seven marks each, Run now and Pause posted, Add schedule posted inline for one of ${CONNECTED.datasets.length + 1} registered datasets, no legacy panel under them, the last view remembered; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );

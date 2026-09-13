@@ -382,39 +382,6 @@ a { color: inherit; text-decoration: inherit; }
 .cost-profile-card small {
   color: var(--muted);
 }
-.automation-panel {
-  margin-top: 16px;
-}
-.automation-list article {
-  display: grid;
-  grid-template-columns: 80px minmax(260px, 1fr) auto auto;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--line);
-}
-.automation-list article div {
-  display: grid;
-  gap: 3px;
-}
-.automation-list small,
-.automation-list em {
-  color: var(--muted);
-  font-style: normal;
-}
-.automation-create {
-  display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 120px minmax(0, 1.2fr) auto auto;
-  gap: 10px;
-  align-items: center;
-  padding: 16px;
-}
-@media (max-width: 1000px) {
-  .automation-list article,
-  .automation-create {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 .correlation-table-ui th,
 .correlation-table-ui td {
   text-align: center !important;
@@ -4250,21 +4217,16 @@ nav {
 .coverage-fold[open] .rules-fold-summary { border-bottom: 1px solid var(--line-soft); }
 .coverage-fold-body { padding: 18px; }
 .coverage-fold-body .section-intro { margin-top: 0; }
-.data-updates-panel { display: flex; flex-direction: column; gap: 12px; }
-.data-updates-panel code { background: #1a1a1a; padding: 1px 5px; word-break: break-all; }
-.data-updates-panel td.feature-actions { text-align: right; white-space: nowrap; }
 /* Paths, notes, commands, and errors wrap in their cells, so these tables fit a 13-inch
    laptop instead of scrolling behind macOS's hidden scrollbar (the layout check measures the
    three views). */
 .data-library-feeds { display: flex; flex-direction: column; gap: 12px; }
 .data-library-feeds .terminal-panel-title small { margin-left: 10px; opacity: 0.8; }
-.data-library-feeds th, .data-library-feeds td, .data-updates-panel th, .data-updates-panel td,
+.data-library-feeds th, .data-library-feeds td,
 .instrument-table th, .instrument-table td { text-align: left; }
-.data-library-feeds td.source-path, .data-library-feeds td.source-note, .data-library-feeds td.source-instrument,
-.data-updates-panel td { white-space: normal; }
-.data-library-feeds td.source-path, .data-library-feeds td.source-instrument, .data-updates-panel code { overflow-wrap: anywhere; }
+.data-library-feeds td.source-path, .data-library-feeds td.source-note, .data-library-feeds td.source-instrument { white-space: normal; }
+.data-library-feeds td.source-path, .data-library-feeds td.source-instrument { overflow-wrap: anywhere; }
 .data-library-feeds td.source-path { min-width: 200px; }
-.data-updates-panel td:first-child { white-space: nowrap; }
 
 /* Registered sources (DS-06; decisions 0003, 0013, 0021, 0022): the source cards with their
    inline forms (never a dialog) and the "Available from <source>" panel. The forms are field
@@ -4362,13 +4324,12 @@ nav {
 /* Under 1500 px the two new tables go dense like the others; these selectors carry three
    classes so they outrank the terminal theme's `.app-shell[data-theme] .table-wrap th`. */
 @media (max-width: 1500px) {
-  .app-shell .instrument-table, .app-shell .data-library-feeds table, .app-shell .data-updates-panel table,
+  .app-shell .instrument-table, .app-shell .data-library-feeds table,
   .app-shell .table-wrap .dataset-table, .app-shell .table-wrap .availability-table { font-size: 15px; line-height: 1.25; }
-  .app-shell .instrument-table th, .app-shell .data-library-feeds th, .app-shell .data-updates-panel th,
+  .app-shell .instrument-table th, .app-shell .data-library-feeds th,
   .app-shell .table-wrap .dataset-table th, .app-shell .table-wrap .availability-table th { font-size: 13px; letter-spacing: 0.04em; }
   .app-shell .instrument-table th, .app-shell .instrument-table td,
   .app-shell .data-library-feeds th, .app-shell .data-library-feeds td,
-  .app-shell .data-updates-panel th, .app-shell .data-updates-panel td,
   .app-shell .table-wrap .dataset-table th, .app-shell .table-wrap .dataset-table td,
   .app-shell .table-wrap .availability-table th, .app-shell .table-wrap .availability-table td { padding: 5px 7px; }
   .app-shell .table-wrap .dataset-jobs-table, .app-shell .table-wrap .dataset-schedules-table { font-size: 15px; line-height: 1.25; }
