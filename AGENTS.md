@@ -102,10 +102,15 @@ Bloomberg-style research console (Vite + React bundle served by the Rust service
   `scripts/deploy-local.sh` does all of this from `origin/main` on a schedule (pull, build what
   changed, run the private checks against a new engine, restart only for engine changes
   whose private checks passed and only when idle; `--dry-run` shows the plan, `--launchd`
-  prints the LaunchAgent that runs it every five minutes). A failed private check, or a
-  restart that did not take (the loop reports a restart only once the port's listener is
-  the pid it started), shows in `data/ui/deploy.log` on every run until a later build
-  passes; the pid on port 8787 is the truth about what the console runs.
+  prints the LaunchAgent that runs it every five minutes). **Never pull `main` in this checkout
+  by hand.** The loop decides what to rebuild by the sha each artifact was last built from
+  (`data/ui/deployed`, the engine and the bundle separately), not by whether it did the pull,
+  so a hand pull used to make it log "nothing new" over a build it had never done and leave
+  the console on the old binary; if you do pull by hand, run `scripts/deploy-local.sh` so the
+  loop catches up. A failed private check, or a restart that did not take (the loop reports a
+  restart only once the port's listener is the pid it started), shows in `data/ui/deploy.log`
+  on every run until a later build passes; the pid on port 8787 is the truth about what the
+  console runs.
 - CLI runs: `./target/release/tessera run-strategy --config <toml> --start <date> --end <date>
   --output-dir <dir>`. Scratch outputs go under `target/` or the session scratchpad, never `artifacts/`.
 

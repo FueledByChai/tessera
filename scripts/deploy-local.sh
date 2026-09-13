@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # The local deploy loop (HK-11): brings the console on this machine up to origin/main. Pulls
-# main fast-forward, rebuilds what the new commits touched (the engine for src/, Cargo, build.rs,
-# or strategy changes; the bundle for web/ changes), runs the private checks against the new
-# engine (HK-18: public CI cannot, so this is the post-merge guard), and restarts the service
-# only when an engine change needs it, the private checks pass, and nothing is running in the
-# catalog. Meant to run every few minutes from a schedule; every run is one line in
-# data/ui/deploy.log.
+# main fast-forward, rebuilds what the commits since the last build touched (the engine for
+# src/, Cargo, build.rs, or strategy changes; the bundle for web/ changes), runs the private
+# checks against the new engine (HK-18: public CI cannot, so this is the post-merge guard), and
+# restarts the service only when an engine change needs it, the private checks pass, and
+# nothing is running in the catalog. What to rebuild is keyed on data/ui/deployed, the sha each
+# artifact was last built from, and not on whether this run did the pull (HK-44): a hand pull in
+# the main checkout advances HEAD, so the pull delta reads as "nothing new" while the artifacts
+# on disk are a build behind. Meant to run every few minutes from a schedule; every run is one
+# line in data/ui/deploy.log.
 #
 #   scripts/deploy-local.sh                 deploy if origin/main moved (exit 0; 3 when refused;
 #                                           4 when the private checks failed or the restart
@@ -21,23 +24,32 @@
 #                                           service still holds the port, a start_service
 #                                           that returns from inside $(...) with the pid
 #                                           file naming the live process, and a LaunchAgent
-#                                           that abandons its process group (HK-47)
+#                                           that abandons its process group (HK-47); and the
+#                                           marker the decisions are keyed on — matching
+#                                           origin/main with nothing rebuilt, and left behind
+#                                           by a hand pull with the engine rebuilt and the
+#                                           service restarted anyway (HK-44)
 #   scripts/deploy-local.sh --start-service internal, the self-test's: start_service alone
 #                                           against $TESSERA_ADDR (refuses a port in use)
 #
 # TESSERA_DEPLOY_HEALTH_WAIT is the seconds start_service waits for /api/health (default 60).
 #
-# Decisions, in order: not on a clean main → refuse. origin/main not ahead → nothing new, exit
-# at once (saying so if the last engine build failed its private checks and the service is
-# still on the build before). A job or study running → refuse before pulling, so the checkout
-# stays what the service runs. Otherwise pull, build what changed; for an engine change run
-# `scripts/check.sh --private-only` (output in data/ui/private-check.log) and, only when it
-# passes, restart (the pid in data/ui/api.pid, checked against the port's listener), wait for
-# /api/health, and print the pid only once the port's listener is that pid (HK-30: a health
-# answer alone can come from the old service, as it did when the new one died with "Address
-# already in use"). A failed private check or a restart that did not take leaves the service
-# on its previous build and marks data/ui/private-check.failed or data/ui/restart.failed with
-# the sha until a later build passes; every idle run repeats that the service is behind.
+# Decisions, in order: not on a clean main → refuse. Nothing to build and nothing to pull →
+# nothing new, exit at once (saying so if the last engine build failed its private checks or its
+# restart did not take, and the service is still on the build before). A job or study running →
+# refuse before pulling, so the checkout stays what the service runs. Otherwise pull when main
+# is behind, then build each artifact whose marker is behind — an artifact whose marker already
+# matches origin/main is not rebuilt, and one whose marker is behind is rebuilt even when this
+# run did not pull — and for an engine change run `scripts/check.sh --private-only` (output in
+# data/ui/private-check.log) and, only when it passes, restart (the pid in data/ui/api.pid,
+# checked against the port's listener), wait for /api/health, and print the pid only once the
+# port's listener is that pid (HK-30: a health answer alone can come from the old service, as
+# it did when the new one died with "Address already in use"). A failed private check or a
+# restart that did not take leaves the service on its previous build and marks
+# data/ui/private-check.failed or data/ui/restart.failed with the sha until a later build
+# passes; every idle run repeats that the service is behind. data/ui/deployed holds
+# `engine <sha>` and `web <sha>`, one line each, written once the run has reached origin/main
+# and that artifact is current for it, so it reads "the artifact on disk is this sha".
 #
 # lsof is called by its absolute path, /usr/sbin/lsof: under launchd the PATH is whatever the
 # plist sets, and /usr/sbin was not on it, which is how the listener went unseen (HK-30).
@@ -178,6 +190,68 @@ touched() {  # $1 old $2 new
   echo "$engine $web $other"
 }
 
+# The sha each artifact was last built from, in data/ui/deployed (HK-44), one line each:
+#   engine <sha>
+#   web <sha>
+# An artifact whose marker is behind origin/main is rebuilt whether or not this run did the
+# pull; one whose marker already matches is not rebuilt. No marker means the loop has no record,
+# so the artifact is rebuilt rather than assumed current.
+deployed() {  # $1 engine|web — the sha, and nothing when there is no marker
+  local line
+  line="$(grep -m1 "^$1 " "$ROOT/data/ui/deployed" 2>/dev/null || true)"
+  printf '%s' "${line#* }"
+}
+
+mark_deployed() {  # $1 engine|web  $2 sha — the other line is kept as it was
+  local e w
+  e="$(deployed engine)"; w="$(deployed web)"
+  if [ "$1" = engine ]; then e="$2"; else w="$2"; fi
+  : > "$ROOT/data/ui/deployed.tmp"
+  [ -z "$e" ] || echo "engine $e" >> "$ROOT/data/ui/deployed.tmp"
+  [ -z "$w" ] || echo "web $w" >> "$ROOT/data/ui/deployed.tmp"
+  mv -f "$ROOT/data/ui/deployed.tmp" "$ROOT/data/ui/deployed"
+  return 0
+}
+
+# Whether $1..$2 is a range git can diff: both shas are commits and $1 is an ancestor of $2. A
+# marker that fails this — gone, or not an ancestor after a rewrite — means rebuild, not assume.
+usable_range() {  # $1 old $2 new
+  [ -n "$1" ] || return 1
+  git -C "$ROOT" cat-file -e "$1^{commit}" 2>/dev/null || return 1
+  git -C "$ROOT" merge-base --is-ancestor "$1" "$2" 2>/dev/null
+}
+
+# Whether an artifact has to be rebuilt to reach $3, judged by the sha it was last built from.
+needs_build() {  # $1 engine|web  $2 marker  $3 new
+  local kind="$1" marker="$2" new="$3" e w other
+  [ -n "$marker" ] && [ "$marker" = "$new" ] && return 1
+  usable_range "$marker" "$new" || return 0
+  read -r e w other <<< "$(touched "$marker" "$new")"
+  if [ "$kind" = engine ]; then [ "$e" = 1 ]; else [ "$w" = 1 ]; fi
+}
+
+# How many commits from the furthest-behind of the given shas to $1, for the refusal line.
+commits_behind() {  # $1 new  $2.. shas
+  local new="$1" n=0 m count
+  shift
+  for m in "$@"; do
+    usable_range "$m" "$new" || continue
+    count="$(git -C "$ROOT" rev-list --count "$m..$new")"
+    if [ "$count" -gt "$n" ]; then n="$count"; fi
+  done
+  printf '%s' "$n"
+}
+
+# A sha for a log line: seven characters, or "none" when there is none.
+short() {  # $1 sha
+  [ -n "$1" ] && git -C "$ROOT" rev-parse --short "$1" 2>/dev/null || echo none
+}
+
+# Which marker the dry run would build on: named, so the plan says which one is behind.
+marker_note() {  # $1 engine|web  $2 marker
+  if [ -n "$2" ]; then echo "the $1 marker $(short "$2") is behind"; else echo "no $1 marker yet"; fi
+}
+
 deploy() {  # $1: dry (1) or real (0)
   local dry="$1"
   cd "$ROOT"
@@ -186,9 +260,19 @@ deploy() {  # $1: dry (1) or real (0)
   if [ "$branch" != "main" ]; then log "refusing: checkout is on $branch, not main"; return 3; fi
   if [ -n "$(git status --porcelain --untracked-files=no)" ]; then log "refusing: main has local changes"; return 3; fi
   git fetch -q origin main
-  local old new
+  local old new de dw engine=0 web=0
   old="$(git rev-parse HEAD)"; new="$(git rev-parse origin/main)"
-  if [ "$old" = "$new" ]; then
+  de="$(deployed engine)"; dw="$(deployed web)"
+  # HK-44: the marker decides what to rebuild, not the pull delta. A session that pulls main by
+  # hand advances HEAD, so old = new says nothing about whether the artifacts on disk were built
+  # from it; the sha each was last built from does.
+  if needs_build engine "$de" "$new"; then engine=1; fi
+  if needs_build web "$dw" "$new"; then web=1; fi
+  if [ "$old" = "$new" ] && [ "$engine" = 0 ] && [ "$web" = 0 ]; then
+    # Nothing to pull and nothing to build: the artifacts on disk are current for this sha, so
+    # record that, and a marker a hand pull left behind stops being reported as behind.
+    [ "$de" = "$new" ] || mark_deployed engine "$new"
+    [ "$dw" = "$new" ] || mark_deployed web "$new"
     if [ "$(cat data/ui/private-check.failed 2>/dev/null || true)" = "$old" ]; then
       log "nothing new: main is at $(git rev-parse --short "$old"); private checks failed on it, the service is still on the build before (data/ui/private-check.log)"
     elif [ "$(cat data/ui/restart.failed 2>/dev/null || true)" = "$old" ]; then
@@ -200,17 +284,29 @@ deploy() {  # $1: dry (1) or real (0)
   fi
   if ! git merge-base --is-ancestor "$old" "$new"; then log "refusing: origin/main ($(git rev-parse --short "$new")) is not a fast-forward of main ($(git rev-parse --short "$old"))"; return 3; fi
   local busy; busy="$(running_work)"
-  if [ -n "$busy" ]; then log "refusing: $busy running; $(git rev-list --count "$old..$new") new commit(s) wait for the next run"; return 3; fi
-  read -r engine web other <<< "$(touched "$old" "$new")"
-  local plan="pull $(git rev-parse --short "$old")..$(git rev-parse --short "$new")"
-  [ "$engine" = 1 ] && plan="$plan, build engine, private checks, restart"
-  [ "$web" = 1 ] && plan="$plan, build web"
+  if [ -n "$busy" ]; then log "refusing: $busy running; $(commits_behind "$new" "$old" "$de" "$dw") new commit(s) wait for the next run"; return 3; fi
+  local plan
+  if [ "$old" = "$new" ]; then plan="already at $(git rev-parse --short "$new")"; else plan="pull $(git rev-parse --short "$old")..$(git rev-parse --short "$new")"; fi
+  [ "$engine" = 1 ] && plan="$plan, build engine ($(marker_note engine "$de")), private checks, restart"
+  [ "$web" = 1 ] && plan="$plan, build web ($(marker_note web "$dw"))"
   [ "$engine" = 0 ] && [ "$web" = 0 ] && plan="$plan, nothing to build (docs or scripts only)"
   if [ "$dry" = 1 ]; then log "dry run: would $plan"; return 0; fi
-  git pull -q --ff-only origin main
-  log "pulled $(git rev-parse --short "$old")..$(git rev-parse --short "$new"): $(git log -1 --format=%s)"
-  [ "$engine" = 1 ] && { build_engine; log "built the engine"; }
-  [ "$web" = 1 ] && { build_web; log "built the web bundle"; }
+  if [ "$old" != "$new" ]; then
+    git pull -q --ff-only origin main
+    log "pulled $(git rev-parse --short "$old")..$(git rev-parse --short "$new"): $(git log -1 --format=%s)"
+  fi
+  # Each marker is written once its artifact is current for the sha just reached, so the next
+  # run rebuilds only what changes after it.
+  if [ "$engine" = 1 ]; then
+    build_engine; log "built the engine"; mark_deployed engine "$new"
+  elif [ "$de" != "$new" ]; then
+    mark_deployed engine "$new"
+  fi
+  if [ "$web" = 1 ]; then
+    build_web; log "built the web bundle"; mark_deployed web "$new"
+  elif [ "$dw" != "$new" ]; then
+    mark_deployed web "$new"
+  fi
   if [ "$engine" = 1 ]; then
     if ! private_checks; then
       git rev-parse HEAD > data/ui/private-check.failed
@@ -282,6 +378,10 @@ self_test() {
     git clone -q -b main origin.git deploy
     mkdir -p deploy/data/ui stub
     echo 0 > stub/busy; echo 4242 > stub/pid
+    # The loop keys on the sha it last deployed (HK-44): the fixture starts as a checkout whose
+    # first deploy already happened, so both markers are the scaffold commit.
+    scaffold="$(git -C deploy rev-parse HEAD)"
+    printf 'engine %s\nweb %s\n' "$scaffold" "$scaffold" > deploy/data/ui/deployed
     export TESSERA_DEPLOY_STUB="$dir/stub"
     export TESSERA_DEPLOY_ROOT="$dir/deploy"
     run() { (cd "$dir/deploy" && bash "$script" "$@" 2>"$dir/last.err"); }
@@ -321,7 +421,7 @@ self_test() {
     (cd upstream && echo "fn main() { println!(\"dry\"); }" > src/main.rs && git commit -q -am "WB-97: dry" && git push -q origin main)
     rm -f stub/built stub/restarted
     rc=0; run --dry-run || rc=$?
-    [ "$rc" = 0 ] && grep -q 'dry run: would pull .*build engine, private checks, restart' "$dir/last.err" && [ ! -e stub/built ] || { echo "self-test: dry run: rc $rc"; cat "$dir/last.err"; exit 1; }
+    [ "$rc" = 0 ] && grep -q 'dry run: would pull .*build engine (the engine marker .* is behind), private checks, restart' "$dir/last.err" && [ ! -e stub/built ] || { echo "self-test: dry run: rc $rc"; cat "$dir/last.err"; exit 1; }
     # 8. The private checks fail on an engine change: pulled and built, but no restart, exit 4,
     #    the failure in the log and marked; the next idle run says the service is behind.
     echo 1 > stub/private
@@ -395,6 +495,34 @@ self_test() {
     [ "$rc" = 3 ] && grep -q 'not main' "$dir/last.err" || { echo "self-test: off-main run: rc $rc"; cat "$dir/last.err"; exit 1; }
     (cd deploy && git checkout -q main && echo "local" >> src/main.rs); rc=0; run || rc=$?
     [ "$rc" = 3 ] && grep -q 'local changes' "$dir/last.err" || { echo "self-test: dirty run: rc $rc"; cat "$dir/last.err"; exit 1; }
+    # 14. The marker matches origin/main: nothing is rebuilt, even though a hand pull has just
+    #     moved the checkout onto it. The marker, not the pull delta, is what decides (HK-44).
+    (cd deploy && git checkout -q -- src/main.rs)
+    (cd upstream && echo "fn main() { println!(\"marker\"); }" > src/main.rs && git commit -q -am "WB-93: marker" && git push -q origin main)
+    (cd deploy && git pull -q --ff-only origin main)
+    head="$(git -C deploy rev-parse HEAD)"
+    [ "$head" = "$(git -C upstream rev-parse HEAD)" ] || { echo "self-test: the hand pull should have left main at origin/main"; exit 1; }
+    printf 'engine %s\nweb %s\n' "$head" "$head" > deploy/data/ui/deployed
+    rm -f stub/built stub/restarted stub/checked
+    rc=0; run || rc=$?
+    [ "$rc" = 0 ] && grep -q 'nothing new' "$dir/last.err" || { echo "self-test: a marker at main: rc $rc"; cat "$dir/last.err"; exit 1; }
+    [ ! -e stub/built ] && [ ! -e stub/restarted ] || { echo "self-test: a marker at main must rebuild nothing"; ls stub; cat "$dir/last.err"; exit 1; }
+    # 15. A hand pull advanced main past the marker (HK-44): the run rebuilds the engine and
+    #     restarts the service even though it did not do the pull itself, because the marker says
+    #     the artifact on disk is a build behind.
+    (cd upstream && echo "fn main() { println!(\"hand\"); }" > src/main.rs && git commit -q -am "WB-92: hand pull" && git push -q origin main)
+    (cd deploy && git pull -q --ff-only origin main)   # the hand pull the Project rules forbid
+    head="$(git -C deploy rev-parse HEAD)"
+    [ "$head" = "$(git -C upstream rev-parse HEAD)" ] || { echo "self-test: the hand pull should have left main at origin/main"; exit 1; }
+    [ "$(sed -n 's/^engine //p' deploy/data/ui/deployed)" != "$head" ] || { echo "self-test: the fixture's marker should be behind after the hand pull"; exit 1; }
+    rm -f stub/built stub/restarted stub/checked
+    rc=0; run || rc=$?
+    [ "$rc" = 0 ] || { echo "self-test: the hand-pull run: rc $rc"; cat "$dir/last.err"; exit 1; }
+    grep -q '^engine$' stub/built && grep -q '^private$' stub/checked || { echo "self-test: a hand pull must rebuild the engine and run the private checks"; ls stub; cat "$dir/last.err"; exit 1; }
+    grep -q 'restarted from ' stub/restarted || { echo "self-test: a hand pull must restart the service"; ls stub; cat "$dir/last.err"; exit 1; }
+    grep -q 'pulled ' "$dir/last.err" && { echo "self-test: the hand-pull run should not pull again"; cat "$dir/last.err"; exit 1; }
+    [ "$(sed -n 's/^engine //p' deploy/data/ui/deployed)" = "$head" ] || { echo "self-test: the engine marker should record the sha just built"; cat deploy/data/ui/deployed; exit 1; }
+    [ "$(sed -n 's/^web //p' deploy/data/ui/deployed)" = "$head" ] || { echo "self-test: the web marker should be brought up to the sha too"; cat deploy/data/ui/deployed; exit 1; }
   )
   echo "deploy-local self-test passed"
 }
