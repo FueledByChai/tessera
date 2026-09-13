@@ -85,6 +85,40 @@ const series = [
 ];
 const BOOK_FEATURES = ["obi_l1", "obi_l5", "obi_l10", "microprice_bps", "trade_imbalance", "spread_bps", "signed_volume"];
 const OHLCV_FEATURES = ["return_1", "range_bps", "gap_bps", "high_252_distance"];
+/** The feature library the fixture serves (WB-16): one accepted feature promoted from the
+ *  fixture study and carrying the study it came from, and one candidate with no study. */
+const library = [
+  {
+    id: "feature-fixture-accepted",
+    name: "spread z 60",
+    expression: "spread_bps | zscore 60",
+    note: "promoted from Fixture · DEMO.US 5m",
+    accepted: true,
+    created_at: "2026-01-01T00:00:00Z",
+    promoted_at: "2026-01-01T00:02:00Z",
+    promoted_grid: "5m",
+    promoted_symbols: "DEMO.US",
+    promoted_horizon: 60,
+    promoted_target: "forward_bps",
+    baseline_ic: 0.0312,
+  },
+  {
+    id: "feature-fixture-candidate",
+    name: "range z 60",
+    expression: "range_bps | zscore 60",
+    note: "",
+    accepted: false,
+    created_at: "2026-01-01T00:00:00Z",
+    promoted_at: null,
+    promoted_grid: null,
+    promoted_symbols: null,
+    promoted_horizon: null,
+    promoted_target: null,
+    baseline_ic: null,
+  },
+];
+/** The text the accepted row's promoted study has to carry (WB-16). */
+const PROMOTED_STUDY_TEXT = ["5m", "DEMO.US", "60 bars", "forward_bps", "IC +0.0312"];
 /** Studies the page submitted to the fixture server. */
 const posted = [];
 const json = (body, status = 200) => ({ status, type: "application/json", body: JSON.stringify(body) });
@@ -95,7 +129,7 @@ const fixtureApi = async (pathname, req) => {
   }
   if (pathname === "/api/studies") return json([study]);
   if (pathname === `/api/studies/${study.id}`) return json({ study, result });
-  if (pathname === "/api/features") return json([]);
+  if (pathname === "/api/features") return json(library);
   if (pathname === "/api/lake/instruments") return json([lakeInstrument]);
   if (pathname === "/api/studies/series") return json(series);
   if (pathname === "/api/instruments") return json({ instruments: [catalog], total_matches: 1, index_size: 1, indexed_at: "" });
@@ -156,6 +190,25 @@ try {
         if (chart.height < 40 || chart.width < 200) failures.push(`${mode}: ${name} chart is ${Math.round(chart.width)}x${Math.round(chart.height)} px`);
         if (chart.shapes === 0) failures.push(`${mode}: ${name} chart has no shapes`);
         if (seen.gridTop != null && chart.top <= seen.gridTop) failures.push(`${mode}: ${name} chart sits above the results grid`);
+      }
+      // WB-16: an accepted feature shows the study it was promoted from, beside it.
+      await page.locator(".feature-library-table tr.accepted").first().waitFor({ timeout: 10000 }).catch(() => undefined);
+      const acceptedRow = await page.evaluate(() => {
+        const row = document.querySelector(".feature-library-table tr.accepted");
+        if (!row) return null;
+        return {
+          status: row.querySelector("em")?.textContent?.trim() ?? "",
+          promoted: row.querySelector(".promoted-study")?.textContent?.trim() ?? "",
+        };
+      });
+      if (!acceptedRow) failures.push(`${mode}: the fixture library has no accepted row`);
+      else {
+        if (acceptedRow.status !== "ACCEPTED") failures.push(`${mode}: the accepted library row reads ${JSON.stringify(acceptedRow.status)}`);
+        for (const text of PROMOTED_STUDY_TEXT) {
+          if (!acceptedRow.promoted.includes(text)) {
+            failures.push(`${mode}: the accepted row's promoted study ${JSON.stringify(acceptedRow.promoted)} lacks ${JSON.stringify(text)}`);
+          }
+        }
       }
       if (mode === "terminal") {
         // The form on the daily grid: no order-book checkbox, the OHLCV set ticked, a
@@ -249,5 +302,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `chart-check: ok (${Object.keys(CHARTS).length} charts from web/fixtures/study-result.json, terminal and modern; ${series.length} series checkboxes; daily grid submitted ${posted[0]?.features?.length ?? 0} OHLCV features, lake grid submitted ${JSON.stringify(posted[1]?.features ?? [])}; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `chart-check: ok (${Object.keys(CHARTS).length} charts from web/fixtures/study-result.json, terminal and modern; ${series.length} series checkboxes; the accepted library row carries its promoted study; daily grid submitted ${posted[0]?.features?.length ?? 0} OHLCV features, lake grid submitted ${JSON.stringify(posted[1]?.features ?? [])}; shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );

@@ -4166,6 +4166,9 @@ nav {
 .feature-library-table .feature-expression { color: var(--accent, #f89828); }
 .feature-library-table em { font-style: normal; color: var(--text-muted, #b8b8b8); letter-spacing: 0.06em; }
 .feature-library-table tr.accepted em { color: #32c832; }
+/* The study a promoted feature came from, beside the feature (WB-16); a dash when it was
+   promoted from the library, which had no study in hand. */
+.feature-library-table .promoted-study { color: var(--text-muted, #b8b8b8); }
 .feature-library-table .feature-actions { white-space: nowrap; }
 .feature-library-table .feature-actions .text-action + .text-action { margin-left: 12px; }
 .sweep-summary-strip .study-export { color: #6a9bff; text-decoration: none; }
