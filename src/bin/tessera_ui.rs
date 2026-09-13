@@ -855,15 +855,20 @@ fn migrate(connection: &Connection) -> Result<()> {
              created_at TEXT NOT NULL,
              immutable INTEGER NOT NULL DEFAULT 1
          );
-         CREATE TABLE IF NOT EXISTS feature_presets (
-             id TEXT PRIMARY KEY,
-             name TEXT NOT NULL UNIQUE,
-             expression TEXT NOT NULL,
-             note TEXT NOT NULL DEFAULT '',
-             accepted INTEGER NOT NULL DEFAULT 0,
-             created_at TEXT NOT NULL,
-             promoted_at TEXT
-         );
+        CREATE TABLE IF NOT EXISTS feature_presets (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            expression TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            accepted INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            promoted_at TEXT,
+            promoted_grid TEXT,
+            promoted_symbols TEXT,
+            promoted_horizon INTEGER,
+            promoted_target TEXT,
+            baseline_ic REAL
+        );
          CREATE TABLE IF NOT EXISTS watchlist_runs (
              id TEXT PRIMARY KEY,
              strategy_id TEXT NOT NULL REFERENCES strategies(id),
@@ -1164,6 +1169,14 @@ fn migrate(connection: &Connection) -> Result<()> {
         "venue",
         "TEXT NOT NULL DEFAULT ''",
     )?;
+    // WB-16: the study a feature was promoted from — its grid, symbols, horizon, and target,
+    // and the incremental IC it was promoted with — so a later run can rescore it apples to
+    // apples. All nullable: a promotion made from the library alone has no study to record.
+    ensure_column(connection, "feature_presets", "promoted_grid", "TEXT")?;
+    ensure_column(connection, "feature_presets", "promoted_symbols", "TEXT")?;
+    ensure_column(connection, "feature_presets", "promoted_horizon", "INTEGER")?;
+    ensure_column(connection, "feature_presets", "promoted_target", "TEXT")?;
+    ensure_column(connection, "feature_presets", "baseline_ic", "REAL")?;
     connection.execute_batch("PRAGMA optimize;")?;
     Ok(())
 }
@@ -1329,7 +1342,7 @@ fn seed_feature_presets(connection: &Connection) -> Result<()> {
             |row| row.get::<_, i64>(0).map(|n| n > 0),
         )?;
         if !exists {
-            save_feature_preset(connection, name, expression, note, false)?;
+            save_feature_preset(connection, name, expression, note, false, &None)?;
         }
     }
     Ok(())
@@ -7489,6 +7502,31 @@ struct FeaturePresetRecord {
     accepted: bool,
     created_at: String,
     promoted_at: Option<String>,
+    /// The study the feature was promoted from (WB-16), all null when it was promoted from the
+    /// library alone. `promoted_symbols` is the comma-joined symbol list; `baseline_ic` is the
+    /// incremental IC the cell had at promotion.
+    promoted_grid: Option<String>,
+    promoted_symbols: Option<String>,
+    promoted_horizon: Option<i64>,
+    promoted_target: Option<String>,
+    baseline_ic: Option<f64>,
+}
+
+/// The study a cell came from (WB-16): what it was measured on, and the IC it had then, so a
+/// later run can rescore the promoted feature against the same baseline. Absent for a promotion
+/// made from the library, which has no study in hand.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PromotionStudy {
+    #[serde(default)]
+    grid: Option<String>,
+    #[serde(default)]
+    symbols: Vec<String>,
+    #[serde(default)]
+    horizon: Option<i64>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    ic: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7500,15 +7538,21 @@ struct SaveFeaturePresetRequest {
     /// Save it straight into the accepted set.
     #[serde(default)]
     accepted: bool,
+    /// The study the cell came from, when the promotion was made from a results grid.
+    #[serde(default)]
+    study: Option<PromotionStudy>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PromoteFeatureRequest {
     accepted: bool,
+    /// The study the cell came from; absent for a promotion made from the library.
+    #[serde(default)]
+    study: Option<PromotionStudy>,
 }
 
-const FEATURE_PRESET_COLUMNS: &str =
-    "id, name, expression, note, accepted, created_at, promoted_at";
+const FEATURE_PRESET_COLUMNS: &str = "id, name, expression, note, accepted, created_at, promoted_at, \
+     promoted_grid, promoted_symbols, promoted_horizon, promoted_target, baseline_ic";
 
 fn map_feature_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeaturePresetRecord> {
     Ok(FeaturePresetRecord {
@@ -7519,7 +7563,50 @@ fn map_feature_preset(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeaturePreset
         accepted: row.get::<_, i64>(4)? != 0,
         created_at: row.get(5)?,
         promoted_at: row.get(6)?,
+        promoted_grid: row.get(7)?,
+        promoted_symbols: row.get(8)?,
+        promoted_horizon: row.get(9)?,
+        promoted_target: row.get(10)?,
+        baseline_ic: row.get(11)?,
     })
+}
+
+/// The five provenance columns for a promotion, all null when no study came with it.
+fn promotion_columns(
+    study: &Option<PromotionStudy>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<f64>,
+) {
+    let Some(study) = study else {
+        return (None, None, None, None, None);
+    };
+    let symbols = study
+        .symbols
+        .iter()
+        .map(|symbol| symbol.trim())
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>();
+    (
+        study
+            .grid
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        (!symbols.is_empty()).then(|| symbols.join(",")),
+        study.horizon,
+        study
+            .target
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        study.ic,
+    )
 }
 
 /// Every preset, the accepted ones first, then by name.
@@ -7551,6 +7638,7 @@ fn save_feature_preset(
     expression: &str,
     note: &str,
     accepted: bool,
+    study: &Option<PromotionStudy>,
 ) -> Result<FeaturePresetRecord> {
     let name = name.trim();
     let expression = expression.trim();
@@ -7560,6 +7648,7 @@ fn save_feature_preset(
     );
     anyhow::ensure!(!expression.is_empty(), "the preset needs an expression");
     let now = Utc::now().to_rfc3339();
+    let (grid, symbols, horizon, target, baseline_ic) = promotion_columns(study);
     let existing: Option<String> = connection
         .query_row(
             "SELECT id FROM feature_presets WHERE name = ?1",
@@ -7569,13 +7658,31 @@ fn save_feature_preset(
         .optional()?;
     let id = match existing {
         Some(id) => {
+            // A save that promotes an existing candidate records the study it came from; one
+            // that leaves an already-promoted feature promoted keeps what it was promoted with.
             connection.execute(
                 "UPDATE feature_presets
                  SET expression = ?2, note = ?3,
                      promoted_at = CASE WHEN accepted = 0 AND ?4 THEN ?5 ELSE promoted_at END,
+                     promoted_grid = CASE WHEN accepted = 0 AND ?4 THEN ?6 ELSE promoted_grid END,
+                     promoted_symbols = CASE WHEN accepted = 0 AND ?4 THEN ?7 ELSE promoted_symbols END,
+                     promoted_horizon = CASE WHEN accepted = 0 AND ?4 THEN ?8 ELSE promoted_horizon END,
+                     promoted_target = CASE WHEN accepted = 0 AND ?4 THEN ?9 ELSE promoted_target END,
+                     baseline_ic = CASE WHEN accepted = 0 AND ?4 THEN ?10 ELSE baseline_ic END,
                      accepted = MAX(accepted, ?4)
                  WHERE id = ?1",
-                params![id, expression, note.trim(), accepted, now],
+                params![
+                    id,
+                    expression,
+                    note.trim(),
+                    accepted,
+                    now,
+                    grid,
+                    symbols,
+                    horizon,
+                    target,
+                    baseline_ic
+                ],
             )?;
             id
         }
@@ -7583,8 +7690,9 @@ fn save_feature_preset(
             let id = format!("feature-{}", Utc::now().format("%Y%m%dT%H%M%S%.6fZ"));
             connection.execute(
                 "INSERT INTO feature_presets
-                 (id, name, expression, note, accepted, created_at, promoted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, name, expression, note, accepted, created_at, promoted_at,
+                  promoted_grid, promoted_symbols, promoted_horizon, promoted_target, baseline_ic)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     id,
                     name,
@@ -7592,7 +7700,12 @@ fn save_feature_preset(
                     note.trim(),
                     accepted,
                     now,
-                    accepted.then(|| now.clone())
+                    accepted.then(|| now.clone()),
+                    grid,
+                    symbols,
+                    horizon,
+                    target,
+                    baseline_ic
                 ],
             )?;
             id
@@ -7606,11 +7719,32 @@ fn set_feature_promoted(
     connection: &Connection,
     id: &str,
     accepted: bool,
+    study: &Option<PromotionStudy>,
 ) -> Result<FeaturePresetRecord> {
     let promoted_at = accepted.then(|| Utc::now().to_rfc3339());
+    // A demotion drops the study with the promotion; a promotion records the one it came with,
+    // which is nothing at all when it was made from the library.
+    let (grid, symbols, horizon, target, baseline_ic) = if accepted {
+        promotion_columns(study)
+    } else {
+        (None, None, None, None, None)
+    };
     let changed = connection.execute(
-        "UPDATE feature_presets SET accepted = ?2, promoted_at = ?3 WHERE id = ?1",
-        params![id, accepted, promoted_at],
+        "UPDATE feature_presets
+         SET accepted = ?2, promoted_at = ?3,
+             promoted_grid = ?4, promoted_symbols = ?5, promoted_horizon = ?6,
+             promoted_target = ?7, baseline_ic = ?8
+         WHERE id = ?1",
+        params![
+            id,
+            accepted,
+            promoted_at,
+            grid,
+            symbols,
+            horizon,
+            target,
+            baseline_ic
+        ],
     )?;
     anyhow::ensure!(changed == 1, "unknown feature preset {id}");
     query_feature_preset(connection, id)
@@ -7668,6 +7802,7 @@ async fn create_feature_preset(
         expression,
         &request.note,
         request.accepted,
+        &request.study,
     )?;
     Ok((StatusCode::CREATED, Json(preset)))
 }
@@ -7682,6 +7817,7 @@ async fn promote_feature_preset(
         &connection,
         &id,
         request.accepted,
+        &request.study,
     )?))
 }
 
@@ -9395,12 +9531,18 @@ mod tests {
         let preset = {
             let connection = Connection::open(&path).unwrap();
             migrate(&connection).unwrap();
-            let preset =
-                save_feature_preset(&connection, "spread z", "spread_bps | zscore 60", "", false)
-                    .unwrap();
+            let preset = save_feature_preset(
+                &connection,
+                "spread z",
+                "spread_bps | zscore 60",
+                "",
+                false,
+                &None,
+            )
+            .unwrap();
             assert!(!preset.accepted && preset.promoted_at.is_none());
             assert!(promoted_expressions(&connection).unwrap().is_empty());
-            set_feature_promoted(&connection, &preset.id, true).unwrap()
+            set_feature_promoted(&connection, &preset.id, true, &None).unwrap()
         };
         assert!(preset.accepted && preset.promoted_at.is_some());
         // The service restarts: a new connection, the same file, the same migration.
@@ -9417,13 +9559,95 @@ mod tests {
             vec!["spread_bps | zscore 60"]
         );
         // Demotion takes it out of the accepted set; deletion removes it.
-        let demoted = set_feature_promoted(&connection, &preset.id, false).unwrap();
+        let demoted = set_feature_promoted(&connection, &preset.id, false, &None).unwrap();
         assert!(!demoted.accepted && demoted.promoted_at.is_none());
         assert!(promoted_expressions(&connection).unwrap().is_empty());
         delete_feature_preset(&connection, &preset.id).unwrap();
         assert!(query_feature_presets(&connection).unwrap().is_empty());
         drop(connection);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// WB-16: a feature promoted from a study's results grid records the study it came from —
+    /// the grid, symbols, horizon, and target, and the IC it had then — so a later run can
+    /// rescore it against that baseline. A promotion made from the library alone records nothing
+    /// and leaves the five fields for WB-17's first run to fill.
+    #[test]
+    fn promoting_a_cell_records_the_study_it_came_from() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        let study = PromotionStudy {
+            grid: Some("5m".to_owned()),
+            symbols: vec!["DEMO.US".to_owned(), "SPY.US".to_owned()],
+            horizon: Some(60),
+            target: Some("forward_bps".to_owned()),
+            ic: Some(0.0312),
+        };
+        // The results grid's promote: save the cell straight into the accepted set, with the
+        // study in hand.
+        let promoted = save_feature_preset(
+            &connection,
+            "spread z 60",
+            "spread_bps | zscore 60",
+            "promoted from Fixture · DEMO.US 5m",
+            true,
+            &Some(study.clone()),
+        )
+        .unwrap();
+        assert!(promoted.accepted && promoted.promoted_at.is_some());
+        assert_eq!(promoted.promoted_grid.as_deref(), Some("5m"));
+        assert_eq!(promoted.promoted_symbols.as_deref(), Some("DEMO.US,SPY.US"));
+        assert_eq!(promoted.promoted_horizon, Some(60));
+        assert_eq!(promoted.promoted_target.as_deref(), Some("forward_bps"));
+        assert_eq!(promoted.baseline_ic, Some(0.0312));
+        // Reading it back through the catalog query returns the same five.
+        let again = query_feature_preset(&connection, &promoted.id).unwrap();
+        assert_eq!(again.promoted_grid.as_deref(), Some("5m"));
+        assert_eq!(again.promoted_symbols.as_deref(), Some("DEMO.US,SPY.US"));
+        assert_eq!(again.promoted_horizon, Some(60));
+        assert_eq!(again.promoted_target.as_deref(), Some("forward_bps"));
+        assert_eq!(again.baseline_ic, Some(0.0312));
+        // A library promotion without a study leaves all five null, on both endpoints.
+        let saved =
+            save_feature_preset(&connection, "library only", "return_1", "", false, &None).unwrap();
+        assert!(saved.promoted_grid.is_none() && saved.promoted_symbols.is_none());
+        assert!(saved.promoted_horizon.is_none() && saved.promoted_target.is_none());
+        assert!(saved.baseline_ic.is_none());
+        let bare = set_feature_promoted(&connection, &saved.id, true, &None).unwrap();
+        assert!(bare.accepted && bare.promoted_at.is_some());
+        assert!(bare.promoted_grid.is_none() && bare.promoted_symbols.is_none());
+        assert!(bare.promoted_horizon.is_none() && bare.promoted_target.is_none());
+        assert!(bare.baseline_ic.is_none());
+        // The promote endpoint records the study when it is given one, and a demotion drops it
+        // with the promotion rather than leaving a stale baseline behind.
+        let from_endpoint =
+            set_feature_promoted(&connection, &saved.id, true, &Some(study)).unwrap();
+        assert_eq!(from_endpoint.promoted_grid.as_deref(), Some("5m"));
+        assert_eq!(
+            from_endpoint.promoted_symbols.as_deref(),
+            Some("DEMO.US,SPY.US")
+        );
+        assert_eq!(from_endpoint.promoted_horizon, Some(60));
+        assert_eq!(
+            from_endpoint.promoted_target.as_deref(),
+            Some("forward_bps")
+        );
+        assert_eq!(from_endpoint.baseline_ic, Some(0.0312));
+        let demoted = set_feature_promoted(&connection, &saved.id, false, &None).unwrap();
+        assert!(!demoted.accepted && demoted.promoted_at.is_none());
+        assert!(demoted.promoted_grid.is_none() && demoted.baseline_ic.is_none());
+        // A study with nothing in it records nothing either.
+        let empty = save_feature_preset(
+            &connection,
+            "empty study",
+            "range_bps",
+            "",
+            true,
+            &Some(PromotionStudy::default()),
+        )
+        .unwrap();
+        assert!(empty.promoted_grid.is_none() && empty.promoted_symbols.is_none());
+        assert!(empty.baseline_ic.is_none());
     }
 
     /// WB-15: a fresh catalog starts with the vol feature set; a second start adds nothing,
@@ -9460,7 +9684,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{expression}: {e}"));
         }
         // The owner edits one and deletes another; the next start touches neither.
-        save_feature_preset(&connection, "rv 5s", "mid | rv 10s", "edited", false).unwrap();
+        save_feature_preset(&connection, "rv 5s", "mid | rv 10s", "edited", false, &None).unwrap();
         let sixty = presets.iter().find(|p| p.name == "rv 60s").unwrap();
         delete_feature_preset(&connection, &sixty.id).unwrap();
         seed_feature_presets(&connection).unwrap();
@@ -9485,8 +9709,16 @@ mod tests {
     fn promoted_features_join_the_accepted_set() {
         let connection = Connection::open_in_memory().unwrap();
         migrate(&connection).unwrap();
-        let obi = save_feature_preset(&connection, "obi", "obi_l1", "", true).unwrap();
-        save_feature_preset(&connection, "spread", "spread_bps", "candidate", false).unwrap();
+        let obi = save_feature_preset(&connection, "obi", "obi_l1", "", true, &None).unwrap();
+        save_feature_preset(
+            &connection,
+            "spread",
+            "spread_bps",
+            "candidate",
+            false,
+            &None,
+        )
+        .unwrap();
         assert_eq!(promoted_expressions(&connection).unwrap(), vec!["obi_l1"]);
         let promoted = promoted_expressions(&connection).unwrap();
         assert_eq!(
@@ -9497,16 +9729,16 @@ mod tests {
         assert!(merge_accepted(&[" ".to_owned()], &[]).is_empty());
         // Saving under an existing name updates the expression and keeps the promotion, so a
         // promoted feature can be refined without falling out of the accepted set.
-        let again = save_feature_preset(&connection, "obi", "obi_l5", "", false).unwrap();
+        let again = save_feature_preset(&connection, "obi", "obi_l5", "", false, &None).unwrap();
         assert_eq!(again.id, obi.id);
         assert!(again.accepted);
         assert_eq!(promoted_expressions(&connection).unwrap(), vec!["obi_l5"]);
         assert_eq!(query_feature_presets(&connection).unwrap().len(), 2);
-        set_feature_promoted(&connection, &obi.id, false).unwrap();
+        set_feature_promoted(&connection, &obi.id, false, &None).unwrap();
         assert!(promoted_expressions(&connection).unwrap().is_empty());
         // Names are trimmed and bounded; a blank expression is refused.
-        assert!(save_feature_preset(&connection, "  ", "obi_l1", "", false).is_err());
-        assert!(save_feature_preset(&connection, "x", "   ", "", false).is_err());
+        assert!(save_feature_preset(&connection, "  ", "obi_l1", "", false, &None).is_err());
+        assert!(save_feature_preset(&connection, "x", "   ", "", false, &None).is_err());
     }
 
     /// UI-06: each catalog row carries its last completed run (date and cached metrics) so the

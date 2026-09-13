@@ -1531,7 +1531,32 @@ type FeaturePreset = {
   accepted: boolean;
   created_at: string;
   promoted_at?: string | null;
+  // The study the feature was promoted from (WB-16), null when it was promoted from the library
+  // alone. `promoted_symbols` is the comma-joined symbol list; `baseline_ic` is the IC it had.
+  promoted_grid?: string | null;
+  promoted_symbols?: string | null;
+  promoted_horizon?: number | null;
+  promoted_target?: string | null;
+  baseline_ic?: number | null;
 };
+// The study a promoted cell came from, sent with the promotion (WB-16).
+type PromotionStudy = {
+  grid?: string | null;
+  symbols?: string[];
+  horizon?: number | null;
+  target?: string | null;
+  ic?: number | null;
+};
+/** The promoted study in one line, or nothing when the feature was promoted from the library. */
+function promotedStudyLine(preset: FeaturePreset): string {
+  const parts: string[] = [];
+  if (preset.promoted_grid) parts.push(preset.promoted_grid);
+  if (preset.promoted_symbols) parts.push(preset.promoted_symbols);
+  if (preset.promoted_horizon != null) parts.push(`${preset.promoted_horizon} bars`);
+  if (preset.promoted_target) parts.push(preset.promoted_target);
+  if (preset.baseline_ic != null) parts.push(`IC ${signed(preset.baseline_ic, 4)}`);
+  return parts.join(" · ");
+}
 type StudyRecord = {
   id: string;
   name: string;
@@ -2032,10 +2057,12 @@ function StudiesWorkspace() {
       return false;
     }
   }
-  const saveFeature = (name: string, expression: string, note: string, accepted: boolean) =>
-    libraryCall("", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, expression, note, accepted }) });
-  const promoteFeature = (id: string, accepted: boolean) =>
-    libraryCall(`/${id}/promote`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ accepted }) });
+  // `study` carries the cell's provenance when the promotion came from a results grid (WB-16);
+  // a save or promotion made from the library leaves it out and the server records nothing.
+  const saveFeature = (name: string, expression: string, note: string, accepted: boolean, study?: PromotionStudy) =>
+    libraryCall("", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, expression, note, accepted, study: study ?? null }) });
+  const promoteFeature = (id: string, accepted: boolean, study?: PromotionStudy) =>
+    libraryCall(`/${id}/promote`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ accepted, study: study ?? null }) });
   const deleteFeature = (id: string) => libraryCall(`/${id}`, { method: "DELETE" });
   // "use" puts a saved expression among the candidates: a plain base ticks its checkbox, anything
   // else goes on its own line in the expressions box.
@@ -2207,7 +2234,15 @@ function StudiesWorkspace() {
                   <button
                     type="button"
                     className="text-action"
-                    onClick={() => void saveFeature(bucketCell.feature, bucketCell.feature, `promoted from ${detail.study.name}`, true)}
+                    onClick={() => void saveFeature(bucketCell.feature, bucketCell.feature, `promoted from ${detail.study.name}`, true, {
+                      // The study the cell came from, so a later run can rescore it apples to
+                      // apples (WB-16).
+                      grid: resultGrid,
+                      symbols: result?.config.symbols ?? [],
+                      horizon: bucketCell.horizon_bars,
+                      target: result?.target ?? null,
+                      ic: bucketCell.ic,
+                    })}
                   >
                     promote to accepted
                   </button>
@@ -2481,12 +2516,13 @@ function StudiesWorkspace() {
         {libError && <p className="negative-text">{libError}</p>}
         {library.length ? (
           <div className="table-wrap"><table className="feature-library-table">
-            <thead><tr><th>Name</th><th>Expression</th><th>Status</th><th>Note</th><th>Saved</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Name</th><th>Expression</th><th>Status</th><th>Promoted from</th><th>Note</th><th>Saved</th><th>Actions</th></tr></thead>
             <tbody>{library.map((p) => (
               <tr key={p.id} className={p.accepted ? "accepted" : ""}>
                 <td>{p.name}</td>
                 <td className="feature-expression">{p.expression}</td>
                 <td><em>{p.accepted ? "ACCEPTED" : "candidate"}</em></td>
+                <td className="promoted-study">{promotedStudyLine(p) || "—"}</td>
                 <td>{p.note}</td>
                 <td>{p.created_at.slice(0, 10)}</td>
                 <td className="feature-actions">
