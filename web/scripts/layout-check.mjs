@@ -16,7 +16,10 @@
 // web/fixtures/strategy-detail.json with four more parameters, long captions and hints among
 // them, added to the catalog by this script and measured with the Simple tier showing and
 // again with Advanced showing all eight; it needs the bundle served here, so a LAYOUT_URL run
-// lists it as skipped.
+// lists it as skipped. A last pass (UI-08) collapses the left menu on the strategies page at
+// both widths and modes and fails unless the rail measures 56px, no nav label is showing, the
+// active item still carries its highlight, a nav icon's label surfaces as a hover tooltip, and
+// the body does not scroll horizontally.
 //
 //   node web/scripts/layout-check.mjs                  this checkout's web/dist, API from the
 //                                                      console at LAYOUT_CONSOLE (127.0.0.1:8787)
@@ -202,6 +205,33 @@ function measureDialog() {
   };
 }
 
+/**
+ * Runs in the page: the sidebar as the rail (UI-08) — its measured width, whether any nav label
+ * still shows, and the active item's highlight against an idle one, so a collapse that dropped
+ * the amber colour is told from one that kept it.
+ */
+function railState() {
+  const style = (el) =>
+    el ? { background: getComputedStyle(el).backgroundColor, shadow: getComputedStyle(el).boxShadow } : null;
+  const labels = [...document.querySelectorAll(".nav-item .nav-label")];
+  const visible = labels.filter((el) => {
+    const cs = getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden" && el.getBoundingClientRect().width > 1;
+  });
+  const items = [...document.querySelectorAll(".nav-item")];
+  const active = document.querySelector(".nav-item.active");
+  return {
+    width: Math.round(document.querySelector(".sidebar").getBoundingClientRect().width),
+    state: document.querySelector(".app-shell").dataset.sidebar,
+    labels: labels.length,
+    visibleLabels: visible.map((el) => el.textContent.trim()),
+    active: style(active),
+    idle: style(items.find((el) => el !== active) ?? null),
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth,
+  };
+}
+
 /** What the console has to offer, so pages it cannot supply are skipped rather than failed. */
 async function supply(origin) {
   const count = async (path, pick) => {
@@ -306,6 +336,57 @@ async function checkDialog(page, label, tiers) {
   return failures;
 }
 
+/**
+ * The collapsed pass (UI-08, decision 0019): on the strategies page the toggle turns the sidebar
+ * into a 56px icon rail in both display modes — no nav label showing, the active item keeping
+ * its highlight, a nav icon surfacing its own label as a tooltip on hover — and the page body
+ * not scrolling horizontally. The tooltip is the item's `::after`, so it is read off the
+ * pseudo-element, before the hover and after it.
+ */
+async function checkCollapsed(page, label) {
+  const failures = [];
+  await page.getByRole("button", { name: /Strategies$/ }).first().click();
+  await page.waitForTimeout(300);
+  const before = await page.evaluate(railState);
+  await page.locator(".sidebar-toggle").click();
+  await page.waitForTimeout(450); // the 150ms width and label transitions, then settle
+  const after = await page.evaluate(railState);
+  if (before.width <= 56) failures.push(`${label}: the sidebar was already ${before.width}px before the toggle`);
+  if (after.state !== "collapsed") failures.push(`${label}: the toggle left the shell at data-sidebar=${after.state}`);
+  if (after.width !== 56) failures.push(`${label}: the collapsed sidebar measures ${after.width}px, not 56`);
+  if (after.visibleLabels.length) {
+    failures.push(`${label}: ${after.visibleLabels.length} nav label(s) still visible (${after.visibleLabels.join(", ")})`);
+  }
+  if (!after.active) failures.push(`${label}: no active nav item to keep highlighted`);
+  else if (after.active.background === "rgba(0, 0, 0, 0)" && after.active.shadow === "none") {
+    failures.push(`${label}: the active nav item lost its highlight (background ${after.active.background}, box-shadow ${after.active.shadow})`);
+  } else if (after.idle && after.active.background === after.idle.background && after.active.shadow === after.idle.shadow) {
+    failures.push(`${label}: the active nav item is styled like an idle one`);
+  }
+  if (after.scrollWidth > after.innerWidth) {
+    failures.push(`${label}: the page scrolls horizontally while collapsed (${after.scrollWidth} > ${after.innerWidth})`);
+  }
+  const item = page.locator('.nav-item[data-label="Studies"]');
+  const tip = () =>
+    item.evaluate((el) => {
+      const cs = getComputedStyle(el, "::after");
+      return { content: cs.content.replace(/^"|"$/g, ""), opacity: Number(cs.opacity), visibility: cs.visibility };
+    });
+  const idleTip = await tip();
+  if (idleTip.visibility === "visible") failures.push(`${label}: a nav tooltip shows with the pointer off it`);
+  await item.hover();
+  await page.waitForTimeout(250);
+  const shownTip = await tip();
+  if (shownTip.visibility !== "visible" || shownTip.opacity < 0.5) {
+    failures.push(`${label}: hovering a nav icon surfaced no tooltip (visibility ${shownTip.visibility}, opacity ${shownTip.opacity})`);
+  }
+  if (shownTip.content !== "Studies") failures.push(`${label}: the nav tooltip reads "${shownTip.content}", not the item's label`);
+  if (verbose) {
+    console.log(`${label}: rail ${before.width} -> ${after.width}px, ${after.labels} labels hidden, active ${after.active?.background}, tooltip "${shownTip.content}"`);
+  }
+  return failures;
+}
+
 /** The pages, reached by clicking, since the console has no routes. Each opens the page and
  *  returns any failures of its own beyond the layout measurement. */
 const PAGES = {
@@ -386,6 +467,7 @@ for (const [name, reason] of skipped) console.log(`layout-check: ${name} skipped
 const browser = await runtime.chromium.launch(LAUNCH);
 const failures = [];
 let measured = 0;
+let rails = 0;
 try {
   for (const mode of ["terminal", "modern"]) {
     for (const width of WIDTHS) {
@@ -427,6 +509,19 @@ try {
       await context.close();
     }
   }
+  // The collapsed pass (UI-08): the same widths and modes, on the strategies page, with the rail.
+  for (const mode of ["terminal", "modern"]) {
+    for (const width of WIDTHS) {
+      const context = await browser.newContext({ viewport: { width, height: HEIGHT } });
+      await context.addInitScript((m) => window.localStorage.setItem("bt-display-mode", m), mode);
+      const page = await context.newPage();
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+      await page.locator(".app-shell").waitFor({ timeout: 15000 });
+      failures.push(...(await checkCollapsed(page, `${mode} ${width}px collapsed`)));
+      rails += 1;
+      await context.close();
+    }
+  }
 } finally {
   await browser.close();
   served?.server.close();
@@ -439,5 +534,5 @@ if (failures.length) {
 }
 const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the eight-parameter dialog not scrolling inside"}, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, and a hover tooltip, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );
