@@ -6945,6 +6945,9 @@ export default function Home() {
       // ignore storage failures
     }
   }
+  // The left menu's rail (UI-08, decision 0019): the toggle's state, never a viewport width.
+  // UI-09 stores the choice in browser storage beside the display mode; here it resets on load.
+  const [collapsed, setCollapsed] = useState(false);
   const [view, setView] = useState<View>("dashboard");
   const [stripStatus, setStripStatus] = useState<{ latest_spy_date?: string } | null>(null);
   useEffect(() => {
@@ -7812,14 +7815,26 @@ export default function Home() {
     <main
       className="app-shell"
       data-theme={terminalMode ? "terminal" : "modern"}
+      data-sidebar={collapsed ? "collapsed" : "expanded"}
     >
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">BT</span>
-          <div>
+          <span className="brand-mark" data-label="Tessera">
+            BT
+          </span>
+          <div className="brand-text">
             <strong>Tessera</strong>
             <small>Research Console</small>
           </div>
+          <button
+            className="sidebar-toggle"
+            type="button"
+            aria-label={collapsed ? "Expand the menu" : "Collapse the menu"}
+            aria-expanded={!collapsed}
+            onClick={() => setCollapsed(!collapsed)}
+          >
+            <span aria-hidden="true">{collapsed ? ">" : "<"}</span>
+          </button>
         </div>
         <nav aria-label="Primary navigation">
           {navItems.map(([label, symbol, target]) => (
@@ -7827,18 +7842,21 @@ export default function Home() {
               className={activeNav === label ? "nav-item active" : "nav-item"}
               key={label}
               type="button"
+              data-label={label}
+              aria-label={label}
               onClick={() => navigate(target)}
             >
               <span aria-hidden="true">{symbol}</span>
-              {label}
+              <span className="nav-label">{label}</span>
             </button>
           ))}
         </nav>
         <div className="sidebar-foot">
           <span
             className={connected ? "engine-light" : "engine-light offline"}
+            data-label={connected ? "Engine ready" : "API offline"}
           />
-          <div>
+          <div className="foot-text">
             <strong>{connected ? "Engine ready" : "API offline"}</strong>
             <small>Local Mac · {dashboard.active_jobs} active</small>
           </div>

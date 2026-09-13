@@ -824,7 +824,7 @@ nav {
   font-size: 12px;
   font-weight: 600;
 }
-.nav-item span {
+.nav-item > span:not(.nav-label) {
   width: 18px;
   color: currentColor;
   font: 700 15px var(--font-geist-mono);
@@ -3110,6 +3110,9 @@ nav {
   .sidebar-foot {
     display: none;
   }
+  .sidebar-toggle {
+    display: none;
+  }
   .topbar {
     padding: 15px 17px;
   }
@@ -4809,6 +4812,131 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 }
 .app-shell[data-theme="terminal"] .run-dialog-foot p {
   color: #a5a5a5;
+}
+
+/* The collapsed left menu (UI-08, decision 0019): a 56px icon rail, the same width in both
+   display modes, keeping the brand mark, the ten glyphs, and the engine dot, with the labels
+   and the foot's text not rendered and each label surfaced as a hover tooltip. Only the toggle
+   collapses it — never a viewport width — so the rail rules sit outside the responsive blocks;
+   the mobile top bar (761px and below), where a rail has no meaning and the nav is not shown
+   anyway, keeps the toggle hidden and its own layout. The rail's width animates with the grid
+   track and the labels fade, both over 150ms; the expanded sidebar is untouched. */
+.app-shell[data-sidebar] {
+  transition: grid-template-columns 150ms ease;
+}
+.nav-label {
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  white-space: nowrap;
+  transition:
+    opacity 150ms ease,
+    max-width 150ms ease;
+}
+.brand {
+  position: relative;
+}
+.sidebar-toggle {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  font: 700 13px var(--font-geist-mono), monospace;
+  line-height: 1;
+  cursor: pointer;
+}
+.sidebar-toggle:hover,
+.sidebar-toggle:focus-visible {
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--ink);
+}
+@media (min-width: 761px) {
+  .app-shell[data-sidebar="collapsed"] {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+  .app-shell[data-theme="terminal"][data-sidebar="collapsed"] {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+  .app-shell[data-sidebar="collapsed"] .sidebar {
+    padding: 24px 0;
+  }
+  .app-shell[data-theme="terminal"][data-sidebar="collapsed"] .sidebar {
+    padding: 14px 0;
+  }
+  .app-shell[data-sidebar="collapsed"] .brand {
+    flex-direction: column;
+    gap: 10px;
+    padding: 0 0 16px;
+  }
+  .app-shell[data-sidebar="collapsed"] .sidebar-toggle {
+    position: static;
+    transform: none;
+  }
+  .app-shell[data-sidebar="collapsed"] .brand-text,
+  .app-shell[data-sidebar="collapsed"] .foot-text {
+    display: none;
+  }
+  .app-shell[data-sidebar="collapsed"] .nav-item {
+    justify-content: center;
+    gap: 0;
+    padding: 11px 0;
+    overflow: visible;
+  }
+  .app-shell[data-theme="terminal"][data-sidebar="collapsed"] .nav-item {
+    padding: 8px 0;
+  }
+  .app-shell[data-sidebar="collapsed"] .nav-label {
+    max-width: 0;
+    opacity: 0;
+  }
+  .app-shell[data-sidebar="collapsed"] .sidebar-foot {
+    justify-content: center;
+    padding: 18px 0 0;
+  }
+  .app-shell[data-sidebar="collapsed"] .nav-item,
+  .app-shell[data-sidebar="collapsed"] .brand-mark,
+  .app-shell[data-sidebar="collapsed"] .engine-light {
+    position: relative;
+  }
+  .app-shell[data-sidebar="collapsed"] [data-label]::after {
+    content: attr(data-label);
+    position: absolute;
+    top: 50%;
+    left: calc(100% + 10px);
+    transform: translateY(-50%);
+    padding: 4px 9px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    background: var(--panel-2);
+    color: var(--ink);
+    font-family: var(--font-geist-sans), system-ui, sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.3;
+    white-space: nowrap;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      opacity 150ms ease,
+      visibility 0s linear 150ms;
+    z-index: 40;
+  }
+  .app-shell[data-sidebar="collapsed"] [data-label]:hover::after {
+    opacity: 1;
+    visibility: visible;
+    transition-delay: 0s;
+  }
 }
 
 /* Form control sizing, both display modes (UI-01, UI-02): every text field, date, number, and
