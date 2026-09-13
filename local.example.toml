@@ -16,11 +16,8 @@ one_minute_dir = "/path/to/data/1m"
 catalog_dir = "/path/to/data/catalog"
 # Daily file whose dates define the trading calendar for screened-universe runs.
 calendar_symbol = "SPY.US"
-# Optional: JSON written by your refresh job, shown on the Data page.
-# freshness_file = "/path/to/data/state/bulk_eod.json"
-# Optional: shell command the Data page can launch to refresh the library.
-# update_command = "python3 /path/to/provider/nightly.py"
-provider = "csv-folders"
+# Keeping the library current is the console's job: register the provider account as a
+# source on the Data page and schedule its datasets there (docs/DATA_SOURCES.md).
 # Optional: parquet tick lake for crypto/HFT research. Feeds trades/, book_snapshots/,
 # book_events/ partitioned as exchange=<EX>/symbol=<SYM>/date=<YYYY-MM-DD>/*.parquet.
 # Enables EXCHANGE:SYMBOL instruments (e.g. PARADEX:SOL-USD-PERP) and 1s/5s/30s bars.

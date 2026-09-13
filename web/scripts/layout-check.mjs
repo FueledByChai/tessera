@@ -355,7 +355,7 @@ const PAGES = {
     }
   },
   "data updates": async (page) => {
-    await openDataView(page, "updates", ".data-workspace .automation-panel");
+    await openDataView(page, "updates", ".data-workspace .dataset-schedules-panel");
   },
 };
 

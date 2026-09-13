@@ -25,8 +25,8 @@ universe lists `stocks.txt` and `etfs.txt` (one symbol per line) that the run fo
 `universe:stocks` and `universe:etfs` selections expand to. Sub-folders and other `.txt` lists in
 the catalog folder are listed on the Data page for reference.
 
-Optional: `freshness_file` (a JSON file your refresh job writes; it is shown as *Updated*) and
-`update_command` (a shell command the Data page can run and schedule).
+Keeping a library current is the console's job: register the provider account as a source on
+the Data page and schedule its datasets there (see [Providers](#providers) and decision 0021).
 
 Any vendor works once its data is exported into this layout. Rob's library is the EODHD bulk
 download maintained outside the repository; the refresh script and catalog live with it.

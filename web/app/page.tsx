@@ -406,23 +406,6 @@ function RunFailure({ detail }: { detail: RunDetail }) {
     </div>
   );
 }
-type DataUpdate = {
-  id: string;
-  status: string;
-  created_at: string;
-  started_at?: string;
-  finished_at?: string;
-  log_path: string;
-  error?: string;
-};
-type DataStatus = {
-  latest_market_date: string;
-  latest_spy_date: string;
-  symbols_on_latest_date: number;
-  universe_symbols: number;
-  updated_at_utc: string;
-  update_job?: DataUpdate;
-};
 /** The Data workspace's three views (decision 0014), remembered in browser storage. */
 type DataView = "inventory" | "instruments" | "updates";
 const DATA_VIEWS: [DataView, string][] = [
@@ -2541,13 +2524,9 @@ type DataSources = {
     memory_budget_gb: number;
   };
   csv_library: {
-    provider: string;
     calendar_symbol: string;
     feeds: FeedInventory[];
     catalog: { path: string; exists: boolean; catalog_rows: number; stocks: number; etfs: number; extra_lists: string[] };
-    freshness_file?: string | null;
-    freshness?: Record<string, unknown> | null;
-    update_command?: string | null;
   };
   lake?: {
     path: string;
@@ -2660,11 +2639,6 @@ const stampUtc = (iso?: string | null) => {
 };
 /** "HH:MM". */
 const clockUtc = (iso?: string | null) => utcParts(iso)?.clock ?? "—";
-/** "YYYY-MM-DD HH:MM UTC", a date and time rather than the raw ISO string. */
-const dateTimeUtc = (iso?: string | null) => {
-  const parts = utcParts(iso);
-  return parts ? `${parts.date} ${parts.clock} UTC` : (iso ?? "unknown");
-};
 /** "MM-DD" of a date. */
 const shortDate = (date?: string | null) => (date && /^\d{4}-\d{2}-\d{2}/.test(date) ? date.slice(5, 10) : "—");
 const tb = (bytes: number) => `${(bytes / 1e12).toFixed(2)} TB`;
@@ -3339,9 +3313,6 @@ five_minute_dir = "/path/to/5m"       # <SYMBOL>.csv  Timestamp,Gmtoffset,Dateti
 one_minute_dir = "/path/to/1m"
 catalog_dir = "/path/to/catalog"      # catalog.csv + stocks.txt / etfs.txt universe lists
 calendar_symbol = "SPY.US"            # daily file whose dates define the trading calendar
-freshness_file = "/path/to/state.json"    # optional, shown as Updated
-update_command = "python3 /path/to/refresh.py"   # optional, the Run update button
-provider = "eodhd"
 lake_dir = "/path/to/lake"            # optional parquet tick lake (trades, book_snapshots, book_events)
 
 [strategies]
@@ -3381,7 +3352,7 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
         <div className="source-block">
           <div className="source-head">
             <strong>CSV bar library</strong>
-            <span>provider {csv.provider} · calendar {csv.calendar_symbol} · {gb(csvTotal)}</span>
+            <span>calendar {csv.calendar_symbol} · {gb(csvTotal)}</span>
           </div>
           <div className="table-wrap"><table>
             <thead><tr><th>Feed</th><th>Path</th><th>Files</th><th>Size</th><th>First</th><th>Last</th><th>Note</th></tr></thead>
@@ -3399,8 +3370,6 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
           </table></div>
           <div className="source-facts">
             <span><strong>Catalog</strong> {csv.catalog.exists ? `${csv.catalog.catalog_rows.toLocaleString()} rows · stocks.txt ${csv.catalog.stocks.toLocaleString()} · etfs.txt ${csv.catalog.etfs.toLocaleString()}${csv.catalog.extra_lists.length ? " · " + csv.catalog.extra_lists.join(", ") : ""}` : "missing"} <em className="source-path">{csv.catalog.path}</em></span>
-            <span><strong>Freshness</strong> {csv.freshness_file ? <>{csv.freshness ? JSON.stringify(csv.freshness).slice(0, 160) : "file not readable"} <em className="source-path">{csv.freshness_file}</em></> : "no freshness_file configured"}</span>
-            <span><strong>Update command</strong> {csv.update_command ? <code>{csv.update_command}</code> : "none configured"}</span>
           </div>
         </div>
         <div className="source-block">
@@ -3460,7 +3429,7 @@ function DataSourcesPanel({ sources, onRefresh, busy }: { sources: DataSources |
                 <li>Export or record it into one of the two layouts above (a new folder per feed).</li>
                 <li>Point the matching key in <code>local.toml</code> at it: <code>daily_dir</code>, <code>five_minute_dir</code>, <code>one_minute_dir</code>, <code>catalog_dir</code>, or <code>lake_dir</code>.</li>
                 <li>Restart the local service (relaunch Tessera). Rescan here to confirm files, sizes, and coverage.</li>
-                <li>Optional: set <code>freshness_file</code> and <code>update_command</code> so the Data page can show when the library was refreshed and run the refresh for you.</li>
+                <li>To keep it current, register the provider account under Data sources above and add a schedule for each dataset on Updates &amp; schedules; the status strip's US EOD date is the calendar symbol's last session.</li>
               </ol>
               <p>A vendor with a different shape (a different CSV layout, a database, an API) needs a reader in the engine; see <code>docs/DATA_SOURCES.md</code> for where the two existing readers live and what a third one has to provide.</p>
             </div>
@@ -3623,56 +3592,6 @@ function InstrumentSearchView({
       ) : (
         !needle && <div className="empty-state">Type a symbol or a name. The catalog indexes every configured source against the files on disk.</div>
       )}
-    </section>
-  );
-}
-
-/** Update actions with their source, scope, and current state (BT-608): the sources rescan
- *  and the library's update command, each with its last run. */
-function DataUpdatesPanel({
-  sources,
-  status,
-  busy,
-  onRescan,
-  onUpdate,
-}: {
-  sources: DataSources | null;
-  status: DataStatus | null;
-  busy: boolean;
-  onRescan: () => void;
-  onUpdate: () => void;
-}) {
-  const job = status?.update_job;
-  const command = sources?.csv_library.update_command ?? null;
-  const when = (iso?: string | null) => (iso ? iso.slice(0, 19).replace("T", " ") : "—");
-  return (
-    <section className="panel data-updates-panel">
-      <div className="terminal-panel-title"><span>UPD</span> UPDATES</div>
-      <div className="table-wrap">
-        <table>
-          <thead><tr><th>Update</th><th>Source</th><th>Scope</th><th>State</th><th>Last</th><th></th></tr></thead>
-          <tbody>
-            <tr>
-              <td><strong>Sources rescan</strong></td>
-              <td>every configured source</td>
-              <td className="source-note">file counts, sizes, first and last dates</td>
-              <td>{sources ? "scanned" : "scanning…"}</td>
-              <td>{when(sources?.generated_at)}</td>
-              <td className="feature-actions"><button type="button" className="text-action" disabled={busy || !sources} onClick={onRescan}>Rescan</button></td>
-            </tr>
-            <tr>
-              <td><strong>Library update</strong></td>
-              <td>CSV bar library{sources ? ` · ${sources.csv_library.provider}` : ""}</td>
-              <td className="source-note">{command ? <code>{command}</code> : "no update_command in local.toml"}</td>
-              <td className={job?.error ? "negative-text" : ""}>{job ? job.status : "never run"}{job?.error ? ` · ${job.error}` : ""}</td>
-              <td>{when(job?.finished_at ?? job?.started_at ?? job?.created_at)}</td>
-              <td className="feature-actions">
-                <button type="button" className="text-action" disabled={busy || !command || job?.status === "running" || job?.status === "queued"} onClick={onUpdate}>Run update command</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
     </section>
   );
 }
@@ -3921,10 +3840,8 @@ function DataWorkspace({
   view,
   onView,
   sources,
-  status,
   busy,
   onRescan,
-  onUpdate,
   runs,
   coverageDetail,
   onOpenCoverage,
@@ -3939,10 +3856,8 @@ function DataWorkspace({
   view: DataView;
   onView: (view: DataView) => void;
   sources: DataSources | null;
-  status: DataStatus | null;
   busy: boolean;
   onRescan: () => void;
-  onUpdate: () => void;
   runs: Run[];
   coverageDetail: RunDetail | null;
   onOpenCoverage: () => void;
@@ -3972,31 +3887,6 @@ function DataWorkspace({
         <>
           <RegisteredSources library={sources} />
           <DataSourcesPanel sources={sources} busy={busy} onRefresh={onRescan} />
-          <section className="panel data-library-panel">
-            <div className="terminal-panel-title"><span>LIB</span> DATA LIBRARY</div>
-            <div className="metrics data-library-metrics">
-              <Metric
-                label="Latest market date"
-                value={status?.latest_market_date ?? "—"}
-                note={`calendar ${status?.latest_spy_date ?? "—"}`}
-              />
-              <Metric
-                label="Daily files"
-                value={String(status?.symbols_on_latest_date ?? "—")}
-                note={`${status?.universe_symbols ?? "—"} in universe`}
-              />
-              <Metric
-                label="Updated"
-                value={dateTimeUtc(status?.updated_at_utc)}
-                note="from the freshness file when configured"
-              />
-              <Metric
-                label="Last update job"
-                value={status?.update_job?.status ?? "none"}
-                note={status?.update_job?.error ?? status?.update_job?.id ?? "local.toml update_command"}
-              />
-            </div>
-          </section>
           <details
             className="panel coverage-fold"
             onToggle={(event) => {
@@ -4021,14 +3911,6 @@ function DataWorkspace({
         <>
           <DatasetSchedules
             schedules={schedules}
-            busy={busy}
-            onToggle={onToggleSchedule}
-            onRun={onRunSchedule}
-            onCreate={onCreateSchedule}
-          />
-          <DataUpdatesPanel sources={sources} status={status} busy={busy} onRescan={onRescan} onUpdate={onUpdate} />
-          <AutomationsWorkspace
-            schedules={schedules.filter((s) => s.kind !== "dataset_update")}
             busy={busy}
             onToggle={onToggleSchedule}
             onRun={onRunSchedule}
@@ -4681,48 +4563,6 @@ function CostsWorkspace({
         </form>
       </section>
     </div>
-  );
-}
-
-function AutomationsWorkspace({
-  schedules,
-  busy,
-  onToggle,
-  onRun,
-  onCreate,
-}: {
-  schedules: AutomationSchedule[];
-  busy: boolean;
-  onToggle: (id: string) => void;
-  onRun: (id: string) => void;
-  onCreate: (request: Record<string, unknown>) => void;
-}) {
-  return (
-    <section className="panel automation-panel">
-      <div className="panel-head"><div><p className="eyebrow">America/Los_Angeles</p><h2>Data schedules</h2></div><span className="discipline-badge">LOCAL SERVICE MUST BE RUNNING</span></div>
-      <div className="automation-list">
-        {schedules.map((schedule) => (
-          <article key={schedule.id}>
-            <span className={schedule.enabled ? "status ready" : "status"}>{schedule.enabled ? "Active" : "Paused"}</span>
-            <div><strong>{schedule.name}</strong><small>{schedule.weekdays} · {schedule.local_time} PT · {schedule.kind.replaceAll("_", " ")}</small><em>{schedule.last_status ?? "Never run"}</em></div>
-            <button onClick={() => onRun(schedule.id)} disabled={busy}>Run now</button>
-            <button onClick={() => onToggle(schedule.id)} disabled={busy}>{schedule.enabled ? "Pause" : "Enable"}</button>
-          </article>
-        ))}
-      </div>
-      <form className="automation-create" onSubmit={(event) => {
-        event.preventDefault();
-        const form = new FormData(event.currentTarget);
-        onCreate({ name: form.get("name"), kind: form.get("kind"), local_time: form.get("local_time"), weekdays: form.get("weekdays"), enabled: form.get("enabled") === "on" });
-      }}>
-        <input name="name" required placeholder="Schedule name" />
-        <select name="kind"><option value="data_update">Data update command</option></select>
-        <input name="local_time" type="time" defaultValue="20:15" required />
-        <input name="weekdays" defaultValue="mon,tue,wed,thu,fri" required />
-        <label className="toggle-label"><input name="enabled" type="checkbox" /><span>Enable immediately</span></label>
-        <button className="secondary-action" disabled={busy}>Add schedule</button>
-      </form>
-    </section>
   );
 }
 
@@ -7130,7 +6970,6 @@ export default function Home() {
   );
   const [runDetail, setRunDetail] = useState<RunDetail | null>(null);
   const [coverageDetail, setCoverageDetail] = useState<RunDetail | null>(null);
-  const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const [dataSources, setDataSources] = useState<DataSources | null>(null);
   // The Data view last chosen, remembered in browser storage (DS-01).
   const [dataView, setDataView] = useState<DataView>(() => {
@@ -7395,21 +7234,13 @@ export default function Home() {
       runs.find((run) => !run.legacy && run.status === "Complete");
     if (preferred) void loadCoverageRun(preferred.id);
   }, [coverageDetail, runs, loadCoverageRun]);
-  const refreshDataStatus = useCallback(async () => {
-    const statusResponse = await fetch(`${API}/data/status`, { cache: "no-store" });
-    if (statusResponse.ok) setDataStatus(await statusResponse.json());
-  }, []);
   useEffect(() => {
     if (view !== "data") return;
     const sources = window.setTimeout(() => void loadDataSources(), 0);
-    const initial = window.setTimeout(() => void refreshDataStatus(), 0);
-    const timer = window.setInterval(() => void refreshDataStatus(), 30_000);
     return () => {
       window.clearTimeout(sources);
-      window.clearTimeout(initial);
-      window.clearInterval(timer);
     };
-  }, [view, refreshDataStatus, loadDataSources]);
+  }, [view, loadDataSources]);
   const openRun = useCallback(async (id: string) => {
     setBusy(true);
     setError("");
@@ -7966,32 +7797,6 @@ export default function Home() {
     }
   }
 
-  async function startDataUpdate() {
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const response = await fetch(`${API}/data/update-eod`, {
-        method: "POST",
-      });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error);
-      setNotice(
-        `${body.id} started. The data library will refresh in place.`,
-      );
-      await refreshDataStatus();
-    } catch (caught) {
-      setError(
-        caught instanceof Error
-          ? caught.message
-          : "Data update could not start",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-
-
   const today = new Date().toISOString().slice(0, 10);
   const activeNav =
     view === "strategy"
@@ -8334,10 +8139,8 @@ export default function Home() {
               view={dataView}
               onView={chooseDataView}
               sources={dataSources}
-              status={dataStatus}
               busy={busy}
               onRescan={() => void loadDataSources(true)}
-              onUpdate={() => void startDataUpdate()}
               runs={runs}
               coverageDetail={coverageDetail}
               onOpenCoverage={openCoverage}

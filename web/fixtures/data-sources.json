@@ -1,5 +1,5 @@
 {
-  "_comment": "Fixture for web/scripts/data-page-check.mjs (DS-01, DS-06): the Data page APIs in their current shapes. `sources` answers GET /api/data/sources, `status` GET /api/data/status, `automations` answers GET /api/automations (two legacy `data_update` schedules and, DS-10, three `dataset_update` ones with their last runs, one paused), `jobs` answers GET /api/datasets/jobs (thirteen, newest first, so the cap of twelve shows) and `job_log` every job's log, `instruments` is the catalog GET /api/instruments searches (q, symbols, limit), `registered` answers GET /api/sources (two sources, the second with its credentials rejected; five datasets and an Uncataloged folder on the first), `availability` answers GET /api/sources/{id}/availability per source (the US row with datasets and a listing, the LSE row with neither), and `secret` is what must never reach the page: the token the check types into Add source and the path of the file the service would keep it in. Every path, symbol, id, and token here is invented.",
+  "_comment": "Fixture for web/scripts/data-page-check.mjs (DS-01, DS-06): the Data page APIs in their current shapes. `sources` answers GET /api/data/sources, `status` GET /api/data/status, `automations` answers GET /api/automations (DS-10: three `dataset_update` schedules with their last runs, one paused), `jobs` answers GET /api/datasets/jobs (thirteen, newest first, so the cap of twelve shows) and `job_log` every job's log, `instruments` is the catalog GET /api/instruments searches (q, symbols, limit), `registered` answers GET /api/sources (two sources, the second with its credentials rejected; five datasets and an Uncataloged folder on the first), `availability` answers GET /api/sources/{id}/availability per source (the US row with datasets and a listing, the LSE row with neither), and `secret` is what must never reach the page: the token the check types into Add source and the path of the file the service would keep it in. Every path, symbol, id, and token here is invented.",
   "sources": {
     "generated_at": "2026-09-11T20:14:03.201Z",
     "config": {
@@ -10,7 +10,6 @@
       "memory_budget_gb": 24.0
     },
     "csv_library": {
-      "provider": "eodhd",
       "calendar_symbol": "SPY.US",
       "feeds": [
         { "feed": "daily", "path": "/srv/market/eod", "exists": true, "files": 11055, "bytes": 5832114688, "first_date": "1995-01-03", "last_date": "2026-09-11", "note": null },
@@ -24,10 +23,7 @@
         "stocks": 6212,
         "etfs": 3390,
         "extra_lists": ["watchlist.txt"]
-      },
-      "freshness_file": "/srv/market/state.json",
-      "freshness": { "updated_at_utc": "2026-09-11T02:15:18Z", "latest_market_date": "2026-09-11" },
-      "update_command": "python3 /srv/tools/refresh_eod.py"
+      }
     },
     "lake": {
       "path": "/srv/lake",
@@ -46,22 +42,10 @@
   "status": {
     "latest_market_date": "2026-09-11",
     "latest_spy_date": "2026-09-11",
-    "symbols_on_latest_date": 11055,
-    "universe_symbols": 50877,
-    "updated_at_utc": "2026-09-11T02:15:18.853812+00:00",
-    "update_job": {
-      "id": "data-20260911T021514.220112Z",
-      "status": "complete",
-      "created_at": "2026-09-11T02:15:14.220112+00:00",
-      "started_at": "2026-09-11T02:15:14.222768+00:00",
-      "finished_at": "2026-09-11T02:15:18.859732+00:00",
-      "log_path": "data/ui/logs/data-20260911T021514.220112Z.log",
-      "error": null
-    }
+    "daily_files": 11055,
+    "updated_at_utc": "2026-09-11T02:15:18.853812+00:00"
   },
   "automations": [
-    { "id": "weekday-eod-refresh", "name": "Weekday US EOD refresh", "kind": "data_update", "enabled": true, "local_time": "19:15", "weekdays": "mon,tue,wed,thu,fri", "last_run_date": "2026-09-10", "last_status": "queued data-20260911T021514.220112Z", "created_at": "2026-08-30T17:08:28.133403+00:00" },
-    { "id": "weekend-catalog-rescan", "name": "Weekend catalog rescan", "kind": "data_update", "enabled": false, "local_time": "08:00", "weekdays": "sat", "last_run_date": null, "last_status": null, "created_at": "2026-08-30T17:08:28.133403+00:00" },
     {"id": "automation-20260905T190000.000000Z", "name": "US EOD", "kind": "dataset_update", "enabled": true, "local_time": "19:15", "weekdays": "mon,tue,wed,thu,fri", "last_run_date": "2026-09-11", "last_status": "queued job-20260912T021500.000000Z", "created_at": "2026-09-05T19:00:00+00:00", "dataset_id": "dataset-20260901T120100.000000Z", "dataset": "US EOD", "runs": [{"ran_at": "2026-09-05T02:15:03+00:00", "status": "complete", "job_id": "job-20260905T021500.000000Z"}, {"ran_at": "2026-09-06T02:15:03+00:00", "status": "complete", "job_id": "job-20260906T021500.000000Z"}, {"ran_at": "2026-09-07T02:15:03+00:00", "status": "complete", "job_id": "job-20260907T021500.000000Z"}, {"ran_at": "2026-09-08T02:15:03+00:00", "status": "complete", "job_id": "job-20260908T021500.000000Z"}, {"ran_at": "2026-09-09T02:15:03+00:00", "status": "complete", "job_id": "job-20260909T021500.000000Z"}, {"ran_at": "2026-09-10T02:15:03+00:00", "status": "complete", "job_id": "job-20260910T021500.000000Z"}, {"ran_at": "2026-09-12T02:15:03+00:00", "status": "queued job-20260912T021500.000000Z", "job_id": "job-20260912T021500.000000Z"}]},
     {"id": "automation-20260905T200000.000000Z", "name": "US 5m", "kind": "dataset_update", "enabled": true, "local_time": "20:30", "weekdays": "mon,tue,wed,thu,fri", "last_run_date": "2026-09-10", "last_status": "complete", "created_at": "2026-09-05T20:00:00+00:00", "dataset_id": "dataset-20260901T120200.000000Z", "dataset": "US 5m", "runs": [{"ran_at": "2026-09-04T02:15:03+00:00", "status": "complete", "job_id": "job-20260904T033000.000000Z"}, {"ran_at": "2026-09-05T02:15:03+00:00", "status": "complete", "job_id": "job-20260905T033000.000000Z"}, {"ran_at": "2026-09-06T02:15:03+00:00", "status": "complete", "job_id": "job-20260906T033000.000000Z"}, {"ran_at": "2026-09-07T02:15:03+00:00", "status": "complete", "job_id": "job-20260907T033000.000000Z"}, {"ran_at": "2026-09-08T02:15:03+00:00", "status": "skipped: job job-20260908T021500.000000Z running", "job_id": null}, {"ran_at": "2026-09-09T02:15:03+00:00", "status": "complete", "job_id": "job-20260909T033000.000000Z"}, {"ran_at": "2026-09-11T02:15:03+00:00", "status": "complete", "job_id": "job-20260911T033000.000000Z"}]},
     {"id": "automation-20260910T060000.000000Z", "name": "CC EOD", "kind": "dataset_update", "enabled": false, "local_time": "06:00", "weekdays": "sat,sun", "last_run_date": null, "last_status": null, "created_at": "2026-09-10T06:00:00+00:00", "dataset_id": "dataset-20260901T120300.000000Z", "dataset": "CC EOD", "runs": []}
