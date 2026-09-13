@@ -4707,6 +4707,18 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
   -webkit-line-clamp: 2;
   overflow: hidden;
 }
+/* A `bool` is a checkbox with a label, not a two-track field: it takes one track, so a parameter
+   set that mixes numeric, `choice`, and `bool` still lays out in a single row (UI-10). Its text
+   clamps to two lines like a numeric's hint, the whole text on hover. */
+.run-dialog .field-grid > .toggle-label {
+  grid-column: span 1;
+}
+.run-dialog .field-grid > .toggle-label > span {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
 .run-dialog-foot {
   display: flex;
   align-items: center;

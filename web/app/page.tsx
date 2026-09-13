@@ -6247,7 +6247,8 @@ function SdkForm({
                       checked={Boolean(current)}
                       onChange={(event) => setParam(param.name, event.target.checked)}
                     />
-                    <span>
+                    {/* One track wide, so the text clamps and the whole of it is the tooltip (UI-10). */}
+                    <span title={param.help ? `${param.label} · ${param.help}` : undefined}>
                       {param.label}
                       {param.help ? ` · ${param.help}` : ""}
                     </span>
