@@ -50,22 +50,25 @@ const WIDTHS = [1280, 1440];
 const HEIGHT = 800;
 
 /**
- * The eight-parameter strategy (UI-07): the fixture strategy under its own id and name, its
- * four manifest parameters all on the Simple tier plus four more, two of them Advanced, with
+ * The eight-parameter strategy (UI-07, UI-10): the fixture strategy under its own id and name,
+ * its four manifest parameters all on the Simple tier plus four more, two of them Advanced, with
  * a caption that wraps to three lines in a numeric track and hints that would wrap to four or
- * five. Simple shows six numeric fields, Advanced all eight. Its default symbols are explicit,
- * so the Data row carries the symbol picker as well: the tallest form a strategy can put in
- * the dialog short of a ninth parameter.
+ * five. The mix is the point (UI-10): five numeric fields take one 92 px track each, while the
+ * two `choice` selects and the `bool` toggle are the wider controls, so the grid has to lay the
+ * set out in one row rather than the eight tracks an all-numeric set needs. Simple shows six
+ * fields, Advanced all eight. Its default symbols are explicit, so the Data row carries the
+ * symbol picker as well: the tallest form a strategy can put in the dialog short of a ninth
+ * parameter.
  */
 const EIGHT = (() => {
   const detail = JSON.parse(readFileSync(fixturePath, "utf8"));
   const id = "layout-eight-parameters";
   const name = "Layout fixture · eight parameters";
   const extra = [
-    { name: "hold_minutes", label: "Hold minutes", help: "Exit after this long in the trade whatever the price", tier: "simple", unit: "min", kind: "int", default: 30, min: 1, max: 390 },
-    { name: "gap_threshold", label: "Gap threshold", help: "Smallest open-to-prior-close gap that qualifies", tier: "simple", unit: "%", kind: "decimal", default: 1.5, min: 0.1, max: 20 },
+    { name: "session_window", label: "Session window", help: "Which session entries are allowed in", tier: "simple", unit: "", kind: "choice", choices: ["regular", "extended", "overnight"], default: "regular", min: null, max: null },
+    { name: "exit_style", label: "Exit style", help: "How the exit order is priced when the signal fires", tier: "simple", unit: "", kind: "choice", choices: ["market", "limit", "close"], default: "market", min: null, max: null },
+    { name: "skip_weekends", label: "Skip weekends", help: "Never open a position on a Friday close", tier: "advanced", unit: "", kind: "bool", default: false, min: null, max: null },
     { name: "volume_floor", label: "Dollar volume floor", help: "Skip symbols trading under this much a day", tier: "advanced", unit: "$", kind: "decimal", default: 1000000, min: 0, max: null },
-    { name: "exit_offset", label: "Exit offset", help: "Ticks above the signal price for the exit order", tier: "advanced", unit: "ticks", kind: "int", default: 2, min: 0, max: 50 },
   ];
   return {
     id,
@@ -599,5 +602,5 @@ if (failures.length) {
 }
 const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, a hover tooltip, and the choice kept across a reload, ${WIDTHS.length} run(s) with storage blocked rendering expanded, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the mixed eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, a hover tooltip, and the choice kept across a reload, ${WIDTHS.length} run(s) with storage blocked rendering expanded, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );
