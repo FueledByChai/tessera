@@ -414,6 +414,8 @@ const DATA_VIEWS: [DataView, string][] = [
   ["updates", "Updates & schedules"],
 ];
 const DATA_VIEW_KEY = "bt-data-view";
+/** The left menu's rail, remembered per browser beside the display mode (decision 0019, UI-09). */
+const SIDEBAR_KEY = "bt-sidebar";
 /** Instrument search lives in app state so the query and selection survive leaving the workspace (BT-608). */
 type InstrumentSearchState = {
   query: string;
@@ -6946,8 +6948,23 @@ export default function Home() {
     }
   }
   // The left menu's rail (UI-08, decision 0019): the toggle's state, never a viewport width.
-  // UI-09 stores the choice in browser storage beside the display mode; here it resets on load.
-  const [collapsed, setCollapsed] = useState(false);
+  // The choice is per browser, beside the display mode (UI-09); a fresh browser, and storage
+  // that is unavailable, both start expanded.
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(SIDEBAR_KEY) === "collapsed";
+    } catch {
+      return false;
+    }
+  });
+  function chooseSidebar(next: boolean) {
+    setCollapsed(next);
+    try {
+      window.localStorage.setItem(SIDEBAR_KEY, next ? "collapsed" : "expanded");
+    } catch {
+      // ignore storage failures
+    }
+  }
   const [view, setView] = useState<View>("dashboard");
   const [stripStatus, setStripStatus] = useState<{ latest_spy_date?: string } | null>(null);
   useEffect(() => {
@@ -7831,7 +7848,7 @@ export default function Home() {
             type="button"
             aria-label={collapsed ? "Expand the menu" : "Collapse the menu"}
             aria-expanded={!collapsed}
-            onClick={() => setCollapsed(!collapsed)}
+            onClick={() => chooseSidebar(!collapsed)}
           >
             <span aria-hidden="true">{collapsed ? ">" : "<"}</span>
           </button>

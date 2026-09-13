@@ -341,7 +341,9 @@ async function checkDialog(page, label, tiers) {
  * into a 56px icon rail in both display modes — no nav label showing, the active item keeping
  * its highlight, a nav icon surfacing its own label as a tooltip on hover — and the page body
  * not scrolling horizontally. The tooltip is the item's `::after`, so it is read off the
- * pseudo-element, before the hover and after it.
+ * pseudo-element, before the hover and after it. The choice is per browser (UI-09), so both
+ * ends are re-read after a reload rather than trusted from the toggle alone: a reload with the
+ * rail collapsed keeps the rail, and one after expanding keeps the sidebar open.
  */
 async function checkCollapsed(page, label) {
   const failures = [];
@@ -383,6 +385,39 @@ async function checkCollapsed(page, label) {
   if (shownTip.content !== "Studies") failures.push(`${label}: the nav tooltip reads "${shownTip.content}", not the item's label`);
   if (verbose) {
     console.log(`${label}: rail ${before.width} -> ${after.width}px, ${after.labels} labels hidden, active ${after.active?.background}, tooltip "${shownTip.content}"`);
+  }
+  // The choice is per browser (UI-09). Reload, rather than navigate, so what the page stored is
+  // what the next render reads: the rail survives a reload...
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator(".app-shell").waitFor({ timeout: 15000 });
+  await page.waitForTimeout(450);
+  const keptRail = await page.evaluate(railState);
+  if (keptRail.state !== "collapsed") {
+    failures.push(`${label}: a reload after collapsing left data-sidebar=${keptRail.state}`);
+  }
+  if (keptRail.width !== 56) {
+    failures.push(`${label}: the rail measures ${keptRail.width}px after a reload, not 56`);
+  }
+  // ...and expanding survives the next reload, so the choice is stored in both directions and a
+  // collapsed rail is not simply what a fresh page renders.
+  await page.locator(".sidebar-toggle").click();
+  await page.waitForTimeout(450);
+  const reopened = await page.evaluate(railState);
+  if (reopened.state !== "expanded") {
+    failures.push(`${label}: the toggle left the shell at data-sidebar=${reopened.state} when expanding`);
+  }
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator(".app-shell").waitFor({ timeout: 15000 });
+  await page.waitForTimeout(450);
+  const keptOpen = await page.evaluate(railState);
+  if (keptOpen.state !== "expanded") {
+    failures.push(`${label}: a reload after expanding left data-sidebar=${keptOpen.state}`);
+  }
+  if (keptOpen.width <= 56) {
+    failures.push(`${label}: the expanded sidebar measures ${keptOpen.width}px after a reload`);
+  }
+  if (verbose) {
+    console.log(`${label}: a reload kept the rail at ${keptRail.width}px collapsed, then ${keptOpen.width}px expanded`);
   }
   return failures;
 }
@@ -522,6 +557,36 @@ try {
       await context.close();
     }
   }
+  // Storage the browser refuses (UI-09): with no stored choice to read the console still renders
+  // the expanded sidebar, so a first visit and a locked-down browser are not left on a rail the
+  // user never chose.
+  for (const width of WIDTHS) {
+    const context = await browser.newContext({ viewport: { width, height: HEIGHT } });
+    await context.addInitScript(() => {
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        get() {
+          throw new Error("storage blocked");
+        },
+      });
+    });
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await page.locator(".app-shell").waitFor({ timeout: 15000 });
+    await page.waitForTimeout(400);
+    const state = await page.evaluate(railState);
+    if (state.state !== "expanded") {
+      failures.push(`${width}px storage blocked: the shell renders data-sidebar=${state.state}, not expanded`);
+    }
+    if (state.width <= 56) {
+      failures.push(`${width}px storage blocked: the sidebar measures ${state.width}px, not an expanded width`);
+    }
+    if (state.visibleLabels.length !== state.labels) {
+      failures.push(`${width}px storage blocked: ${state.labels - state.visibleLabels.length} of ${state.labels} nav label(s) hidden without a stored choice`);
+    }
+    if (verbose) console.log(`storage blocked ${width}px: sidebar ${state.width}px, ${state.visibleLabels.length} label(s) visible`);
+    await context.close();
+  }
 } finally {
   await browser.close();
   served?.server.close();
@@ -534,5 +599,5 @@ if (failures.length) {
 }
 const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, and a hover tooltip, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, a hover tooltip, and the choice kept across a reload, ${WIDTHS.length} run(s) with storage blocked rendering expanded, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );
