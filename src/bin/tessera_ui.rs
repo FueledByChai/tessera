@@ -309,6 +309,12 @@ struct AutomationRunRecord {
 
 /// The kind of schedule that queues a dataset's download job (DS-10).
 const AUTOMATION_KIND_DATASET_UPDATE: &str = "dataset_update";
+/// The kind of schedule that rescores the promoted features (WB-17).
+const AUTOMATION_KIND_FEATURE_DECAY: &str = "feature_decay";
+/// Sessions of trailing IC a feature-decay run scores (WB-17).
+const FEATURE_DECAY_SESSIONS: usize = 20;
+/// The statuses a `feature_ic_history` row can carry (WB-17).
+const FEATURE_IC_STATUSES: [&str; 5] = ["baseline", "ok", "watch", "alert", "skipped"];
 
 /// How many outcomes a schedule serves as marks.
 const AUTOMATION_RUNS_SERVED: usize = 7;
@@ -1098,7 +1104,18 @@ fn migrate(connection: &Connection) -> Result<()> {
              job_id TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_automation_runs_schedule
-         ON automation_runs(schedule_id, ran_at DESC, id DESC);",
+         ON automation_runs(schedule_id, ran_at DESC, id DESC);
+         CREATE TABLE IF NOT EXISTS feature_ic_history (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             preset_id TEXT NOT NULL REFERENCES feature_presets(id) ON DELETE CASCADE,
+             date TEXT NOT NULL,
+             ic REAL,
+             observations INTEGER,
+             status TEXT NOT NULL,
+             reason TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_feature_ic_history_preset
+         ON feature_ic_history(preset_id, date DESC, id DESC);",
     )?;
     // DS-10: the dataset a `dataset_update` schedule queues the job for.
     ensure_column(connection, "automation_schedules", "dataset_id", "TEXT")?;
@@ -1355,6 +1372,14 @@ fn seed_automation_schedules(connection: &Connection) -> Result<()> {
          (id, name, kind, enabled, local_time, weekdays, created_at)
          VALUES ('weekday-overnight-watchlist', 'Weekday Overnight Attention watchlist',
                  'watchlist', 0, '20:15', 'mon,tue,wed,thu,fri', ?1)",
+        [&now],
+    )?;
+    // WB-17: the nightly rescore of the promoted features, seeded disabled like the others.
+    connection.execute(
+        "INSERT OR IGNORE INTO automation_schedules
+         (id, name, kind, enabled, local_time, weekdays, created_at)
+         VALUES ('nightly-feature-decay', 'Nightly promoted-feature decay rescore',
+                 'feature_decay', 0, '02:30', 'mon,tue,wed,thu,fri', ?1)",
         [&now],
     )?;
     Ok(())
@@ -1645,6 +1670,7 @@ async fn execute_automation(state: &AppState, id: &str) -> Result<()> {
     }
     let outcome = match schedule.kind.as_str() {
         AUTOMATION_KIND_DATASET_UPDATE => run_dataset_schedule(state, &schedule).await,
+        AUTOMATION_KIND_FEATURE_DECAY => run_feature_decay_schedule(state).await,
         _ => bail!("unsupported automation kind"),
     };
     let (status, job_id) = outcome.unwrap_or_else(|error| (format!("failed: {error:#}"), None));
@@ -7779,6 +7805,331 @@ fn merge_accepted(requested: &[String], promoted: &[String]) -> Vec<String> {
     out
 }
 
+/// One day's rescore of a promoted feature (WB-17).
+#[derive(Debug, Clone, Serialize)]
+struct FeatureIcHistoryRow {
+    id: i64,
+    preset_id: String,
+    date: String,
+    ic: Option<f64>,
+    observations: Option<i64>,
+    status: String,
+    reason: Option<String>,
+}
+
+/// The rescore history of one promoted feature, newest first.
+fn query_feature_ic_history(
+    connection: &Connection,
+    preset_id: &str,
+) -> Result<Vec<FeatureIcHistoryRow>> {
+    let mut statement = connection.prepare(
+        "SELECT id, preset_id, date, ic, observations, status, reason
+         FROM feature_ic_history WHERE preset_id = ?1 ORDER BY date DESC, id DESC",
+    )?;
+    let rows = statement.query_map([preset_id], |row| {
+        Ok(FeatureIcHistoryRow {
+            id: row.get(0)?,
+            preset_id: row.get(1)?,
+            date: row.get(2)?,
+            ic: row.get(3)?,
+            observations: row.get(4)?,
+            status: row.get(5)?,
+            reason: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The newest rescore of a feature, which decides whether a breach is the first or the second.
+fn latest_feature_ic_row(
+    connection: &Connection,
+    preset_id: &str,
+) -> Result<Option<FeatureIcHistoryRow>> {
+    Ok(query_feature_ic_history(connection, preset_id)?
+        .into_iter()
+        .next())
+}
+
+fn insert_feature_ic_row(
+    connection: &Connection,
+    preset_id: &str,
+    date: NaiveDate,
+    ic: Option<f64>,
+    observations: Option<i64>,
+    status: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    debug_assert!(FEATURE_IC_STATUSES.contains(&status));
+    connection.execute(
+        "INSERT INTO feature_ic_history (preset_id, date, ic, observations, status, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            preset_id,
+            date.to_string(),
+            ic,
+            observations,
+            status,
+            reason
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether a trailing IC has fallen away from the baseline it was promoted with: under half of
+/// it, or of the opposite sign (WB-17).
+fn ic_has_decayed(ic: f64, baseline: f64) -> bool {
+    if !ic.is_finite() || !baseline.is_finite() {
+        return false;
+    }
+    if ic.abs() < baseline.abs() / 2.0 {
+        return true;
+    }
+    baseline != 0.0 && ic != 0.0 && (ic > 0.0) != (baseline > 0.0)
+}
+
+/// The status a run records for a feature it scored (WB-17): the first run sets the baseline, and
+/// a breach is a `watch` when the previous row was not already watching and an `alert` when it
+/// was, so a feature has to fail twice running before it is raised.
+fn decay_status(baseline: Option<f64>, ic: f64, previous: Option<&str>) -> &'static str {
+    let Some(baseline) = baseline else {
+        return "baseline";
+    };
+    if !ic_has_decayed(ic, baseline) {
+        return "ok";
+    }
+    match previous {
+        Some("watch") | Some("alert") => "alert",
+        _ => "watch",
+    }
+}
+
+/// The study a promoted feature was frozen on, rebuilt from the provenance WB-16 recorded
+/// (WB-17). `None` when the promotion carries no study — one made from the library alone — since
+/// there is then nothing to rescore it against. The second value is the frozen horizon in bars.
+fn frozen_study_config(
+    preset: &FeaturePresetRecord,
+    data: &tessera::local_config::DataLibrary,
+) -> Option<(tessera::study::StudyConfig, usize)> {
+    let text = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let grid_label = text(preset.promoted_grid.as_deref())?;
+    let horizon = preset.promoted_horizon.filter(|h| *h > 0)? as usize;
+    let symbols: Vec<String> = text(preset.promoted_symbols.as_deref())
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if symbols.is_empty() {
+        return None;
+    }
+    let target = match text(preset.promoted_target.as_deref()) {
+        Some(name) => tessera::study::Target::parse(&name).ok()?,
+        None => tessera::study::Target::default(),
+    };
+    // The frozen grid is the label WB-16 recorded: a CSV resolution, or the lake's step in
+    // seconds written as `Ns`.
+    let (resolution, step_secs) = match grid_label.as_str() {
+        "daily" | "5m" | "1m" => (Some(grid_label.clone()), 60),
+        other => (None, other.trim_end_matches('s').parse().ok()?),
+    };
+    let config = tessera::study::StudyConfig {
+        lake_dir: data.lake_dir.clone().unwrap_or_default(),
+        symbols,
+        step_secs,
+        resolution,
+        daily_dir: data.daily_dir.clone(),
+        five_minute_dir: data.five_minute_dir.clone(),
+        one_minute_dir: data.one_minute_dir.clone(),
+        calendar_symbol: Some(data.calendar_symbol.clone()),
+        session: tessera::sdk::runner::SessionKind::Regular,
+        features: vec![preset.expression.clone()],
+        horizons: vec![horizon],
+        decision_delay_bars: 0,
+        buckets: 10,
+        target,
+        series: data.series.clone(),
+        lake_series: true,
+        mode: tessera::study::StudyMode::TimeSeries,
+        intraday_source: if data.one_minute_dir.is_dir() {
+            Some("1m".to_owned())
+        } else if data.five_minute_dir.is_dir() {
+            Some("5m".to_owned())
+        } else {
+            None
+        },
+        event_window: 20,
+        accepted: Vec::new(),
+    };
+    Some((config, horizon))
+}
+
+/// The trailing IC of a promoted feature on its frozen study, and the observations behind it, or
+/// the reason it could not be scored at all (WB-17). Nothing here watches or alerts: a window
+/// with no bars, a base the grid cannot supply, and a horizon longer than the window are skips.
+fn rescore_on_panel(
+    config: &tessera::study::StudyConfig,
+    horizon: usize,
+    panel: &[(String, Vec<tessera::lake::LakeBar>)],
+    start: NaiveDate,
+    end: NaiveDate,
+    scratch: &Path,
+) -> std::result::Result<(f64, i64), String> {
+    let missing: Vec<&str> = panel
+        .iter()
+        .filter(|(_, bars)| bars.is_empty())
+        .map(|(symbol, _)| symbol.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("no bars for {} in the window", missing.join(", ")));
+    }
+    let bars = panel.iter().map(|(_, bars)| bars.len()).min().unwrap_or(0);
+    if horizon > bars {
+        return Err(format!("horizon {horizon} is beyond the {bars}-bar window"));
+    }
+    let result = tessera::study::run_on_panel(config, panel.to_vec(), start, end, scratch)
+        .map_err(|error| format!("{error:#}"))?;
+    let expression = config.features.first().cloned().unwrap_or_default();
+    if let Some(entry) = result
+        .unavailable
+        .iter()
+        .find(|entry| entry.feature == expression)
+    {
+        return Err(entry.reason.clone());
+    }
+    let cell = result
+        .cells
+        .iter()
+        .filter(|cell| cell.feature == expression && cell.horizon_bars == horizon)
+        .max_by_key(|cell| cell.observations)
+        .ok_or_else(|| "the study scored no cell for the feature".to_owned())?;
+    if !cell.ic.is_finite() {
+        return Err("the window held too little to score".to_owned());
+    }
+    Ok((cell.ic, cell.observations as i64))
+}
+
+/// Rescores every promoted feature on the study it was promoted from, over the trailing window,
+/// and records one `feature_ic_history` row each (WB-17). `load_panel` supplies the bars, so the
+/// service reads them from the data library and a test hands over a synthetic panel. The
+/// database lock is taken only around the reads and the writes, never across a study, so a
+/// nightly run does not stall the console. Returns how many were scored and how many skipped.
+fn run_feature_decay<F>(
+    database: &Mutex<Connection>,
+    data: &tessera::local_config::DataLibrary,
+    as_of: NaiveDate,
+    scratch: &Path,
+    load_panel: F,
+) -> Result<(usize, usize)>
+where
+    F: Fn(
+        &tessera::study::StudyConfig,
+        NaiveDate,
+        NaiveDate,
+    ) -> Result<Vec<(String, Vec<tessera::lake::LakeBar>)>>,
+{
+    let presets: Vec<FeaturePresetRecord> = {
+        let connection = database.lock().expect("database lock poisoned");
+        query_feature_presets(&connection)?
+            .into_iter()
+            .filter(|preset| preset.accepted)
+            .collect()
+    };
+    let start = as_of - chrono::Duration::days(FEATURE_DECAY_SESSIONS as i64);
+    let mut scored = 0usize;
+    let mut skipped = 0usize;
+    for preset in &presets {
+        let previous = {
+            let connection = database.lock().expect("database lock poisoned");
+            latest_feature_ic_row(&connection, &preset.id)?
+        };
+        let outcome: std::result::Result<(f64, i64), String> =
+            match frozen_study_config(preset, data) {
+                None => Err("study missing".to_owned()),
+                Some((config, horizon)) => match load_panel(&config, start, as_of) {
+                    Err(error) => Err(format!("{error:#}")),
+                    Ok(panel) => rescore_on_panel(&config, horizon, &panel, start, as_of, scratch),
+                },
+            };
+        let connection = database.lock().expect("database lock poisoned");
+        match outcome {
+            Err(reason) => {
+                insert_feature_ic_row(
+                    &connection,
+                    &preset.id,
+                    as_of,
+                    None,
+                    None,
+                    "skipped",
+                    Some(&reason),
+                )?;
+                skipped += 1;
+            }
+            Ok((ic, observations)) => {
+                let status = decay_status(
+                    preset.baseline_ic,
+                    ic,
+                    previous.as_ref().map(|row| row.status.as_str()),
+                );
+                insert_feature_ic_row(
+                    &connection,
+                    &preset.id,
+                    as_of,
+                    Some(ic),
+                    Some(observations),
+                    status,
+                    None,
+                )?;
+                // The first run on a feature sets the baseline every later run is judged against.
+                if preset.baseline_ic.is_none() {
+                    connection.execute(
+                        "UPDATE feature_presets SET baseline_ic = ?2 WHERE id = ?1",
+                        params![preset.id, ic],
+                    )?;
+                }
+                scored += 1;
+            }
+        }
+    }
+    Ok((scored, skipped))
+}
+
+/// A `feature_decay` schedule's run (WB-17, decision 0001): rescores the promoted features on
+/// their frozen studies over the trailing window and answers how many were scored and skipped,
+/// which is what the schedule's `last_status` carries.
+async fn run_feature_decay_schedule(state: &AppState) -> Result<(String, Option<String>)> {
+    let as_of = Utc::now().with_timezone(&Los_Angeles).date_naive();
+    let scratch = state.root.join("data/ui/feature-decay");
+    fs::create_dir_all(&scratch)?;
+    let (scored, skipped) = run_feature_decay(
+        &state.database,
+        &state.local.data,
+        as_of,
+        &scratch,
+        |config, start, end| {
+            let grid = config.grid()?;
+            config
+                .symbols
+                .iter()
+                .map(|symbol| {
+                    Ok((
+                        symbol.clone(),
+                        tessera::study::load_panel_symbol(config, grid, symbol, start, end)?,
+                    ))
+                })
+                .collect()
+        },
+    )?;
+    Ok((format!("scored {scored}, skipped {skipped}"), None))
+}
+
 async fn list_feature_presets(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<FeaturePresetRecord>>, ApiError> {
@@ -9648,6 +9999,312 @@ mod tests {
         .unwrap();
         assert!(empty.promoted_grid.is_none() && empty.promoted_symbols.is_none());
         assert!(empty.baseline_ic.is_none());
+    }
+
+    /// WB-17: the feature-decay job rescores a promoted feature on the study it was promoted
+    /// from, day by day, and keeps its IC history — the first run sets the baseline, a quiet blip
+    /// stays `ok`, the first breach is a `watch` and the second an `alert`, and a window with no
+    /// bars, a base the grid cannot supply, or a horizon longer than the window is a skip. The
+    /// schedule it runs under carries `scored N, skipped M`.
+    #[test]
+    fn the_feature_decay_job_watches_a_promoted_feature_day_by_day() {
+        let scratch = std::env::temp_dir().join(format!(
+            "tessera-wb17-decay-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let data = tessera::local_config::DataLibrary {
+            daily_dir: PathBuf::new(),
+            five_minute_dir: PathBuf::new(),
+            one_minute_dir: PathBuf::new(),
+            catalog_dir: PathBuf::new(),
+            calendar_symbol: "DEMO.US".to_owned(),
+            lake_dir: None,
+            series: Vec::new(),
+        };
+        // Eight symbols: enough that a twenty-session window still clears the hundred
+        // observations the study engine needs before it scores a cell at all.
+        let symbols: Vec<String> = (1..=8).map(|i| format!("DEMO.{i:02}")).collect();
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        // A promoted feature frozen on the daily grid: one symbol, horizon 1, the forward return
+        // as the target, and no baseline yet, so the first run sets one.
+        let preset = save_feature_preset(
+            &connection,
+            "momentum 1",
+            "return_1",
+            "promoted from the fixture study",
+            true,
+            &Some(PromotionStudy {
+                grid: Some("daily".to_owned()),
+                symbols: symbols.clone(),
+                horizon: Some(1),
+                target: Some("return".to_owned()),
+                ic: None,
+            }),
+        )
+        .unwrap();
+        assert!(preset.baseline_ic.is_none());
+        let database = Arc::new(Mutex::new(connection));
+        // The panel: eight symbols, 60 daily sessions. `return_1` predicts the forward return
+        // while the returns grow geometrically — a monotone map, so the two columns rank the
+        // same — and stops once they reverse at session 40; a single quiet blip at session 30
+        // halves one bar only.
+        let first = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let panel_for = |scale: f64| -> Vec<tessera::lake::LakeBar> {
+            let mut price = 100.0_f64;
+            let mut ret = scale * 0.001_f64;
+            (0..60)
+                .map(|i| {
+                    // The quiet blip: one bar at session 30 halves its return, which nudges the
+                    // trailing IC down without taking it under half the baseline.
+                    if i == 30 {
+                        ret *= 0.5;
+                    }
+                    price *= 1.0 + ret;
+                    let bar = tessera::lake::LakeBar {
+                        date: first + chrono::Duration::days(i as i64),
+                        time: chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                        open: price,
+                        high: price,
+                        low: price,
+                        close: price,
+                        volume: 1_000.0,
+                        book: None,
+                    };
+                    // While the feature predicts the target each return grows on the last, so
+                    // `return_1` and the forward return rank the same; from session 40 each is
+                    // the opposite of the last and shrinking, so they rank in reverse.
+                    ret = if i + 1 < 40 { ret * 1.01 } else { -ret * 0.9 };
+                    bar
+                })
+                .collect()
+        };
+        let panels: Vec<(String, Vec<tessera::lake::LakeBar>)> = symbols
+            .iter()
+            .enumerate()
+            .map(|(i, symbol)| (symbol.clone(), panel_for(1.0 + 0.01 * i as f64)))
+            .collect();
+        let dates: Vec<NaiveDate> = panels[0].1.iter().map(|bar| bar.date).collect();
+        let window = |start: NaiveDate, end: NaiveDate| {
+            panels
+                .iter()
+                .map(|(symbol, bars)| {
+                    (
+                        symbol.clone(),
+                        bars.iter()
+                            .filter(|bar| bar.date >= start && bar.date <= end)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // Day by day, from the first day whose window holds the full twenty sessions.
+        let mut statuses: Vec<String> = Vec::new();
+        for day in 19..60 {
+            run_feature_decay(&database, &data, dates[day], &scratch, |_, start, end| {
+                Ok(window(start, end))
+            })
+            .unwrap();
+            let connection = database.lock().unwrap();
+            let latest = latest_feature_ic_row(&connection, &preset.id)
+                .unwrap()
+                .unwrap();
+            statuses.push(latest.status.clone());
+        }
+        // The baseline first, `ok` through the blip, then a watch with the alert behind it, and
+        // never an alert before the watch.
+        assert_eq!(statuses[0], "baseline", "{statuses:?}");
+        let watch = statuses
+            .iter()
+            .position(|status| status == "watch")
+            .unwrap_or_else(|| panic!("no watch in {statuses:?}"));
+        assert!(
+            statuses[..watch]
+                .iter()
+                .all(|status| status == "baseline" || status == "ok"),
+            "{statuses:?}"
+        );
+        assert_eq!(statuses[watch + 1], "alert", "{statuses:?}");
+        // The baseline the first run set is the one later runs are judged against.
+        let stored = query_feature_preset(&database.lock().unwrap(), &preset.id).unwrap();
+        assert!(stored.baseline_ic.is_some(), "{stored:?}");
+
+        // A day with no bars for the symbol in the window.
+        run_feature_decay(
+            &database,
+            &data,
+            dates[59] + chrono::Duration::days(1),
+            &scratch,
+            |_, _, _| {
+                Ok(symbols
+                    .iter()
+                    .map(|symbol| (symbol.clone(), Vec::new()))
+                    .collect())
+            },
+        )
+        .unwrap();
+        let skipped_row = |database: &Arc<Mutex<Connection>>, id: &str| {
+            latest_feature_ic_row(&database.lock().unwrap(), id)
+                .unwrap()
+                .unwrap()
+        };
+        let row = skipped_row(&database, &preset.id);
+        assert_eq!(row.status, "skipped", "{row:?}");
+        assert!(
+            row.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no bars"),
+            "{row:?}"
+        );
+
+        // A base the daily grid cannot supply: an order-book feature on a CSV grid.
+        save_feature_preset(
+            &database.lock().unwrap(),
+            "momentum 1",
+            "obi_l1",
+            "",
+            true,
+            &None,
+        )
+        .unwrap();
+        run_feature_decay(
+            &database,
+            &data,
+            dates[59] + chrono::Duration::days(2),
+            &scratch,
+            |_, start, end| Ok(window(start, end)),
+        )
+        .unwrap();
+        let row = skipped_row(&database, &preset.id);
+        assert_eq!(row.status, "skipped", "{row:?}");
+        assert!(row.reason.is_some(), "{row:?}");
+
+        // A horizon the twenty-session window cannot reach.
+        let too_long = {
+            let connection = database.lock().unwrap();
+            save_feature_preset(&connection, "momentum 1", "return_1", "", true, &None).unwrap();
+            save_feature_preset(
+                &connection,
+                "too long",
+                "return_1",
+                "",
+                true,
+                &Some(PromotionStudy {
+                    grid: Some("daily".to_owned()),
+                    symbols: symbols.clone(),
+                    horizon: Some(999),
+                    target: Some("return".to_owned()),
+                    ic: None,
+                }),
+            )
+            .unwrap()
+        };
+        run_feature_decay(
+            &database,
+            &data,
+            dates[59] + chrono::Duration::days(3),
+            &scratch,
+            |_, start, end| Ok(window(start, end)),
+        )
+        .unwrap();
+        let row = skipped_row(&database, &too_long.id);
+        assert_eq!(row.status, "skipped", "{row:?}");
+        assert!(
+            row.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("beyond the"),
+            "{row:?}"
+        );
+
+        // A promotion made from the library alone has no frozen study to rescore against.
+        let bare = save_feature_preset(
+            &database.lock().unwrap(),
+            "library only",
+            "return_1",
+            "",
+            true,
+            &None,
+        )
+        .unwrap();
+        assert!(bare.promoted_grid.is_none());
+        run_feature_decay(
+            &database,
+            &data,
+            dates[59] + chrono::Duration::days(4),
+            &scratch,
+            |_, start, end| Ok(window(start, end)),
+        )
+        .unwrap();
+        let row = skipped_row(&database, &bare.id);
+        assert_eq!(row.status, "skipped", "{row:?}");
+        assert_eq!(row.reason.as_deref(), Some("study missing"), "{row:?}");
+
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// WB-17: the `feature_decay` schedule is seeded disabled at 02:30 on the weekdays, and a run
+    /// writes how many promoted features it scored and how many it skipped as its status.
+    #[tokio::test]
+    async fn the_feature_decay_schedule_reports_scored_and_skipped() {
+        let root =
+            std::env::temp_dir().join(format!("tessera-wb17-schedule-{}", std::process::id()));
+        let state = AppState {
+            root: root.clone(),
+            local: Arc::new(LocalConfig::bundled_example(Path::new(env!(
+                "CARGO_MANIFEST_DIR"
+            )))),
+            database: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            workers: Arc::new(Semaphore::new(1)),
+            instruments: Arc::new(Mutex::new(None)),
+            sdk_manifests: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            data_sources: Arc::new(Mutex::new(None)),
+            eodhd_base_url: Arc::new(String::new()),
+            scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dataset_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        };
+        {
+            let connection = state.database.lock().unwrap();
+            migrate(&connection).unwrap();
+            seed_automation_schedules(&connection).unwrap();
+            // One promoted feature with no study behind it: a run has nothing to score, so it
+            // skips it, which keeps the count deterministic whatever the data library holds.
+            save_feature_preset(&connection, "library only", "return_1", "", true, &None).unwrap();
+        }
+        let (enabled, local_time, kind): (i64, String, String) = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT enabled, local_time, kind FROM automation_schedules
+                 WHERE id = 'nightly-feature-decay'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (enabled, local_time.as_str(), kind.as_str()),
+            (0, "02:30", "feature_decay")
+        );
+        execute_automation(&state, "nightly-feature-decay")
+            .await
+            .unwrap();
+        let status: String = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT last_status FROM automation_schedules WHERE id = 'nightly-feature-decay'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "scored 0, skipped 1");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// WB-15: a fresh catalog starts with the vol feature set; a second start adds nothing,

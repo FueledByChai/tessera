@@ -25,3 +25,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0020](0020-provider-adapters-are-native-rust-modules-in-the-service-beh.md) Provider adapters are native Rust modules in the service behind one trait — accepted
 - [0021](0021-data-sources-and-datasets-are-registered-from-the-console-cr.md) Data sources and datasets are registered from the console; credentials live in a 0600 file per source, never in the database — accepted
 - [0022](0022-a-provider-download-job-is-budgeted-exclusive-per-source-and.md) A provider download job is budgeted, exclusive per source, and fails closed on its folder — accepted
+- [0023](0023-the-feature-decay-job-rescores-only-the-features-promoted-fr.md) The feature-decay job rescores only the features promoted from a study — accepted
