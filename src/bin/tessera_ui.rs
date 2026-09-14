@@ -6964,13 +6964,14 @@ fn exchange_listing(
     connection: &Connection,
     source_id: &str,
     exchange: &str,
+    delisted: bool,
 ) -> Result<Vec<Listing>> {
     let mut statement = connection.prepare(
         "SELECT code, name, type, currency, country, venue FROM provider_listings
-         WHERE source_id = ?1 AND exchange = ?2 AND delisted = 0 ORDER BY code",
+         WHERE source_id = ?1 AND exchange = ?2 AND delisted = ?3 ORDER BY code",
     )?;
     let rows = statement
-        .query_map(params![source_id, exchange], |row| {
+        .query_map(params![source_id, exchange, i64::from(delisted)], |row| {
             Ok(Listing {
                 code: row.get(0)?,
                 name: row.get(1)?,
@@ -7249,11 +7250,14 @@ async fn execute_dataset_job(
             params![job_id, JobState::Running.as_str(), Utc::now().to_rfc3339()],
         )?;
     }
-    let (symbols, catalog) = {
+    let (symbols, catalog, delisted_catalog) = {
         let connection = state.database.lock().expect("database lock poisoned");
         (
             dataset_symbols(&connection, dataset)?,
-            exchange_listing(&connection, &dataset.source_id, &dataset.exchange)?,
+            exchange_listing(&connection, &dataset.source_id, &dataset.exchange, false)?,
+            // DS-14: the delisted listing gets its own catalog folder, so it never joins the
+            // active one.
+            exchange_listing(&connection, &dataset.source_id, &dataset.exchange, true)?,
         )
     };
     let from_date = NaiveDate::parse_from_str(&dataset.from_date, "%Y-%m-%d")
@@ -7300,6 +7304,7 @@ async fn execute_dataset_job(
         calendar_code: calendar_code_for(&state.local.data.calendar_symbol, &dataset.exchange),
         symbols,
         catalog,
+        delisted_catalog,
     };
     Ok(
         eod_job::run(adapter, &input, &mut budget, &mut log, &mut on_progress)
@@ -11105,6 +11110,70 @@ mod tests {
                 3,
                 "the second expansion probed again"
             );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        /// DS-14: the layout the EOD job writes — the US listing at the catalog root, every
+        /// other exchange under `<EXCHANGE>/`, the delisted listing under `delisted/` — is the
+        /// layout the instrument index reads, so a CC symbol and a delisted one both come back.
+        #[test]
+        fn the_catalog_layout_the_job_writes_is_the_one_the_index_reads() {
+            let root = scratch_root("ds14-index");
+            let universe = root.join("catalog");
+            fs::create_dir_all(&universe).unwrap();
+            let listing =
+                |code: &str, name: &str, kind: &str, venue: &str| tessera::provider::Listing {
+                    code: code.to_owned(),
+                    name: name.to_owned(),
+                    kind: kind.to_owned(),
+                    currency: "USD".to_owned(),
+                    country: "USA".to_owned(),
+                    venue: venue.to_owned(),
+                };
+            // Exactly what the job writes for a US dataset and a CC dataset on one source.
+            tessera::provider::jobs::eod::write_catalog(
+                &universe,
+                "US",
+                &[listing("AAPL", "Apple Inc", "Common Stock", "NASDAQ")],
+            )
+            .unwrap();
+            tessera::provider::jobs::eod::write_delisted_catalog(
+                &universe,
+                "US",
+                &[listing("YHOO", "Yahoo Inc", "Common Stock", "NASDAQ")],
+            )
+            .unwrap();
+            tessera::provider::jobs::eod::write_catalog(
+                &universe,
+                "CC",
+                &[listing("BTC-USD", "Bitcoin USD", "Crypto", "CC")],
+            )
+            .unwrap();
+
+            let index = build_instrument_index(InstrumentDataRoots {
+                daily_dir: root.join("eod"),
+                five_minute_dir: root.join("5m"),
+                one_minute_dir: root.join("1m"),
+                universe_dir: universe,
+                lake_dir: None,
+            })
+            .unwrap();
+            let symbol = |wanted: &str| {
+                index
+                    .records
+                    .iter()
+                    .find(|record| record.symbol == wanted)
+                    .unwrap_or_else(|| panic!("no {wanted} in {:?}", index.records))
+            };
+            // The active US row, read from the root catalog.
+            assert_eq!(symbol("AAPL.US").name, "Apple Inc");
+            assert_eq!(symbol("AAPL.US").status, "active");
+            // The CC row, read from its own sub-catalog.
+            assert_eq!(symbol("BTC-USD.CC").name, "Bitcoin USD");
+            assert_eq!(symbol("BTC-USD.CC").suffix, "CC");
+            // The delisted row, read from `delisted/` and marked as such.
+            assert_eq!(symbol("YHOO.US").name, "Yahoo Inc");
+            assert_eq!(symbol("YHOO.US").status, "delisted");
             let _ = fs::remove_dir_all(&root);
         }
 

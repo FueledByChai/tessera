@@ -88,6 +88,9 @@ pub struct EodJobInput {
     pub symbols: Vec<DatasetSymbol>,
     /// The exchange's active listing, every type, for the catalog files.
     pub catalog: Vec<Listing>,
+    /// The exchange's cached delisted listing, for `delisted/` (DS-14); empty when the dataset
+    /// does not include delisted symbols, in which case `delisted/` is left alone.
+    pub delisted_catalog: Vec<Listing>,
 }
 
 /// A job record's state.
@@ -361,12 +364,52 @@ pub fn catalog_files(exchange: &str, listing: &[Listing]) -> io::Result<[(String
     ])
 }
 
-/// Writes the catalog files into `catalog_dir` (created when missing: it is the source's
-/// own folder, not a data folder), each through a part file.
+/// The exchange whose catalog files sit at the catalog folder's root (DS-14). Every other
+/// exchange gets a sub-catalog named after it, which is the layout the instrument index reads.
+pub const US_EXCHANGE: &str = "US";
+
+/// The folder a dataset's exchange writes its catalog files into (DS-14): the catalog root for
+/// US, and `<EXCHANGE>/` under it for every other exchange. Without this a source with datasets
+/// on several exchanges would have each job overwrite the others' files.
+pub fn exchange_catalog_dir(catalog_dir: &Path, exchange: &str) -> PathBuf {
+    if exchange == US_EXCHANGE {
+        catalog_dir.to_path_buf()
+    } else {
+        catalog_dir.join(exchange)
+    }
+}
+
+/// The folder the delisted listing is written into, beside the exchanges' own folders (DS-14).
+pub fn delisted_catalog_dir(catalog_dir: &Path) -> PathBuf {
+    catalog_dir.join("delisted")
+}
+
+/// Writes the catalog files for `exchange` into that exchange's own folder under `catalog_dir`
+/// (DS-14), created when missing — it is the source's own folder, not a data folder — each
+/// through a part file.
 pub fn write_catalog(catalog_dir: &Path, exchange: &str, listing: &[Listing]) -> io::Result<()> {
-    fs::create_dir_all(catalog_dir)?;
+    write_catalog_into(
+        &exchange_catalog_dir(catalog_dir, exchange),
+        exchange,
+        listing,
+    )
+}
+
+/// Writes the delisted listing's catalog files into `delisted/` under `catalog_dir` (DS-14), so
+/// the delisted symbols keep their own file rather than joining the active catalog.
+pub fn write_delisted_catalog(
+    catalog_dir: &Path,
+    exchange: &str,
+    listing: &[Listing],
+) -> io::Result<()> {
+    write_catalog_into(&delisted_catalog_dir(catalog_dir), exchange, listing)
+}
+
+/// The three files into `dir`, which is created when missing.
+fn write_catalog_into(dir: &Path, exchange: &str, listing: &[Listing]) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
     for (name, content) in catalog_files(exchange, listing)? {
-        write_part_then_rename(&catalog_dir.join(name), &content)?;
+        write_part_then_rename(&dir.join(name), &content)?;
     }
     Ok(())
 }
@@ -777,8 +820,16 @@ pub async fn run<P: Provider>(
         runner.unit_done();
     }
 
-    // 5. The catalog files.
-    if let Err(error) = write_catalog(&input.catalog_dir, &exchange, &input.catalog) {
+    // 5. The catalog files, into the exchange's own folder under the catalog root (DS-14), and
+    //    the delisted listing into `delisted/` beside it.
+    let written = write_catalog(&input.catalog_dir, &exchange, &input.catalog).and_then(|()| {
+        if input.delisted_catalog.is_empty() {
+            Ok(())
+        } else {
+            write_delisted_catalog(&input.catalog_dir, &exchange, &input.delisted_catalog)
+        }
+    });
+    if let Err(error) = written {
         let text = format!(
             "write the catalog files in {}: {error}",
             input.catalog_dir.display()
@@ -793,9 +844,10 @@ pub async fn run<P: Provider>(
         );
     }
     runner.log(&format!(
-        "catalog: {} listings written to {}",
+        "catalog: {} listings written to {} ({} delisted)",
         input.catalog.len(),
-        input.catalog_dir.display()
+        exchange_catalog_dir(&input.catalog_dir, &exchange).display(),
+        input.delisted_catalog.len()
     ));
     runner.units_done = runner.units_total;
     runner.report();
@@ -1045,6 +1097,7 @@ mod tests {
                 symbol("YHOO", true),
             ],
             catalog: Vec::new(),
+            delisted_catalog: Vec::new(),
         };
         fs::write(
             folder.join("SPY.US.csv"),

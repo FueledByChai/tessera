@@ -266,6 +266,7 @@ impl Scenario {
             calendar_code: Some("SPY".into()),
             symbols: self.symbols.clone(),
             catalog: self.symbols.iter().map(|s| s.listing.clone()).collect(),
+            delisted_catalog: Vec::new(),
         }
     }
 
@@ -343,6 +344,87 @@ fn assert_progress_is_monotonic_and_ends_at_100(progress: &[Progress]) {
         last = p.percent;
     }
     assert_eq!(progress.last().unwrap().percent, 100, "{progress:?}");
+}
+
+/// DS-14: two datasets on one source keep their catalogs apart — the US listing at the catalog
+/// folder's root, every other exchange under `<EXCHANGE>/`, and the delisted listing under
+/// `delisted/`, so neither job overwrites the other's files.
+#[tokio::test]
+async fn each_exchange_keeps_its_own_catalog_and_the_delisted_listing_apart() {
+    let s = Scenario::new("catalogs").await;
+    let mut budget = plenty();
+    let mut log: Vec<u8> = Vec::new();
+    let mut progress = Vec::new();
+    let mut on_progress = |p: Progress| progress.push(p);
+
+    // Nothing new to fetch (through is the seeded last session), so each run reaches the
+    // catalog step without a stub answer.
+    let mut us = s.input("2026-09-09");
+    us.symbols.retain(|symbol| symbol.listing.code != "NVDA");
+    us.catalog = vec![
+        listing("AAPL", "Apple Inc", "Common Stock"),
+        listing("SPY", "SPDR S&P 500 ETF Trust", "ETF"),
+    ];
+    us.delisted_catalog = vec![listing("YHOO", "Yahoo Inc", "Common Stock")];
+    let outcome = eod::run(&s.provider, &us, &mut budget, &mut log, &mut on_progress).await;
+    assert_eq!(
+        outcome.state,
+        JobState::Complete,
+        "{outcome:?}\n{}",
+        String::from_utf8_lossy(&log)
+    );
+
+    // The CC dataset, on the same source and the same catalog folder.
+    let cc_folder = s.root.join("eod-cc");
+    fs::create_dir_all(&cc_folder).unwrap();
+    let mut cc = us.clone();
+    cc.exchange = "CC".into();
+    cc.folder = cc_folder;
+    cc.symbols = Vec::new();
+    cc.catalog = vec![listing("BTC-USD", "Bitcoin USD", "Crypto")];
+    cc.delisted_catalog = Vec::new();
+    let outcome = eod::run(&s.provider, &cc, &mut budget, &mut log, &mut on_progress).await;
+    assert_eq!(
+        outcome.state,
+        JobState::Complete,
+        "{outcome:?}\n{}",
+        String::from_utf8_lossy(&log)
+    );
+
+    let catalog = s.catalog_dir();
+    let read = |path: PathBuf| fs::read_to_string(path).unwrap();
+
+    // The root files hold the US rows and nothing else: not the CC rows, not the delisted ones.
+    let root = read(catalog.join("catalog.csv"));
+    assert!(root.contains("AAPL"), "{root}");
+    assert!(root.contains("SPY"), "{root}");
+    assert!(
+        !root.contains("BTC-USD"),
+        "the CC row reached the root:\n{root}"
+    );
+    assert!(
+        !root.contains("YHOO"),
+        "a delisted row joined the active catalog:\n{root}"
+    );
+
+    // The CC rows are in their own sub-catalog, which is what the instrument index reads.
+    let cc_rows = read(catalog.join("CC").join("catalog.csv"));
+    assert!(cc_rows.contains("BTC-USD"), "{cc_rows}");
+    assert!(
+        !cc_rows.contains("AAPL"),
+        "the US row reached CC/:\n{cc_rows}"
+    );
+
+    // The delisted rows are apart, with the columns `catalog.csv` carries.
+    let delisted = read(catalog.join("delisted").join("catalog.csv"));
+    assert!(
+        delisted.starts_with("Code,Name,Country,Exchange,Currency,Type"),
+        "{delisted}"
+    );
+    assert!(delisted.contains("YHOO"), "{delisted}");
+
+    s.no_part_files();
+    s.cleanup();
 }
 
 #[test]
