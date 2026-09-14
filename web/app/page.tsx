@@ -4521,6 +4521,51 @@ function PortfolioWorkspace({
   );
 }
 
+/** The asset classes and cost models the service accepts (UI-12), in the order it lists them. */
+const COST_ASSET_CLASSES = ["US equities", "US futures", "Spot FX", "Crypto spot", "Any"];
+const COST_MODELS = [
+  { value: "all_in_bps", label: "All-in basis points" },
+  { value: "fixed_tick_per_unit", label: "Fixed tick + per unit" },
+  { value: "none", label: "Costs off" },
+];
+/**
+ * What the create dialog holds: every model's values at once, as typed, so switching model and
+ * back keeps what was typed (UI-12). Only the fields the chosen model needs are rendered, but
+ * the request carries all of them: the service validates the whole set whatever the model.
+ */
+type CostDraft = {
+  name: string;
+  asset_class: string;
+  model: string;
+  entry_bps: string;
+  exit_bps: string;
+  tick_size: string;
+  entry_slippage_ticks: string;
+  exit_slippage_ticks: string;
+  entry_commission_per_unit: string;
+  exit_commission_per_unit: string;
+  minimum_commission: string;
+};
+const EMPTY_COST_DRAFT: CostDraft = {
+  name: "",
+  asset_class: "US equities",
+  model: "all_in_bps",
+  entry_bps: "5",
+  exit_bps: "5",
+  tick_size: "0.01",
+  entry_slippage_ticks: "0",
+  exit_slippage_ticks: "0",
+  entry_commission_per_unit: "0",
+  exit_commission_per_unit: "0",
+  minimum_commission: "0",
+};
+/** A field as a number: a cleared field falls back to `fallback`, a typed 0 stays 0, so the
+ *  service is the one that refuses an out-of-range value and says why. */
+const costNumber = (value: string, fallback = 0) => {
+  const parsed = Number(value);
+  return value.trim() === "" || !Number.isFinite(parsed) ? fallback : parsed;
+};
+
 function CostsWorkspace({
   profiles,
   busy,
@@ -4528,8 +4573,60 @@ function CostsWorkspace({
 }: {
   profiles: CostProfile[];
   busy: boolean;
-  onCreate: (request: Record<string, unknown>) => void;
+  /** The service's refusal as text, or "" when the profile was saved (UI-12). */
+  onCreate: (request: Record<string, unknown>) => Promise<string>;
 }) {
+  const [draft, setDraft] = useState<CostDraft>(EMPTY_COST_DRAFT);
+  const [refused, setRefused] = useState("");
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const openDialog = () => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+  };
+  const closeDialog = () => dialogRef.current?.close();
+  const setField = (key: keyof CostDraft, value: string) =>
+    setDraft((current) => ({ ...current, [key]: value }));
+  /** A name the library already holds, trimmed and case-insensitively, as the service compares
+   *  it (UI-11). Save is disabled before a request that can only be refused is sent. */
+  const duplicate = profiles.some(
+    (profile) => profile.name.trim().toLowerCase() === draft.name.trim().toLowerCase(),
+  );
+  const title = COST_MODELS.find((model) => model.value === draft.model)?.label ?? "";
+  const numeric = (field: keyof CostDraft, label: string, step: string) => (
+    <label className="numeric" data-field={field}>
+      {label}
+      <input
+        name={field}
+        type="number"
+        step={step}
+        min="0"
+        value={draft[field]}
+        onChange={(event) => setField(field, event.target.value)}
+      />
+    </label>
+  );
+  async function save() {
+    const message = await onCreate({
+      name: draft.name.trim(),
+      asset_class: draft.asset_class,
+      model: draft.model,
+      entry_bps: costNumber(draft.entry_bps),
+      exit_bps: costNumber(draft.exit_bps),
+      tick_size: costNumber(draft.tick_size, 0.01),
+      entry_slippage_ticks: Math.round(costNumber(draft.entry_slippage_ticks)),
+      exit_slippage_ticks: Math.round(costNumber(draft.exit_slippage_ticks)),
+      entry_commission_per_unit: costNumber(draft.entry_commission_per_unit),
+      exit_commission_per_unit: costNumber(draft.exit_commission_per_unit),
+      minimum_commission: costNumber(draft.minimum_commission),
+    });
+    if (message) {
+      setRefused(message); // the dialog stays open with every field as it was typed
+      return;
+    }
+    setRefused("");
+    setDraft((current) => ({ ...current, name: "" }));
+    closeDialog();
+  }
   return (
     <div className="costs-workspace">
       <section className="strategy-hero">
@@ -4542,7 +4639,12 @@ function CostsWorkspace({
             strategy parameters remain auditable overrides.
           </p>
         </div>
-        <span className="discipline-badge">ENTRY + EXIT STORED SEPARATELY</span>
+        <div className="strategy-hero-actions">
+          <span className="discipline-badge">ENTRY + EXIT STORED SEPARATELY</span>
+          <button type="button" className="primary-action cost-dialog-open" onClick={openDialog}>
+            New profile
+          </button>
+        </div>
       </section>
       <section className="panel cost-profile-grid">
         {profiles.map((profile) => (
@@ -4569,37 +4671,115 @@ function CostsWorkspace({
           </article>
         ))}
       </section>
-      <section className="panel config-panel">
-        <div className="panel-head"><div><p className="eyebrow">Write-once version</p><h2>Create cost profile</h2></div></div>
-        <form onSubmit={(event) => {
-          event.preventDefault();
-          const form = new FormData(event.currentTarget);
-          onCreate({
-            name: form.get("name"), asset_class: form.get("asset_class"), model: form.get("model"),
-            entry_bps: Number(form.get("entry_bps")), exit_bps: Number(form.get("exit_bps")),
-            tick_size: Number(form.get("tick_size")), entry_slippage_ticks: Number(form.get("entry_slippage_ticks")),
-            exit_slippage_ticks: Number(form.get("exit_slippage_ticks")),
-            entry_commission_per_unit: Number(form.get("entry_commission_per_unit")),
-            exit_commission_per_unit: Number(form.get("exit_commission_per_unit")),
-            minimum_commission: Number(form.get("minimum_commission")),
-          });
-        }}>
-          <div className="field-grid">
-            <label>Profile name<input name="name" required maxLength={100} placeholder="US equities · conservative" /></label>
-            <label>Asset class<select name="asset_class"><option>US equities</option><option>US futures</option><option>Spot FX</option><option>Crypto spot</option><option>Any</option></select></label>
-            <label>Model<select name="model"><option value="all_in_bps">All-in basis points</option><option value="fixed_tick_per_unit">Fixed tick + per unit</option><option value="none">Costs off</option></select></label>
-            <label className="numeric">Tick size<input name="tick_size" type="number" step="0.0001" defaultValue="0.01" /></label>
-            <label className="numeric">Entry bps<input name="entry_bps" type="number" step="0.1" min="0" defaultValue="5" /></label>
-            <label className="numeric">Exit bps<input name="exit_bps" type="number" step="0.1" min="0" defaultValue="5" /></label>
-            <label className="numeric">Entry slippage ticks<input name="entry_slippage_ticks" type="number" min="0" defaultValue="0" /></label>
-            <label className="numeric">Exit slippage ticks<input name="exit_slippage_ticks" type="number" min="0" defaultValue="0" /></label>
-            <label className="numeric">Entry commission / unit<input name="entry_commission_per_unit" type="number" step="0.001" min="0" defaultValue="0" /></label>
-            <label className="numeric">Exit commission / unit<input name="exit_commission_per_unit" type="number" step="0.001" min="0" defaultValue="0" /></label>
-            <label className="numeric">Minimum commission<input name="minimum_commission" type="number" step="0.01" min="0" defaultValue="0" /></label>
+      <dialog
+        className="cost-dialog"
+        ref={dialogRef}
+        aria-labelledby="cost-dialog-title"
+        onClose={() => setRefused("")}
+      >
+        <form
+          noValidate
+          onSubmit={(event) => {
+            event.preventDefault();
+            void save();
+          }}
+        >
+          <div className="cost-dialog-head">
+            <h2 id="cost-dialog-title">New cost profile</h2>
+            <span className="cost-dialog-note">{title}</span>
+            <button type="button" className="cost-dialog-close" aria-label="Close" onClick={closeDialog}>
+              ×
+            </button>
           </div>
-          <div className="run-submit"><p>Existing profiles are never edited; create a new version when assumptions change.</p><button className="primary-action" disabled={busy}>{busy ? "Saving…" : "Save immutable profile →"}</button></div>
+          <div className="cost-dialog-body">
+            <div className="form-section">
+              <h3>Identity</h3>
+              <div className="field-grid">
+                <label data-field="name">
+                  Profile name
+                  <input
+                    name="name"
+                    required
+                    maxLength={100}
+                    placeholder="US equities · conservative"
+                    value={draft.name}
+                    onChange={(event) => setField("name", event.target.value)}
+                  />
+                </label>
+                <label data-field="asset_class">
+                  Asset class
+                  <select
+                    name="asset_class"
+                    value={draft.asset_class}
+                    onChange={(event) => setField("asset_class", event.target.value)}
+                  >
+                    {COST_ASSET_CLASSES.map((assetClass) => (
+                      <option key={assetClass}>{assetClass}</option>
+                    ))}
+                  </select>
+                </label>
+                <label data-field="model">
+                  Model
+                  <select
+                    name="model"
+                    value={draft.model}
+                    onChange={(event) => setField("model", event.target.value)}
+                  >
+                    {COST_MODELS.map((model) => (
+                      <option value={model.value} key={model.value}>
+                        {model.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+            {draft.model === "all_in_bps" ? (
+              <div className="form-section">
+                <h3>Basis points</h3>
+                <div className="field-grid">
+                  {numeric("entry_bps", "Entry bps", "0.1")}
+                  {numeric("exit_bps", "Exit bps", "0.1")}
+                </div>
+              </div>
+            ) : null}
+            {draft.model === "fixed_tick_per_unit" ? (
+              <div className="form-section">
+                <h3>Ticks and commission</h3>
+                <div className="field-grid">
+                  {numeric("tick_size", "Tick size", "0.0001")}
+                  {numeric("entry_slippage_ticks", "Entry slippage ticks", "1")}
+                  {numeric("exit_slippage_ticks", "Exit slippage ticks", "1")}
+                  {numeric("entry_commission_per_unit", "Entry commission / unit", "0.001")}
+                  {numeric("exit_commission_per_unit", "Exit commission / unit", "0.001")}
+                  {numeric("minimum_commission", "Minimum commission", "0.01")}
+                </div>
+              </div>
+            ) : null}
+          </div>
+          {refused ? (
+            <p className="cost-dialog-error" role="alert">
+              {refused}
+            </p>
+          ) : null}
+          <div className="cost-dialog-foot">
+            <p>Existing profiles are never edited; create a new version when assumptions change.</p>
+            {duplicate ? (
+              <span className="cost-dialog-reason">A profile with that name already exists.</span>
+            ) : null}
+            <button type="button" className="secondary-action cost-dialog-cancel" onClick={closeDialog}>
+              Cancel
+            </button>
+            <button
+              className="primary-action cost-dialog-save"
+              type="submit"
+              disabled={busy || duplicate || !draft.name.trim()}
+            >
+              {busy ? "Saving…" : "Save profile"}
+            </button>
+          </div>
         </form>
-      </section>
+      </dialog>
     </div>
   );
 }
@@ -7660,21 +7840,30 @@ export default function Home() {
     }
   }
 
-  async function createCostProfile(request: Record<string, unknown>) {
+  /**
+   * The service's refusal as text, or "" when the profile was saved (UI-12). The Costs dialog
+   * renders a refusal itself, with the fields still holding what was typed, so a refused save
+   * is not also the page's error banner and does not close the dialog.
+   */
+  async function createCostProfile(request: Record<string, unknown>): Promise<string> {
     setBusy(true);
-    setError("");
     try {
       const response = await fetch(`${API}/cost-profiles`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(request),
       });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error);
+      const body = await response.json().catch(() => null);
+      if (!response.ok) {
+        return typeof body?.error === "string" && body.error
+          ? body.error
+          : `the service refused the profile (${response.status})`;
+      }
       setCostProfiles((current) => [body, ...current]);
       setNotice(`Cost profile “${body.name}” saved as an immutable version.`);
+      return "";
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Cost profile could not be saved");
+      return caught instanceof Error ? caught.message : "Cost profile could not be saved";
     } finally {
       setBusy(false);
     }
@@ -8230,7 +8419,7 @@ export default function Home() {
             <CostsWorkspace
               profiles={costProfiles}
               busy={busy}
-              onCreate={(request) => void createCostProfile(request)}
+              onCreate={(request) => createCostProfile(request)}
             />
           )}
 

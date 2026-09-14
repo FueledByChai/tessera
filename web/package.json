@@ -16,6 +16,7 @@
     "layout-check": "node scripts/layout-check.mjs",
     "chart-check": "node scripts/chart-check.mjs",
     "run-form-check": "node scripts/run-form-check.mjs",
+    "costs-check": "node scripts/costs-check.mjs",
     "data-page-check": "node scripts/data-page-check.mjs"
   },
   "dependencies": {

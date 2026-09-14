@@ -55,7 +55,13 @@ The seeded cost profiles are:
 - Costs off: zero modeled execution cost for gross-alpha diagnostics.
 
 Custom profiles are append-only, and no two carry the same name (the service refuses a
-second profile under a name the library already holds, compared case-insensitively). The
+second profile under a name the library already holds, compared case-insensitively). One is
+created from **New profile** in the page's head, in a dialog whose fields follow the chosen
+model: name and asset class always; entry and exit basis points for all-in; tick size, entry
+and exit slippage ticks, entry and exit commission per unit, and minimum commission for fixed
+tick + per unit; nothing more for costs off. Switching model and back keeps what was typed, a
+name the library already holds disables Save with the reason beside it, and a save the service
+refuses is reported above the buttons with the dialog open and every field intact. The
 current fixed-tick strategy adapters require symmetric entry/exit tick and per-unit assumptions and do not yet support a minimum commission; all-in basis-point profiles may store different entry and exit estimates because the engines consume their exact sum.
 
 ## One-file strategies (Strategy SDK)
