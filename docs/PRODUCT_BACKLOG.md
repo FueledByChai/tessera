@@ -1066,6 +1066,103 @@ EXPANDED (unchanged)                    COLLAPSED (new, 56 px, both modes)
    224 px (216 terminal)                 56 px; active item keeps its highlight
 ```
 
+### BT-1104 — The Costs page is one sortable table of every cost profile
+
+**Status:** Proposed
+**User story:** As a researcher comparing execution assumptions, I want the whole
+cost-profile library as one sortable table with the numbers in columns, so that I can
+compare every profile at a glance instead of opening five cards.
+
+**Acceptance criteria:**
+
+- The page is the hero — the title "Execution cost profiles" and one sentence saying
+  profiles are immutable and that a run freezes the one it was queued with — and one panel,
+  the profiles table. The create form is not on the page; the eyebrow, the second sentence,
+  and the ENTRY + EXIT badge are gone.
+- Columns in order: NAME, ORIGIN, ASSET CLASS, MODEL, ENTRY, EXIT, ROUND TRIP, TICK, MIN
+  COMM, and a last column holding the row's Duplicate control. Every header sorts; the
+  default order is the one `/api/cost-profiles` returns (built-in first, then newest).
+- Every profile is one row whatever its model. ENTRY and EXIT are that side's cost in the
+  model's own unit ("$0.0150" for fixed tick, "5.00 bps" for all-in); ROUND TRIP is their
+  sum. A cell the model does not use shows a dash, never a zero: an all-in row dashes TICK
+  and MIN COMM; a costs-off row dashes every value column while still showing its name,
+  asset class, and model.
+- The profile id is not a column: the NAME cell carries it as its tooltip.
+- "New profile" sits in the panel's title bar and each row carries Duplicate. Both open the
+  create dialog (BT-1105). Nothing on a row edits or deletes a profile; they are write-once.
+- An empty library shows the panel's empty state with New profile still in the title bar,
+  no broken table, and no error.
+- At 1280 and 1440 px in both display modes the page does not scroll horizontally and the
+  table scrolls inside its own wrapper when it must; the layout check proves it.
+
+**Wireframe:**
+
+```
++ Execution cost profiles                                        [New profile] +
+  Profiles are immutable; every run freezes the one it was queued with.
+
++ CST  COST PROFILES - 7 - sort: name v                                       +
+| NAME               ORIGIN ASSET      MODEL       ENTRY    EXIT      ROUND   |
+| US equities · tick BASE   US equities Fixed tick $0.0150  $0.0150   $0.0300 |
+| US eq · 10 bps     BASE   US equities All-in bps 5.00 bps 5.00 bps  10.00bps|
+| Spot FX · 4 bps    BASE   Spot FX     All-in bps 2.00 bps 2.00 bps  4.00 bps|
+| Costs off          BASE   Any         Costs off  -        -         -       |
++------------------------------------------------------------------------------+
+  the last columns, reached by scrolling the table inside the panel:
+| ROUND TRIP  TICK    MIN COMM                              duplicate         |
+| $0.0300     $0.01   -                                              [>]      |
+| 10.00 bps   -       -                                              [>]      |
+| -           -       -                                              [>]      |
+```
+
+### BT-1105 — A cost profile is created in a dialog whose fields follow its model
+
+**Status:** Proposed
+**User story:** As a researcher defining a new cost assumption, I want the form in a dialog
+showing only the fields my model uses, a line telling me what the assumption costs, and a
+refusal that does not lose what I typed, so that eleven fields stop being a puzzle.
+
+**Acceptance criteria:**
+
+- "New profile" opens a modal dialog in the terminal look (decision 0003): a native `dialog`
+  element, amber title bar, the same 42 px controls. Escape or Cancel closes it and keeps
+  the edits in memory until the page changes; Save creates the immutable version and closes
+  it.
+- Profile name and Asset class always show; the rest follow the model. All-in basis points
+  adds Entry bps and Exit bps. Fixed tick + per unit adds tick size, entry and exit
+  slippage ticks, entry and exit commission per unit, and minimum commission. Costs off
+  adds nothing. Switching model swaps the field set and keeps each model's typed values, so
+  switching away and back loses nothing.
+- Duplicate opens the same dialog pre-filled from that row: asset class, model, every
+  value, and the name as "<name> copy" with the text selected. It creates a new profile; it
+  never edits the row it came from.
+- A line at the foot of the dialog prices the assumption: "A $100,000 round trip at
+  $100.00/share costs about $30.00 (3.00 bps)", recomputed on every change, with the
+  reference price editable and defaulting to 100. All-in basis points shows the same line
+  with no reference-price control; costs off reads "No modeled cost."
+- A name that is already in use is refused before it is sent: Save is disabled with the
+  reason beside it, and the service answers 400 for any caller.
+- A refused save — a duplicate name, an out-of-range value, anything else the service
+  rejects — shows the service's message inline above the dialog's buttons, keeps the dialog
+  open, and keeps every field exactly as typed.
+- At 1280×800 in both display modes the dialog stays inside the viewport with each of the
+  three field sets; the layout check proves it.
+
+**Wireframe:**
+
+```
+  NEW COST PROFILE (modal, ~760 px)                                       [x]
+  Name        [US equities · conservative copy                        ]
+  Asset class [US equities      v]  Model [Fixed tick + per unit      v]
+  Tick size        [0.0100]
+  Entry slippage   [1] ticks       Exit slippage    [1] ticks
+  Entry comm/unit  [0.0050]        Exit comm/unit   [0.0050]
+  Minimum commission [0.00]
+  Reference price  [100.00]
+  A $100,000 round trip at $100.00/share costs about $30.00 (3.00 bps).
+  A profile with this name already exists.        [Cancel]  [Save profile]
+```
+
 ## Epic L: Provider data sources and downloads
 
 The service talks to market-data providers itself (decision 0020): a source is a provider

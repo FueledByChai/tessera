@@ -156,6 +156,90 @@ and one `bool` among the eight, and the dialog's rules (`web/app/globals.css`, `
 **Done when:** `web/scripts/layout-check.mjs` measures the mixed eight-parameter fixture at 1280
 and 1440 px in both display modes and fails when the dialog's rows scroll inside it.
 
+### UI-11 A cost profile's name is unique; a second one with the same name is refused
+`validate_cost_profile_request` (`src/bin/tessera_ui.rs`, line 1398) checks the name's
+length, the asset class, the model, the basis-point bounds, the tick size, the slippage
+ceiling, and the commission bounds — but not whether the name is taken, so two POSTs to
+`/api/cost-profiles` (line 771) with the same name both succeed and the cost-profile select
+in the run form then offers two rows with the same label and nothing to tell them apart,
+which is exactly what "Duplicate as new version" (UI-13) would produce every time.
+`create_cost_profile` (line 3775) gains the check: a name already present in
+`cost_profiles`, compared case-insensitively on the trimmed name, is refused with 400 and
+the error "a cost profile with that name already exists". `seed_cost_profiles` (line 1241)
+is unaffected, inserting as it does with INSERT OR IGNORE. Serves BT-1105.
+**Done when:** an async test in the `mod tests` at the foot of `src/bin/tessera_ui.rs`
+builds an in-memory `AppState` (as the feature-preset tests do), calls `create_cost_profile`
+twice with the same name in a different case, and asserts the second answers 400 with that
+message and leaves one row while a new name answers 200 and leaves two; and
+`validate_cost_profile_request` still refuses an empty name, an unknown asset class, and
+501 bps.
+
+### UI-12 The cost-profile form moves into a dialog whose fields follow the model — Blocked by UI-11
+`CostsWorkspace` (`web/app/page.tsx`, line 4524) ends with the "Create cost profile" panel:
+a `field-grid` of eleven fields, six of them inert for any one model, sitting below the
+profile cards so the results are always under the form. It becomes the console's second
+modal dialog after UI-05's Configure run (decision 0003), opened from a "New profile"
+button in the workspace head: a native `dialog` element in the terminal look, amber title
+bar, the same 42 px controls, Cancel and Save. Profile name and Asset class always render;
+the rest follow the chosen model — all-in basis points adds Entry bps and Exit bps, fixed
+tick + per unit adds tick size, entry and exit slippage ticks, entry and exit commission
+per unit, and minimum commission, costs off adds nothing — and switching model swaps the set
+while keeping each model's typed values. A name matching one already loaded disables Save
+with the reason beside it; a save the service refuses shows the service's message inline
+above the buttons with the dialog open and every field intact. Escape or Cancel keeps the
+edits in memory until the page changes; Save creates the immutable version and closes.
+Serves BT-1105. Wireframe: BT-1105. Decisions: 0003, 0024.
+**Done when:** a new `web/scripts/costs-check.mjs` in the `web/scripts/run-form-check.mjs`
+style (serving `web/dist` with `/api/cost-profiles` and its POST answered from a new
+`web/fixtures/cost-profiles.json`, run by `scripts/check.sh`) fails unless the page shows no
+create form; New profile opens a dialog; All-in basis points shows no tick size, slippage,
+commission, or minimum field, Fixed tick + per unit shows exactly those six, and Costs off
+shows only name, asset class, and model; switching model away and back restores the values
+typed; a duplicate name disables Save with the reason beside it; and a POST answered 400
+renders the message above the buttons with the dialog still open and every field holding
+what was typed. `web/scripts/layout-check.mjs` gains a Costs pass that opens the dialog at
+1280×800 in both display modes for each of the three field sets and fails when it passes
+the viewport or the page behind it scrolls horizontally.
+
+### UI-13 The cost profiles are a sortable table — Blocked by UI-12
+The `cost-profile-grid` of cards (`web/app/page.tsx`, line 4547), each holding a
+model-shaped `<dl>`, becomes one table (decision 0024): one row per profile with the
+columns NAME, ORIGIN, ASSET CLASS, MODEL, ENTRY, EXIT, ROUND TRIP, TICK, MIN COMM, and a
+Duplicate control; ENTRY and EXIT in the model's own unit and ROUND TRIP their sum; a cell
+the model does not use rendering a dash and never a zero, so a costs-off row keeps its
+name, asset class, and model over five dashes; every header sorting, with the order
+`/api/cost-profiles` returns as the default; the profile id as the NAME cell's tooltip
+rather than a column; the panel's empty state when there is no profile. Each row's Duplicate
+opens UI-12's dialog pre-filled from that row with the name as "<name> copy" and its text
+selected, and the panel's title bar holds New profile. Nothing on a row edits or deletes.
+Serves BT-1104. Wireframe: BT-1104. Decisions: 0003, 0024.
+**Done when:** `web/scripts/costs-check.mjs` fails unless the fixture's seven profiles (two
+all-in, three fixed tick, one costs off, one custom) render as seven rows in wireframe
+order; a costs-off row's five value cells read a dash while a fixed-tick row's TICK reads
+"$0.01"; clicking NAME sorts by name and clicking ROUND TRIP sorts by round trip, a second
+click reversing it; Duplicate on a row opens the dialog carrying that row's model, asset
+class, and every value with its name as "<name> copy"; the NAME cell's title attribute is
+that profile's id; and an empty list shows the panel's empty state with New profile still
+present. `web/scripts/layout-check.mjs`'s Costs pass measures the table at 1280 and 1440 px
+in both display modes and fails on horizontal page scroll; `theme-check.mjs` still passes.
+
+### UI-14 The dialog prices the assumption it is defining — Blocked by UI-12
+The dialog from UI-12 prices what it is defining, so a basis-point figure and a
+ticks-and-commission figure can be told apart before either is saved as an immutable
+version. A line at its foot reads "A $100,000 round trip at $100.00/share costs about
+$30.00 (3.00 bps)", recomputed on every change: shares are 100,000 divided by the reference
+price, which is editable and defaults to 100; a side's commission is the greater of the
+minimum commission and shares times its per-unit commission; a side's cost is that plus
+shares times its slippage in ticks times the tick size; all-in basis points is 100,000
+times entry plus exit over 10,000 and needs no price, so the reference-price control is not
+rendered for it; costs off reads "No modeled cost." Serves BT-1105. Wireframe: BT-1105.
+**Done when:** `web/scripts/costs-check.mjs` fails unless, with tick size 0.01, one tick of
+slippage each side, $0.005 per unit each side, and a $100.00 reference price, the line
+reads $30.00 and 3.00 bps; at $50.00 it reads $60.00 and 6.00 bps; with All-in basis points
+at 5 and 5 it reads $100.00 and 10.00 bps with no reference-price control; with Costs off
+it reads "No modeled cost."; and a minimum commission above the per-unit figure is the
+figure the line uses.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar
