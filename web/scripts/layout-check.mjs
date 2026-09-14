@@ -11,9 +11,11 @@
 // run dialog and fails when the dialog passes the viewport, when its rows scroll inside it
 // (UI-07: the whole form shows at 1280x800), or when the page behind it scrolls horizontally,
 // and counts the fields in the first row of the dialog's Data grid and fails under six (UI-04:
-// numeric fields take one auto-fit track, dates and selects two). A Costs pass (UI-12) opens
-// the New profile dialog at 1280x800 in both modes for each of the three cost models and fails
-// when it passes the viewport or the page behind it scrolls horizontally. A fifth page holds the
+// numeric fields take one auto-fit track, dates and selects two). A Costs pass (UI-13) measures
+// the profiles table at both widths in both modes and fails when the page scrolls horizontally
+// or the table is wider than its wrapper, and one (UI-12) opens the New profile dialog in both
+// modes for each of the three cost models and fails when it passes the viewport or the page
+// behind it scrolls horizontally. A fifth page holds the
 // dialog to a strategy declaring eight parameters (UI-07): the fixture strategy from
 // web/fixtures/strategy-detail.json with four more parameters, long captions and hints among
 // them, added to the catalog by this script and measured with the Simple tier showing and
@@ -345,6 +347,50 @@ async function checkDialog(page, label, tiers) {
 /** The three cost models, each with its own field set in the dialog (UI-12). */
 const COST_MODELS = ["all_in_bps", "fixed_tick_per_unit", "none"];
 
+/** Runs in the page: the profiles table against the wrapper it sits in (UI-13). */
+function measureTable() {
+  const wrap = document.querySelector(".costs-table");
+  const table = wrap?.querySelector("table");
+  if (!wrap || !table) return null;
+  return {
+    width: Math.round(table.getBoundingClientRect().width),
+    wrapper: wrap.clientWidth,
+    rows: wrap.querySelectorAll("tbody tr").length,
+    columns: wrap.querySelectorAll("thead th").length,
+  };
+}
+
+/**
+ * The Costs page's profiles table (UI-13, decision 0024): ten columns — NAME through MIN COMM
+ * plus the row's Duplicate — measured at 1280 and 1440 px in both display modes, failing when
+ * the page scrolls horizontally, an element passes the viewport, or the table is wider than
+ * the wrapper it sits in. A wrapper that scrolls is a table that looks cut off, since macOS
+ * hides the scrollbar until it is used, so the columns have to fit rather than merely scroll.
+ */
+async function checkCostsTable(page, label) {
+  const failures = [];
+  try {
+    await page.getByRole("button", { name: /^Costs$/ }).first().click();
+    await page.locator(".costs-workspace").waitFor({ timeout: 15000 });
+    await page.locator(".costs-table tbody tr").first().waitFor({ timeout: 15000 });
+    await page.waitForTimeout(250);
+  } catch (error) {
+    return [`${label}: the Costs page renders no profiles table (${String(error).split("\n")[0]})`];
+  }
+  const box = await page.evaluate(measureTable);
+  if (!box) return [`${label}: no profiles table to measure`];
+  if (verbose) console.log(`${label}: table ${box.width}px in a ${box.wrapper}px wrapper, ${box.rows} row(s), ${box.columns} column(s)`);
+  if (box.rows < 1) failures.push(`${label}: the profiles table has no row to measure`);
+  if (box.width > box.wrapper + 1) {
+    failures.push(`${label}: the table is ${box.width}px wide in a ${box.wrapper}px wrapper, so it is cut off at the panel edge (${box.columns} columns)`);
+  }
+  const behind = await page.evaluate(measure);
+  if (behind.scrollWidth > behind.innerWidth) failures.push(`${label}: the page scrolls horizontally (${behind.scrollWidth} > ${behind.innerWidth})`);
+  for (const o of behind.offenders) failures.push(`${label}: past the viewport: ${o}`);
+  for (const c of behind.clipped) failures.push(`${label}: cut off in its wrapper: ${c}`);
+  return failures;
+}
+
 /**
  * The Costs page's New profile dialog (UI-12, decisions 0003 and 0024): opened from the page's
  * head at 1280x800 in both display modes and measured with each model showing its own field set
@@ -606,16 +652,20 @@ try {
       await context.close();
     }
   }
-  // The Costs dialog pass (UI-12): 1280x800, both display modes, each of the three models.
+  // The Costs passes (UI-12 and UI-13): both display modes at 1280 and 1440 px — the profiles
+  // table with its ten columns, then the New profile dialog with each of the three models.
   for (const mode of ["terminal", "modern"]) {
-    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    await context.addInitScript((m) => window.localStorage.setItem("bt-display-mode", m), mode);
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    await page.locator(".app-shell").waitFor({ timeout: 15000 });
-    failures.push(...(await checkCostsDialog(page, `${mode} 1280px costs dialog`)));
-    costs += 1;
-    await context.close();
+    for (const width of WIDTHS) {
+      const context = await browser.newContext({ viewport: { width, height: HEIGHT } });
+      await context.addInitScript((m) => window.localStorage.setItem("bt-display-mode", m), mode);
+      const page = await context.newPage();
+      await page.goto(url, { waitUntil: "domcontentloaded" });
+      await page.locator(".app-shell").waitFor({ timeout: 15000 });
+      failures.push(...(await checkCostsTable(page, `${mode} ${width}px costs table`)));
+      failures.push(...(await checkCostsDialog(page, `${mode} ${width}px costs dialog`)));
+      costs += 1;
+      await context.close();
+    }
   }
   // Storage the browser refuses (UI-09): with no stored choice to read the console still renders
   // the expanded sidebar, so a first visit and a locked-down browser are not left on a rail the
@@ -659,5 +709,5 @@ if (failures.length) {
 }
 const pages = Object.keys(PAGES).length - skipped.size;
 console.log(
-  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the mixed eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, a hover tooltip, and the choice kept across a reload, ${costs} costs dialog run(s) inside the viewport for each of the three models, ${WIDTHS.length} run(s) with storage blocked rendering expanded, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
+  `layout-check: ok (${WIDTHS.join("/")} px, terminal and modern, ${pages} of ${Object.keys(PAGES).length} pages measured${skipped.size ? `, skipped: ${[...skipped.keys()].join(", ")}` : ""}; ${measured} measurements${skipped.has("strategy page") ? "" : `, history first after the strip, the dialog inside the viewport with ${FIELDS_PER_ROW}+ fields in its Data row`}${skipped.has("eight-parameter strategy") ? "" : ", the mixed eight-parameter dialog not scrolling inside"}; ${rails} collapsed rail(s) at 56px with the labels hidden, the active item highlighted, a hover tooltip, and the choice kept across a reload, ${costs} costs run(s) with the table fitting its wrapper and the dialog inside the viewport for each of the three models, ${WIDTHS.length} run(s) with storage blocked rendering expanded, ${served ? "built bundle with the console's data" : servedUrl}) via ${runtime.from}`,
 );

@@ -4566,6 +4566,98 @@ const costNumber = (value: string, fallback = 0) => {
   return value.trim() === "" || !Number.isFinite(parsed) ? fallback : parsed;
 };
 
+/** A cell the model does not use: a dash, never a zero (BT-1104), so "no cost" never reads
+ *  like "a cost of nothing". */
+const COST_DASH = "—";
+/** The columns of the profiles table (UI-13), in wireframe order: the row's Duplicate is a
+ *  tenth column of its own. A numeric column starts sorted at its expensive end. */
+type CostColumn = { key: string; label: string; numeric?: boolean };
+const COST_COLUMNS: CostColumn[] = [
+  { key: "name", label: "Name" },
+  { key: "origin", label: "Origin" },
+  { key: "asset_class", label: "Asset class" },
+  { key: "model", label: "Model" },
+  { key: "entry", label: "Entry", numeric: true },
+  { key: "exit", label: "Exit", numeric: true },
+  { key: "round_trip", label: "Round trip", numeric: true },
+  { key: "tick", label: "Tick", numeric: true },
+  { key: "min_comm", label: "Min comm", numeric: true },
+];
+/** The model as the table names it: the dialog's labels are too long for a column. */
+const COST_MODEL_LABELS: Record<string, string> = {
+  all_in_bps: "All-in bps",
+  fixed_tick_per_unit: "Fixed tick",
+  none: "Costs off",
+};
+const costModelLabel = (model: string) => COST_MODEL_LABELS[model] ?? model;
+/** One side's cost in the model's own unit: money per unit for fixed tick — the commission plus
+ *  the slippage, priced at the tick size — basis points for all-in, and nothing at all when
+ *  costs are off. The minimum commission is a floor on an order, not a per-unit cost, so it
+ *  is its own column rather than part of a side. */
+const costSide = (profile: CostProfile, side: "entry" | "exit") => {
+  if (profile.model === "all_in_bps") return side === "entry" ? profile.entry_bps : profile.exit_bps;
+  if (profile.model === "fixed_tick_per_unit") {
+    const commission = side === "entry" ? profile.entry_commission_per_unit : profile.exit_commission_per_unit;
+    const ticks = side === "entry" ? profile.entry_slippage_ticks : profile.exit_slippage_ticks;
+    return commission + ticks * profile.tick_size;
+  }
+  return null;
+};
+const costRoundTrip = (profile: CostProfile) => {
+  const entry = costSide(profile, "entry");
+  const exit = costSide(profile, "exit");
+  return entry == null || exit == null ? null : entry + exit;
+};
+/** A value cell: the model's own unit, or a dash when the model has no such value. */
+const costCell = (profile: CostProfile, value: number | null) => {
+  if (value == null) return COST_DASH;
+  return profile.model === "all_in_bps" ? `${value.toFixed(2)} bps` : `$${value.toFixed(4)}`;
+};
+const costMoney = (value: number) => `$${value.toFixed(2)}`;
+/** What a row sorts by: the cell as it reads, with a dash as the least value there is. */
+const costSortValue = (profile: CostProfile, key: string): string | number | null => {
+  switch (key) {
+    case "name":
+      return profile.name;
+    case "origin":
+      return profile.builtin ? 0 : 1;
+    case "asset_class":
+      return profile.asset_class;
+    case "model":
+      return costModelLabel(profile.model);
+    case "entry":
+      return costSide(profile, "entry");
+    case "exit":
+      return costSide(profile, "exit");
+    case "round_trip":
+      return costRoundTrip(profile);
+    case "tick":
+      return profile.model === "fixed_tick_per_unit" ? profile.tick_size : null;
+    case "min_comm":
+      return profile.model === "fixed_tick_per_unit" && profile.minimum_commission > 0
+        ? profile.minimum_commission
+        : null;
+    default:
+      return null;
+  }
+};
+/** A row's values as a draft, so Duplicate opens the dialog carrying them (UI-13). */
+const draftFromProfile = (profile: CostProfile): CostDraft => ({
+  name: `${profile.name} copy`,
+  asset_class: COST_ASSET_CLASSES.includes(profile.asset_class) ? profile.asset_class : "Any",
+  model: COST_MODELS.some((model) => model.value === profile.model) ? profile.model : "none",
+  entry_bps: String(profile.entry_bps),
+  exit_bps: String(profile.exit_bps),
+  // The service validates every field whatever the model, so a row with no tick size still
+  // needs a positive one to save; the draft falls back to the default rather than a zero.
+  tick_size: profile.tick_size > 0 ? String(profile.tick_size) : EMPTY_COST_DRAFT.tick_size,
+  entry_slippage_ticks: String(profile.entry_slippage_ticks),
+  exit_slippage_ticks: String(profile.exit_slippage_ticks),
+  entry_commission_per_unit: String(profile.entry_commission_per_unit),
+  exit_commission_per_unit: String(profile.exit_commission_per_unit),
+  minimum_commission: String(profile.minimum_commission),
+});
+
 function CostsWorkspace({
   profiles,
   busy,
@@ -4578,12 +4670,54 @@ function CostsWorkspace({
 }) {
   const [draft, setDraft] = useState<CostDraft>(EMPTY_COST_DRAFT);
   const [refused, setRefused] = useState("");
+  /** The table's sort (UI-13): null is the order the API returned, built-in first then newest. */
+  const [sortKey, setSortKey] = useState<string | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
   const openDialog = () => {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) dialog.showModal();
   };
   const closeDialog = () => dialogRef.current?.close();
+  /** Duplicate: the same dialog carrying that row, under "<name> copy" with the name selected
+   *  so the first thing typed replaces it (BT-1104). It creates; it never edits the row. */
+  const openDuplicate = (profile: CostProfile) => {
+    setDraft(draftFromProfile(profile));
+    setRefused("");
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    window.setTimeout(() => {
+      const input = nameRef.current;
+      if (!input) return;
+      input.focus();
+      input.select();
+    }, 0);
+  };
+  const rows = useMemo(() => {
+    if (!sortKey) return profiles;
+    const key = sortKey;
+    const direction = sortDir === "asc" ? 1 : -1;
+    return [...profiles].sort((left, right) => {
+      const a = costSortValue(left, key);
+      const b = costSortValue(right, key);
+      // A dash is the least value there is, so it leads an ascending sort and trails a
+      // descending one: a costs-off profile is the cheapest assumption, not the dearest.
+      if (a == null || b == null) return (a == null ? -1 : 1) * direction;
+      const delta = typeof a === "string" ? a.localeCompare(b as string) : a - (b as number);
+      return delta * direction;
+    });
+  }, [profiles, sortKey, sortDir]);
+  const sortLabel = COST_COLUMNS.find((column) => column.key === sortKey)?.label ?? "";
+  const toggleSort = (key: string) => {
+    if (sortKey === key) {
+      setSortDir(sortDir === "asc" ? "desc" : "asc");
+      return;
+    }
+    setSortKey(key);
+    // A number starts at the expensive end; a name starts at A.
+    setSortDir(COST_COLUMNS.find((column) => column.key === key)?.numeric ? "desc" : "asc");
+  };
   const setField = (key: keyof CostDraft, value: string) =>
     setDraft((current) => ({ ...current, [key]: value }));
   /** A name the library already holds, trimmed and case-insensitively, as the service compares
@@ -4629,47 +4763,79 @@ function CostsWorkspace({
   }
   return (
     <div className="costs-workspace">
-      <section className="strategy-hero">
+      <section className="strategy-hero costs-hero">
         <div>
-          <p className="eyebrow">Central assumption library</p>
           <h2>Execution cost profiles</h2>
-          <p>
-            Profiles are versioned, write-once assumptions. Every queued run
-            freezes the selected profile inside its manifest, while explicit
-            strategy parameters remain auditable overrides.
-          </p>
+          <p>Profiles are immutable; every run freezes the one it was queued with.</p>
         </div>
-        <div className="strategy-hero-actions">
-          <span className="discipline-badge">ENTRY + EXIT STORED SEPARATELY</span>
-          <button type="button" className="primary-action cost-dialog-open" onClick={openDialog}>
+      </section>
+      <section className="panel cost-profiles-panel">
+        <div className="terminal-panel-title">
+          <span>CST</span> COST PROFILES
+          <em>{rows.length}</em>
+          {sortKey ? <span className="cost-profiles-sort">sort: {sortLabel} {sortDir === "asc" ? "▲" : "▼"}</span> : null}
+          <button type="button" className="text-action cost-dialog-open" onClick={openDialog}>
             New profile
           </button>
         </div>
-      </section>
-      <section className="panel cost-profile-grid">
-        {profiles.map((profile) => (
-          <article className="cost-profile-card" key={profile.id}>
-            <div className="terminal-panel-title">
-              <span>{profile.builtin ? "BASE" : "USER"}</span> {profile.asset_class.toUpperCase()}
-            </div>
-            <h3>{profile.name}</h3>
-            <strong>{profile.model.replaceAll("_", " ")}</strong>
-            {profile.model === "all_in_bps" ? (
-              <dl>
-                <div><dt>Entry</dt><dd>{profile.entry_bps.toFixed(2)} bps</dd></div>
-                <div><dt>Exit</dt><dd>{profile.exit_bps.toFixed(2)} bps</dd></div>
-                <div><dt>Round trip</dt><dd>{(profile.entry_bps + profile.exit_bps).toFixed(2)} bps</dd></div>
-              </dl>
-            ) : profile.model === "fixed_tick_per_unit" ? (
-              <dl>
-                <div><dt>Slippage</dt><dd>{profile.entry_slippage_ticks} / {profile.exit_slippage_ticks} ticks</dd></div>
-                <div><dt>Commission</dt><dd>${profile.entry_commission_per_unit.toFixed(4)} / ${profile.exit_commission_per_unit.toFixed(4)}</dd></div>
-                <div><dt>Tick size</dt><dd>${profile.tick_size}</dd></div>
-              </dl>
-            ) : <p>Zero commissions, spread, and slippage.</p>}
-            <small>{profile.id}</small>
-          </article>
-        ))}
+        {rows.length ? (
+          <div className="table-wrap costs-table">
+            <table>
+              <thead>
+                <tr>
+                  {COST_COLUMNS.map((column) => (
+                    <th
+                      className={`cost-col-${column.key}${column.numeric ? " cost-num" : ""}`}
+                      data-sort={column.key}
+                      key={column.key}
+                      onClick={() => toggleSort(column.key)}
+                    >
+                      {column.label}
+                      {sortKey === column.key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+                    </th>
+                  ))}
+                  <th className="cost-col-duplicate"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((profile) => {
+                  const entry = costSide(profile, "entry");
+                  const exit = costSide(profile, "exit");
+                  return (
+                    <tr key={profile.id}>
+                      <td className="cost-name" title={profile.id}>
+                        {profile.name}
+                      </td>
+                      <td>{profile.builtin ? "BASE" : "USER"}</td>
+                      <td>{profile.asset_class}</td>
+                      <td>{costModelLabel(profile.model)}</td>
+                      <td className="cost-num">{costCell(profile, entry)}</td>
+                      <td className="cost-num">{costCell(profile, exit)}</td>
+                      <td className="cost-num">{costCell(profile, entry == null || exit == null ? null : entry + exit)}</td>
+                      <td className="cost-num">
+                        {profile.model === "fixed_tick_per_unit" ? costMoney(profile.tick_size) : COST_DASH}
+                      </td>
+                      <td className="cost-num">
+                        {profile.model === "fixed_tick_per_unit" && profile.minimum_commission > 0
+                          ? costMoney(profile.minimum_commission)
+                          : COST_DASH}
+                      </td>
+                      <td className="cost-duplicate-cell">
+                        <button type="button" className="text-action cost-duplicate" onClick={() => openDuplicate(profile)}>
+                          Duplicate
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="empty-state">
+            No cost profiles yet. New profile adds one; a run freezes the profile it was queued with.
+          </div>
+        )}
       </section>
       <dialog
         className="cost-dialog"
@@ -4699,6 +4865,7 @@ function CostsWorkspace({
                   Profile name
                   <input
                     name="name"
+                    ref={nameRef}
                     required
                     maxLength={100}
                     placeholder="US equities · conservative"
