@@ -26,6 +26,8 @@ grill-me.md	wireframe
 grill-me.md	80 columns
 grill-me.md	sprint
 grill-me.md	--stories
+grill-me.md	settings file and the ticket file
+grill-me.md	this repository, a new one, or a sibling
 review-prs.md	four questions
 review-prs.md	one status per head commit
 review-prs.md	--update-all

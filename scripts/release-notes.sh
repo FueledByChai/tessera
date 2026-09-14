@@ -12,6 +12,16 @@
 #                                                      heading (newest first), so the queue
 #                                                      holds only open work
 #   --backlog <file> / --changelog <file>              other files (default: the repo's)
+#   --prefix <P>                                       only the tickets whose id carries that
+#                                                      prefix (repeatable, or comma-separated);
+#                                                      it filters the notes and the archive
+#                                                      alike, so one prefix's work can leave a
+#                                                      backlog without touching the rest. When
+#                                                      nothing matches, nothing moves and the
+#                                                      exit status is still 0. A --prefix that
+#                                                      names no prefix at all is refused, since
+#                                                      read as "no filter" it would archive
+#                                                      every prefix's tickets.
 #   --self-test                                        a fixture repo proves both modes
 #
 # Tag releases; the notes for a release are the diff between its tag and the previous one.
@@ -22,17 +32,43 @@ CHANGELOG="$ROOT/CHANGELOG.md"
 ARCHIVE=""
 MODE=notes
 REFS=()
+PREFIXES=""
+PREFIX_GIVEN=0
+# --prefix accumulates, splitting on commas, so `--prefix AA --prefix BB` and `--prefix AA,BB`
+# mean the same thing. An empty component is dropped: it names no prefix, and dropping it cannot
+# widen the filter.
+add_prefix() {
+  local list="$1" p
+  local IFS=','
+  for p in $list; do
+    [ -n "$p" ] || continue
+    PREFIXES="${PREFIXES:+$PREFIXES,}$p"
+  done
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --archive) ARCHIVE="$2"; shift ;;
     --backlog) BACKLOG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift ;;
     --changelog) CHANGELOG="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift ;;
+    --prefix) PREFIX_GIVEN=1; add_prefix "$2"; shift ;;
     --self-test) MODE=selftest ;;
     --*) echo "unknown flag: $1" >&2; exit 2 ;;
     *) REFS+=("$1") ;;
   esac
   shift
 done
+# A --prefix that was asked for and named nothing is a mistake, not an omission. Read as "no
+# filter" it would archive every prefix's tickets, which is the opposite of what it asked for, so
+# it is refused before either file is touched.
+if [ "$PREFIX_GIVEN" = 1 ] && [ -z "$PREFIXES" ]; then
+  echo "usage: --prefix needs at least one prefix; an empty list is not the same as leaving the flag off" >&2
+  exit 2
+fi
+# The filter reaches the renderer through the environment: the perl block below is a black box
+# that already takes its inputs positionally, and the sibling TUI script passes its width the
+# same way.
+RELEASE_NOTES_PREFIXES="$PREFIXES"
+export RELEASE_NOTES_PREFIXES
 
 # The commits from..to that carry a ticket id, oldest first, as `sha<TAB>date<TAB>id<TAB>summary`.
 shipped() {
@@ -47,6 +83,15 @@ render() {
   perl -e '
     use strict; use warnings;
     my ($mode, $tag, $from, $to, $backlog, $changelog) = @ARGV;
+    # --prefix narrows the run to the tickets whose id carries one of these prefixes. An empty
+    # list means no filter, which is what a flag-less invocation passes.
+    my %want_prefix = map { $_ => 1 } grep { length } split /,/, ($ENV{RELEASE_NOTES_PREFIXES} // "");
+    my $keep = sub {
+      my $id = shift;
+      return 1 unless %want_prefix;
+      my ($p) = $id =~ /^([A-Z]+)-/;
+      return (defined $p && $want_prefix{$p}) ? 1 : 0;
+    };
     my @shipped;
     while (my $line = <STDIN>) { chomp $line; my @f = split /\t/, $line, 4; push @shipped, { sha => $f[0], date => $f[1], id => $f[2], summary => $f[3] } if @f == 4; }
     # The backlog: every ticket block (heading through the line before the next heading) and
@@ -60,9 +105,12 @@ render() {
       if ($line =~ /^### (\S+) /) { $current_id = $1; $section{$current_id} = $current_section; $block{$current_id} = [$i, $i]; $order{$current_id} = $i; next; }
       $block{$current_id}[1] = $i if $current_id ne "";
     }
+    # The filter is applied once, here, so the notes, the archive, and the "already archived"
+    # line all see the same tickets.
+    my @ships = grep { $keep->($_->{id}) } @shipped;
     my %seen;
-    my @ids = grep { !$seen{$_}++ } map { $_->{id} } @shipped;
-    my %first; for my $s (@shipped) { $first{ $s->{id} } //= $s; }
+    my @ids = grep { !$seen{$_}++ } map { $_->{id} } @ships;
+    my %first; for my $s (@ships) { $first{ $s->{id} } //= $s; }
     my %by_prefix;
     for my $id (@ids) { my ($prefix) = $id =~ /^([A-Z]+)-/; push @{ $by_prefix{$prefix} }, $id; }
     my $section_name = sub { my $prefix = shift; for my $id (@{ $by_prefix{$prefix} }) { return "$section{$id} ($prefix)" if ($section{$id} // "") ne ""; } return $prefix; };
@@ -76,16 +124,23 @@ render() {
         $notes .= "- **$id** " . ($t ne "" ? "$t" : $f->{summary}) . " — $f->{date} · $f->{sha}" . ($t ne "" && lc($t) ne lc($f->{summary}) ? " ($f->{summary})" : "") . "\n";
       }
     }
+    my $scope = %want_prefix ? " matching " . join(", ", sort keys %want_prefix) : "";
     if ($mode eq "notes") {
       print "# Release notes $from..$to\n";
-      print @ids ? $notes : "\nNo ticket commits in $from..$to.\n";
+      print @ids ? $notes : "\nNo ticket commits in $from..$to$scope.\n";
+      exit 0;
+    }
+    # A filter that matches nothing leaves both files exactly as they were, and is not an error:
+    # the prefix may simply have had no work in this range.
+    if (%want_prefix && !@ids) {
+      print "nothing in $from..$to$scope; nothing archived\n";
       exit 0;
     }
     # Archive: the tickets still in the backlog move into the changelog under the tag.
     my $existing = "";
     if (open my $ch, "<", $changelog) { local $/; $existing = <$ch>; close $ch; }
     my @moved = grep { $block{$_} && $existing !~ /^#### \Q$_\E /m } @ids;
-    my $date = @shipped ? $shipped[-1]{date} : "";
+    my $date = @ships ? $ships[-1]{date} : "";
     my $entry = "## $tag — $date ($from..$to)\n" . $notes;
     for my $prefix (sort keys %by_prefix) {
       my @here = grep { $block{$_} } @{ $by_prefix{$prefix} };
@@ -147,12 +202,18 @@ Body of the second thing.
 ### BB-01 Other thing
 Body of the other thing.
 **Done when:** it ships.
+
+## Gamma
+
+### CC-01 Third thing
+Body of the third thing.
 EOF
     git add BACKLOG.md
     git commit -q -m "Scaffold the fixture queue"
     git tag v0.0.0
     git commit -q --allow-empty -m "AA-01: first thing landed"
     git commit -q --allow-empty -m "Unrelated tidy-up"
+    git commit -q --allow-empty -m "CC-01: third thing shipped"
     git commit -q --allow-empty -m "BB-01: other thing shipped"
     git commit -q --allow-empty -m "AA-01: a follow-up fix"
     notes="$("$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md v0.0.0 HEAD)"
@@ -163,6 +224,53 @@ EOF
     echo "$notes" | grep -q 'AA-02' && { echo "self-test: AA-02 has not shipped and must not be listed:"; echo "$notes"; exit 1; }
     [ "$(echo "$notes" | grep -c 'AA-01')" = 1 ] || { echo "self-test: AA-01 must be listed once (first commit):"; echo "$notes"; exit 1; }
     echo "$notes" | grep -q 'Unrelated' && { echo "self-test: a commit without a ticket id leaked in"; exit 1; }
+    # --prefix narrows the notes to one prefix, and three prefixes interleave in this range, so
+    # the two it does not name must be absent from both the list and the section headings.
+    notes_aa="$("$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --prefix AA v0.0.0 HEAD)"
+    echo "$notes_aa" | grep -q '^- \*\*AA-01\*\*' || { echo "self-test: --prefix AA dropped AA-01:"; echo "$notes_aa"; exit 1; }
+    echo "$notes_aa" | grep -qE 'BB-01|CC-01' && { echo "self-test: --prefix AA leaked another prefix:"; echo "$notes_aa"; exit 1; }
+    echo "$notes_aa" | grep -q '^### Alpha (AA)$' || { echo "self-test: --prefix AA lost its own section:"; echo "$notes_aa"; exit 1; }
+    echo "$notes_aa" | grep -qE '^### (Beta|Gamma)' && { echo "self-test: --prefix AA kept another prefix's section:"; echo "$notes_aa"; exit 1; }
+    notes_bb="$("$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --prefix BB v0.0.0 HEAD)"
+    echo "$notes_bb" | grep -q '^- \*\*BB-01\*\*' || { echo "self-test: --prefix BB dropped BB-01:"; echo "$notes_bb"; exit 1; }
+    echo "$notes_bb" | grep -qE 'AA-01|CC-01' && { echo "self-test: --prefix BB leaked another prefix:"; echo "$notes_bb"; exit 1; }
+    # Both spellings of the flag mean the same thing, and together they mean no filter at all.
+    [ "$("$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --prefix AA,BB,CC v0.0.0 HEAD)" = "$notes" ] \
+      || { echo "self-test: a comma-separated --prefix list must equal no filter"; exit 1; }
+    [ "$("$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --prefix AA --prefix BB --prefix CC v0.0.0 HEAD)" = "$notes" ] \
+      || { echo "self-test: a repeated --prefix must equal no filter"; exit 1; }
+    # The archive moves exactly the prefix it was given, says how many it moved, and leaves the
+    # other prefixes' tickets where they were.
+    archive_out="$("$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --changelog CHANGELOG.md --prefix AA --archive v0.1.0 v0.0.0 HEAD)"
+    [ "$archive_out" = "archived 1 ticket(s) under v0.1.0: AA-01" ] || { echo "self-test: --prefix AA must move one ticket and print the count:"; echo "$archive_out"; exit 1; }
+    grep -q '^#### AA-01 First thing' CHANGELOG.md || { echo "self-test: --prefix AA did not archive AA-01:"; cat CHANGELOG.md; exit 1; }
+    grep -qE 'BB-01|CC-01' CHANGELOG.md && { echo "self-test: --prefix AA archived another prefix:"; cat CHANGELOG.md; exit 1; }
+    grep -q '^### AA-01 ' BACKLOG.md && { echo "self-test: AA-01 still in the backlog after the prefix archive"; exit 1; }
+    grep -q '^### BB-01 Other thing$' BACKLOG.md || { echo "self-test: --prefix AA removed BB-01:"; cat BACKLOG.md; exit 1; }
+    grep -q '^### CC-01 Third thing$' BACKLOG.md || { echo "self-test: --prefix AA removed CC-01:"; cat BACKLOG.md; exit 1; }
+    # A prefix with nothing in the range moves nothing, changes nothing, and is not an error.
+    changelog_before="$(cat CHANGELOG.md)"
+    backlog_before="$(cat BACKLOG.md)"
+    # A --prefix that names no prefix is refused rather than read as "no filter". Read as no
+    # filter it would archive every prefix's tickets, which is the opposite of what it asked for.
+    for empty in "" ","; do
+      if "$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --changelog CHANGELOG.md --prefix "$empty" --archive v0.1.0 v0.0.0 HEAD >empty.out 2>&1; then
+        echo "self-test: --prefix '$empty' must be refused, not read as no filter:"; cat empty.out; exit 1
+      fi
+      grep -q 'at least one prefix' empty.out || { echo "self-test: the refusal should say what is wrong:"; cat empty.out; exit 1; }
+      [ "$changelog_before" = "$(cat CHANGELOG.md)" ] || { echo "self-test: a refused --prefix rewrote the changelog"; exit 1; }
+      [ "$backlog_before" = "$(cat BACKLOG.md)" ] || { echo "self-test: a refused --prefix rewrote the backlog"; exit 1; }
+    done
+    if ! "$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --changelog CHANGELOG.md --prefix ZZ --archive v0.1.0 v0.0.0 HEAD >zz.out 2>&1; then
+      echo "self-test: a prefix matching nothing must still exit 0:"; cat zz.out; exit 1
+    fi
+    grep -q 'nothing archived' zz.out || { echo "self-test: a prefix matching nothing said nothing:"; cat zz.out; exit 1; }
+    [ "$changelog_before" = "$(cat CHANGELOG.md)" ] || { echo "self-test: a prefix matching nothing rewrote the changelog"; exit 1; }
+    [ "$backlog_before" = "$(cat BACKLOG.md)" ] || { echo "self-test: a prefix matching nothing rewrote the backlog"; exit 1; }
+    # Put the fixture back the way the rest of the test expects it, then prove the flag-less run
+    # still behaves exactly as it did before.
+    rm -f CHANGELOG.md zz.out empty.out
+    git checkout -- BACKLOG.md
     "$ROOT/scripts/release-notes.sh" --backlog BACKLOG.md --changelog CHANGELOG.md --archive v0.1.0 v0.0.0 HEAD >/dev/null
     grep -q '^# Changelog' CHANGELOG.md || { echo "self-test: no changelog header"; cat CHANGELOG.md; exit 1; }
     grep -q '^## v0.1.0 — [0-9-]* (v0.0.0..HEAD)$' CHANGELOG.md || { echo "self-test: no tag heading:"; cat CHANGELOG.md; exit 1; }
