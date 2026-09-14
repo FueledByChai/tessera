@@ -24,6 +24,11 @@ use super::{
 /// Where the public API lives; a stub server replaces it in tests.
 pub const DEFAULT_BASE_URL: &str = "https://eodhd.com";
 
+/// The timeout the usage check gets (DS-13). `/api/user` is what `GET /api/sources` waits on
+/// before it can draw the Inventory listing, so a provider that hangs rather than refusing fast
+/// must not hold that listing for the client's general timeout.
+const USAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The bar resolutions the exchanges list can be asked about, in the engine's names. The list
 /// endpoint says nothing about intraday coverage, so this is not a per-exchange claim: every
 /// exchange claims the same set, and which of them the account really gets is what the service's
@@ -84,12 +89,28 @@ impl Eodhd {
         token: &str,
         extra: &[(&str, &str)],
     ) -> Result<T, ProviderError> {
+        self.get_json_within(path, token, extra, None).await
+    }
+
+    /// [`get_json`] with a request timeout of its own, for a call whose caller cannot wait for
+    /// the client's general one (DS-13).
+    async fn get_json_within<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+        timeout: Option<Duration>,
+    ) -> Result<T, ProviderError> {
         let mut query: Vec<(&str, &str)> = vec![("api_token", token), ("fmt", "json")];
         query.extend_from_slice(extra);
-        let response = self
+        let mut request = self
             .client
             .get(format!("{}{path}", self.base_url))
-            .query(&query)
+            .query(&query);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| ProviderError::Unreachable(scrub(&e.without_url().to_string(), token)))?;
@@ -362,7 +383,9 @@ fn splits_of(rows: Vec<SplitRow>) -> Result<Vec<Split>, ProviderError> {
 
 impl Provider for Eodhd {
     async fn verify(&self, token: &str) -> Result<Account, ProviderError> {
-        let user: UserResponse = self.get_json("/api/user", token, &[]).await?;
+        let user: UserResponse = self
+            .get_json_within("/api/user", token, &[], Some(USAGE_TIMEOUT))
+            .await?;
         account_of(user)
     }
 
@@ -540,6 +563,17 @@ mod tests {
         assert_eq!(bars[0].close, 277.6451);
         assert_eq!(bars[1].timestamp, 1_704_206_700);
         assert_eq!((bars[1].gmtoffset, bars[1].volume), (0, 0.0));
+    }
+
+    #[test]
+    fn the_usage_check_gives_up_long_before_the_client_would() {
+        // DS-13: `GET /api/sources` waits on this call before it can draw the Inventory
+        // listing, so its timeout is the one that bounds the listing; a change that widened it
+        // back toward the client's general timeout would undo the ticket.
+        assert!(
+            USAGE_TIMEOUT <= Duration::from_secs(5),
+            "the usage check waits {USAGE_TIMEOUT:?}"
+        );
     }
 
     #[test]
