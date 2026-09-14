@@ -11,7 +11,16 @@ go at the top of the ticket file under a heading of their own.
 
 ## 1. Ground yourself before asking anything
 
-Read the decision records: the index in the decisions directory (`docs/decisions/README.md`
+Before anything else, check that this repository is loop-managed: it must have the settings file
+and the ticket file. The settings file is `.loop.toml` at the repository root; the ticket file is
+the one `scripts/loop-config.sh backlog` names (`BACKLOG.md` by default). When either is missing,
+stop before any other question and ask the owner where the artifacts belong — this repository, a
+new one, or a sibling of it — and where the settings file should live, because nothing below can
+run until they exist. Do not infer either from the code: a repository with neither is not an
+invitation to guess, and a session that guesses spends its rounds working out what one question
+would have settled.
+
+Then read the decision records: the index in the decisions directory (`docs/decisions/README.md`
 by default) and every record that touches the idea. A decision that has a record is settled;
 never ask about it, cite it by number. Then read the product backlog (every epic that
 touches the idea), the ticket file (the protocol and the tickets in the sections the idea
