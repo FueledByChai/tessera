@@ -67,7 +67,11 @@ dialog carrying that row — asset class, model, every value, and the name as "<
 with the text selected — so a new version is one click away. The dialog's fields follow the
 chosen model: name and asset class always; entry and exit basis points for all-in; tick size,
 entry and exit slippage ticks, entry and exit commission per unit, and minimum commission for
-fixed tick + per unit; nothing more for costs off. Switching model and back keeps what was
+fixed tick + per unit; nothing more for costs off. Its foot carries a line pricing the
+assumption — "A $100,000 round trip at $100.00/share costs about $30.00 (3.00 bps)" —
+recomputed on every change, with the reference price editable (default 100) beside it for
+fixed tick only: all-in basis points prices itself from its bps and costs off reads "No
+modeled cost." Switching model and back keeps what was
 typed, a name the library already holds disables Save with the reason beside it, and a save
 the service refuses is reported above the buttons with the dialog open and every field
 intact. The

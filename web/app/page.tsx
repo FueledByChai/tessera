@@ -4614,6 +4614,31 @@ const costCell = (profile: CostProfile, value: number | null) => {
   return profile.model === "all_in_bps" ? `${value.toFixed(2)} bps` : `$${value.toFixed(4)}`;
 };
 const costMoney = (value: number) => `$${value.toFixed(2)}`;
+/** The notional every price line quotes (UI-14): one round trip of this many dollars, so a
+ *  basis-point figure and a ticks-and-commission figure can be told apart. */
+const COST_NOTIONAL = 100000;
+const COST_NOTIONAL_TEXT = `$${COST_NOTIONAL.toLocaleString("en-US")}`;
+/** What the assumption costs, as the line at the foot of the dialog (UI-14). Shares are the
+ *  notional over the reference price, which only fixed tick needs — basis points price
+ *  themselves — and a side pays the greater of the minimum commission and shares times its
+ *  per-unit commission, plus its slippage in ticks at the tick size. */
+const costPreview = (draft: CostDraft, reference: string) => {
+  if (draft.model === "none") return "No modeled cost.";
+  if (draft.model === "all_in_bps") {
+    const bps = costNumber(draft.entry_bps) + costNumber(draft.exit_bps);
+    return `A ${COST_NOTIONAL_TEXT} round trip costs about ${costMoney((COST_NOTIONAL * bps) / 10000)} (${bps.toFixed(2)} bps)`;
+  }
+  const price = costNumber(reference, 100);
+  const shares = price > 0 ? COST_NOTIONAL / price : 0;
+  const minimum = costNumber(draft.minimum_commission);
+  const tickSize = costNumber(draft.tick_size, 0.01);
+  const side = (perUnit: string, ticks: string) =>
+    Math.max(minimum, shares * costNumber(perUnit)) + shares * costNumber(ticks) * tickSize;
+  const total =
+    side(draft.entry_commission_per_unit, draft.entry_slippage_ticks) +
+    side(draft.exit_commission_per_unit, draft.exit_slippage_ticks);
+  return `A ${COST_NOTIONAL_TEXT} round trip at ${costMoney(price)}/share costs about ${costMoney(total)} (${((total / COST_NOTIONAL) * 10000).toFixed(2)} bps)`;
+};
 /** What a row sorts by: the cell as it reads, with a dash as the least value there is. */
 const costSortValue = (profile: CostProfile, key: string): string | number | null => {
   switch (key) {
@@ -4670,6 +4695,8 @@ function CostsWorkspace({
 }) {
   const [draft, setDraft] = useState<CostDraft>(EMPTY_COST_DRAFT);
   const [refused, setRefused] = useState("");
+  /** The price the line quotes a share at (UI-14): only fixed tick needs one. */
+  const [reference, setReference] = useState("100");
   /** The table's sort (UI-13): null is the order the API returned, built-in first then newest. */
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
@@ -4923,6 +4950,22 @@ function CostsWorkspace({
                 </div>
               </div>
             ) : null}
+          </div>
+          <div className="cost-dialog-price-row">
+            {draft.model === "fixed_tick_per_unit" ? (
+              <label className="cost-dialog-reference" data-field="reference_price">
+                Reference price
+                <input
+                  name="reference_price"
+                  type="number"
+                  step="0.01"
+                  min="0"
+                  value={reference}
+                  onChange={(event) => setReference(event.target.value)}
+                />
+              </label>
+            ) : null}
+            <p className="cost-dialog-price">{costPreview(draft, reference)}</p>
           </div>
           {refused ? (
             <p className="cost-dialog-error" role="alert">
