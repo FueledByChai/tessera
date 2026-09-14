@@ -70,6 +70,25 @@ const TYPED = {
   all_in_bps: { entry_bps: "7.5", exit_bps: "2.5" },
   fixed_tick_per_unit: { tick_size: "0.25", entry_slippage_ticks: "3" },
 };
+/** The assumption the price line is read against (UI-14): one adverse tick each side at a
+ *  $0.01 tick, $0.005 a share each side, no minimum. 1000 shares at $100 is $5 of commission
+ *  and $10 of slippage a side, so $30 round trip, which is 3.00 bps of $100,000. */
+const PRICED = {
+  tick_size: "0.01",
+  entry_slippage_ticks: "1",
+  exit_slippage_ticks: "1",
+  entry_commission_per_unit: "0.005",
+  exit_commission_per_unit: "0.005",
+  minimum_commission: "0",
+};
+/** The line each case has to read. A $100,000 round trip is the notional throughout. */
+const PRICE = {
+  at100: "A $100,000 round trip at $100.00/share costs about $30.00 (3.00 bps)",
+  at50: "A $100,000 round trip at $50.00/share costs about $60.00 (6.00 bps)",
+  minimum: "A $100,000 round trip at $100.00/share costs about $60.00 (6.00 bps)",
+  allIn: "A $100,000 round trip costs about $100.00 (10.00 bps)",
+  off: "No modeled cost.",
+};
 
 const runtime = await resolveChromium();
 if (!runtime) {
@@ -165,6 +184,12 @@ async function chooseModel(page, value) {
   await page.locator(`${dialog} [data-field="model"] select`).first().selectOption(value);
   await page.waitForTimeout(120);
 }
+/** The dialog's price line, as it reads (UI-14). */
+const priceLine = (page) =>
+  page.evaluate((sel) => (document.querySelector(`${sel} .cost-dialog-price`)?.textContent ?? "").trim(), dialog);
+/** Whether the dialog offers a reference price at all: only fixed tick needs one. */
+const hasReference = (page) =>
+  page.evaluate((sel) => Boolean(document.querySelector(`${sel} [data-field="reference_price"]`)), dialog);
 
 const upstream = (await reachable(consoleOrigin)) ? consoleOrigin : null;
 const served = await serveDist(distDir, upstream, fixtureApi);
@@ -395,6 +420,44 @@ try {
         after = await page.locator(".costs-table tbody tr").count();
       }
       if (after !== expected) fail(`after Save the table shows ${after} row(s), not ${expected}`);
+
+      // 8. The dialog prices the assumption it is defining (UI-14).
+      await page.locator(".cost-dialog-open").first().click();
+      await page.locator(dialog).waitFor({ timeout: 10000 });
+      await chooseModel(page, "fixed_tick_per_unit");
+      for (const [field, value] of Object.entries(PRICED)) await fill(page, field, value);
+      let line = "";
+      if (!(await hasReference(page))) fail("fixed tick + per unit offers no reference price to edit");
+      else {
+        await fill(page, "reference_price", "100");
+        await page.waitForTimeout(150);
+        line = await priceLine(page);
+        if (!line) fail("the dialog shows no price line");
+        else if (line !== PRICE.at100) fail(`at $100.00/share the line reads ${JSON.stringify(line)}, not ${JSON.stringify(PRICE.at100)}`);
+        await fill(page, "reference_price", "50");
+        await page.waitForTimeout(150);
+        line = await priceLine(page);
+        if (line !== PRICE.at50) fail(`at $50.00/share the line reads ${JSON.stringify(line)}, not ${JSON.stringify(PRICE.at50)}`);
+        // A minimum above what the shares would pay is the figure the line uses.
+        await fill(page, "reference_price", "100");
+        await fill(page, "minimum_commission", "20");
+        await page.waitForTimeout(150);
+        line = await priceLine(page);
+        if (line !== PRICE.minimum) fail(`with a $20 minimum the line reads ${JSON.stringify(line)}, not ${JSON.stringify(PRICE.minimum)}`);
+      }
+      // All-in basis points needs no price at all, so the control is not rendered for it.
+      await chooseModel(page, "all_in_bps");
+      await fill(page, "entry_bps", "5");
+      await fill(page, "exit_bps", "5");
+      await page.waitForTimeout(150);
+      line = await priceLine(page);
+      if (line !== PRICE.allIn) fail(`all-in at 5 and 5 the line reads ${JSON.stringify(line)}, not ${JSON.stringify(PRICE.allIn)}`);
+      if (await hasReference(page)) fail("all-in basis points still offers a reference price it does not use");
+      await chooseModel(page, "none");
+      await page.waitForTimeout(150);
+      line = await priceLine(page);
+      if (line !== PRICE.off) fail(`costs off the line reads ${JSON.stringify(line)}, not ${JSON.stringify(PRICE.off)}`);
+      if (await hasReference(page)) fail("costs off still offers a reference price it does not use");
       for (const error of errors) fail(`console error: ${error.split("\n")[0]}`);
     } catch (error) {
       fail(String(error).split("\n")[0]);
@@ -440,5 +503,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `costs-check: ok (web/fixtures/cost-profiles.json with ${profiles.length} profiles, terminal and modern; ${MODELS.map((m) => m.fields.length).join("/")} fields per model, ${DUPLICATE} refused before sending, ${REFUSED} answered 400 and rendered above the buttons with the fields kept, ${FRESH} saved; ${COLUMNS.length} sortable columns over ${profiles.length} rows with the id as the NAME tooltip, NAME and ROUND TRIP reversed on a second click, ${JSON.stringify(duplicated.name)} duplicated as "${duplicated.name} copy", an empty library keeping New profile; ${posted.length} profile(s) posted, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `costs-check: ok (web/fixtures/cost-profiles.json with ${profiles.length} profiles, terminal and modern; ${MODELS.map((m) => m.fields.length).join("/")} fields per model, ${DUPLICATE} refused before sending, ${REFUSED} answered 400 and rendered above the buttons with the fields kept, ${FRESH} saved; ${COLUMNS.length} sortable columns over ${profiles.length} rows with the id as the NAME tooltip, NAME and ROUND TRIP reversed on a second click, ${JSON.stringify(duplicated.name)} duplicated as "${duplicated.name} copy", an empty library keeping New profile; the line pricing 1 tick and $0.005 a share at $100.00 as ${JSON.stringify(PRICE.at100)}, at $50.00 as ${JSON.stringify(PRICE.at50)}, over a $20 minimum as ${JSON.stringify(PRICE.minimum)}, all-in at 5 and 5 as ${JSON.stringify(PRICE.allIn)}, and costs off as ${JSON.stringify(PRICE.off)}; ${posted.length} profile(s) posted, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );
