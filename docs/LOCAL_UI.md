@@ -54,7 +54,9 @@ The seeded cost profiles are:
 - Crypto spot: 10 bps all-in round trip.
 - Costs off: zero modeled execution cost for gross-alpha diagnostics.
 
-Custom profiles are append-only. The current fixed-tick strategy adapters require symmetric entry/exit tick and per-unit assumptions and do not yet support a minimum commission; all-in basis-point profiles may store different entry and exit estimates because the engines consume their exact sum.
+Custom profiles are append-only, and no two carry the same name (the service refuses a
+second profile under a name the library already holds, compared case-insensitively). The
+current fixed-tick strategy adapters require symmetric entry/exit tick and per-unit assumptions and do not yet support a minimum commission; all-in basis-point profiles may store different entry and exit estimates because the engines consume their exact sum.
 
 ## One-file strategies (Strategy SDK)
 

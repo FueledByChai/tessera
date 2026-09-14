@@ -1436,6 +1436,19 @@ fn validate_cost_profile_request(request: &CreateCostProfileRequest) -> Result<(
     Ok(())
 }
 
+/// Whether the library already holds a profile under this name (UI-11). The name is compared
+/// trimmed and case-insensitively, so "  us equities · CONSERVATIVE " is the name "US
+/// equities · conservative" already holds. Profiles are write-once, so a name is taken for
+/// good: a new version of an assumption is a new name, not a reuse of the old one.
+fn cost_profile_name_taken(connection: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM cost_profiles WHERE lower(trim(name)) = lower(trim(?1))",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn map_cost_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<CostProfileRecord> {
     Ok(CostProfileRecord {
         id: row.get(0)?,
@@ -3777,10 +3790,19 @@ async fn create_cost_profile(
     Json(request): Json<CreateCostProfileRequest>,
 ) -> Result<(StatusCode, Json<CostProfileRecord>), ApiError> {
     validate_cost_profile_request(&request)?;
+    let name = request.name.trim().to_owned();
     let now = Utc::now();
     let id = format!("cost-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
     {
         let connection = state.database.lock().expect("database lock poisoned");
+        // UI-11: one name, one profile. The check and the insert share one lock, so two
+        // callers racing for a name cannot both pass it.
+        if cost_profile_name_taken(&connection, &name)? {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "a cost profile with that name already exists",
+            ));
+        }
         connection.execute(
             "INSERT INTO cost_profiles
              (id, name, asset_class, model, entry_bps, exit_bps, tick_size,
@@ -3789,7 +3811,7 @@ async fn create_cost_profile(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, 1)",
             params![
                 id,
-                request.name.trim(),
+                name,
                 request.asset_class,
                 request.model,
                 request.entry_bps,
@@ -10487,6 +10509,116 @@ mod tests {
             .unwrap();
         assert_eq!(status, "scored 0, skipped 1");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// UI-11: a cost profile's name is unique. The second profile to claim a name the library
+    /// already holds is refused in any case and with any surrounding space, writes nothing,
+    /// and says why; a third under a new name is still created.
+    #[tokio::test]
+    async fn a_second_cost_profile_cannot_take_a_name_already_used() {
+        let state = AppState {
+            root: std::env::temp_dir(),
+            local: Arc::new(LocalConfig::bundled_example(Path::new(env!(
+                "CARGO_MANIFEST_DIR"
+            )))),
+            database: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            workers: Arc::new(Semaphore::new(1)),
+            instruments: Arc::new(Mutex::new(None)),
+            sdk_manifests: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            data_sources: Arc::new(Mutex::new(None)),
+            eodhd_base_url: Arc::new(String::new()),
+            scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            dataset_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        };
+        migrate(&state.database.lock().unwrap()).unwrap();
+        let request = |name: &str| CreateCostProfileRequest {
+            name: name.to_owned(),
+            asset_class: "US equities".to_owned(),
+            model: "all_in_bps".to_owned(),
+            entry_bps: 5.0,
+            exit_bps: 5.0,
+            tick_size: 0.01,
+            entry_slippage_ticks: 0,
+            exit_slippage_ticks: 0,
+            entry_commission_per_unit: 0.0,
+            exit_commission_per_unit: 0.0,
+            minimum_commission: 0.0,
+        };
+        let count = || -> i64 {
+            state
+                .database
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM cost_profiles", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        let created = create_cost_profile(
+            State(state.clone()),
+            Json(request("US equities · conservative")),
+        )
+        .await
+        .expect("the first profile under a name is created");
+        assert_eq!(created.0, StatusCode::CREATED);
+        assert_eq!(count(), 1);
+
+        let duplicate = create_cost_profile(
+            State(state.clone()),
+            Json(request("  us equities · CONSERVATIVE  ")),
+        )
+        .await
+        .expect_err("a name the library already holds is refused");
+        assert_eq!(duplicate.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            duplicate.1.to_string(),
+            "a cost profile with that name already exists"
+        );
+        assert_eq!(count(), 1, "the refused post wrote no row");
+
+        let renamed = create_cost_profile(
+            State(state.clone()),
+            Json(request("US equities · aggressive")),
+        )
+        .await
+        .expect("a name the library does not hold is created");
+        assert_eq!(renamed.0, StatusCode::CREATED);
+        assert_eq!(count(), 2);
+    }
+
+    /// UI-11: the bounds a cost profile has always been held to still hold — an empty name, an
+    /// asset class the console does not offer, and 501 bps a side are each refused.
+    #[test]
+    fn cost_profile_validation_keeps_the_bounds_it_always_had() {
+        let request = |name: &str, asset_class: &str, entry_bps: f64| CreateCostProfileRequest {
+            name: name.to_owned(),
+            asset_class: asset_class.to_owned(),
+            model: "all_in_bps".to_owned(),
+            entry_bps,
+            exit_bps: 5.0,
+            tick_size: 0.01,
+            entry_slippage_ticks: 0,
+            exit_slippage_ticks: 0,
+            entry_commission_per_unit: 0.0,
+            exit_commission_per_unit: 0.0,
+            minimum_commission: 0.0,
+        };
+        assert!(validate_cost_profile_request(&request("   ", "US equities", 5.0)).is_err());
+        assert!(
+            validate_cost_profile_request(&request("US equities · conservative", "US bonds", 5.0))
+                .is_err()
+        );
+        assert!(
+            validate_cost_profile_request(&request("US equities · wild", "US equities", 501.0))
+                .is_err()
+        );
+        assert!(
+            validate_cost_profile_request(&request(
+                "US equities · conservative",
+                "US equities",
+                5.0
+            ))
+            .is_ok()
+        );
     }
 
     /// WB-15: a fresh catalog starts with the vol feature set; a second start adds nothing,
