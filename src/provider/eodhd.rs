@@ -24,10 +24,11 @@ use super::{
 /// Where the public API lives; a stub server replaces it in tests.
 pub const DEFAULT_BASE_URL: &str = "https://eodhd.com";
 
-/// Bar resolutions, in the engine's names, that every EODHD exchange offers.
-const COMMON_RESOLUTIONS: [&str; 3] = ["daily", "1h", "5m"];
-/// Exchanges with 1-minute intraday history as well.
-const ONE_MINUTE_EXCHANGES: [&str; 3] = ["US", "FOREX", "CC"];
+/// The bar resolutions the exchanges list can be asked about, in the engine's names. The list
+/// endpoint says nothing about intraday coverage, so this is not a per-exchange claim: every
+/// exchange claims the same set, and which of them the account really gets is what the service's
+/// probe settles before the panel shows them (DS-12).
+const CLAIMED_RESOLUTIONS: [&str; 4] = ["daily", "1h", "5m", "1m"];
 
 /// The intraday intervals EODHD serves, by the engine's resolution name, with the longest
 /// span in days one request may cover (the API's own limits: 120 days of 1-minute bars,
@@ -150,13 +151,14 @@ fn scrub(text: &str, token: &str) -> String {
     }
 }
 
-/// The resolutions EODHD offers on `exchange`, in the engine's names.
-fn resolutions_for(exchange: &str) -> Vec<String> {
-    let mut out: Vec<String> = COMMON_RESOLUTIONS.iter().map(|s| (*s).to_owned()).collect();
-    if ONE_MINUTE_EXCHANGES.contains(&exchange) {
-        out.push("1m".to_owned());
-    }
-    out
+/// The resolutions the exchanges list claims for an exchange, in the engine's names. Every
+/// exchange claims the same set — see [`CLAIMED_RESOLUTIONS`]; the service probes what an
+/// account actually has and stores that instead (DS-12).
+fn resolutions_for() -> Vec<String> {
+    CLAIMED_RESOLUTIONS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -199,7 +201,7 @@ struct ExchangeRow {
 
 impl From<ExchangeRow> for Exchange {
     fn from(row: ExchangeRow) -> Self {
-        let resolutions = resolutions_for(&row.code);
+        let resolutions = resolutions_for();
         Exchange {
             code: row.code,
             name: row.name,
@@ -541,11 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn one_minute_history_is_the_us_forex_and_crypto_exchanges() {
-        assert_eq!(resolutions_for("US"), ["daily", "1h", "5m", "1m"]);
-        assert_eq!(resolutions_for("FOREX"), ["daily", "1h", "5m", "1m"]);
-        assert_eq!(resolutions_for("CC"), ["daily", "1h", "5m", "1m"]);
-        assert_eq!(resolutions_for("LSE"), ["daily", "1h", "5m"]);
+    fn every_exchange_claims_the_same_resolutions_until_the_service_probes_them() {
+        // DS-12: the exchanges list says nothing about intraday coverage, so the adapter makes
+        // no per-exchange guess; the service probes what the account actually gets and stores
+        // that. Every exchange claims the same set here.
+        assert_eq!(resolutions_for(), ["daily", "1h", "5m", "1m"]);
     }
 
     #[test]

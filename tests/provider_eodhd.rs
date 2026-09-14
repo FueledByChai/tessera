@@ -300,8 +300,16 @@ async fn exchanges_and_symbols_parse_the_recorded_lists() {
         (lse.name.as_str(), lse.country.as_str()),
         ("London Exchange", "UK")
     );
-    assert_eq!(lse.resolutions, ["daily", "1h", "5m"]);
-    assert_eq!(exchanges[3].resolutions, ["daily", "1h", "5m", "1m"]);
+    // DS-12: the exchanges list makes no per-exchange guess about intraday coverage, so every
+    // exchange claims the same set; the service probes what an account actually gets.
+    for exchange in &exchanges {
+        assert_eq!(
+            exchange.resolutions,
+            ["daily", "1h", "5m", "1m"],
+            "{}",
+            exchange.code
+        );
+    }
 
     let listings = provider.symbols("US", false).await.unwrap();
     assert_eq!(listings.len(), 3);

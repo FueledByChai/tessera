@@ -1034,6 +1034,7 @@ fn migrate(connection: &Connection) -> Result<()> {
              country TEXT NOT NULL,
              resolutions TEXT NOT NULL,
              fetched_at TEXT NOT NULL,
+             resolutions_probed_at TEXT,
              PRIMARY KEY (source_id, code)
          );
          CREATE TABLE IF NOT EXISTS provider_listings (
@@ -1194,6 +1195,15 @@ fn migrate(connection: &Connection) -> Result<()> {
     ensure_column(connection, "feature_presets", "promoted_horizon", "INTEGER")?;
     ensure_column(connection, "feature_presets", "promoted_target", "TEXT")?;
     ensure_column(connection, "feature_presets", "baseline_ic", "REAL")?;
+    // DS-12: when an exchange row's resolutions were last probed against the provider. Null
+    // means the row still carries only the exchanges list's claim, so expanding it — or adding
+    // a dataset against it — probes each intraday resolution once and records what came back.
+    ensure_column(
+        connection,
+        "provider_exchanges",
+        "resolutions_probed_at",
+        "TEXT",
+    )?;
     connection.execute_batch("PRAGMA optimize;")?;
     Ok(())
 }
@@ -5283,6 +5293,9 @@ struct AvailableExchange {
     name: String,
     country: String,
     resolutions: Vec<String>,
+    /// When the resolutions were probed against the provider (DS-12); `None` while the row
+    /// still carries only the exchanges list's claim.
+    resolutions_probed_at: Option<String>,
     fetched_at: String,
     /// When the exchange's listing was fetched; `None` until it has been.
     listings_fetched_at: Option<String>,
@@ -5306,13 +5319,28 @@ struct AvailabilityResponse {
     exchanges: Vec<AvailableExchange>,
 }
 
-/// Replaces the source's exchange rows with `exchanges`, all stamped `fetched_at`.
+/// Replaces the source's exchange rows with `exchanges`, all stamped `fetched_at`. A row the
+/// resolution probe has already settled keeps the resolutions it found and its probe time, so
+/// re-fetching the exchanges list never puts back a resolution the account does not have (DS-12).
 fn store_exchanges(
     connection: &mut Connection,
     source_id: &str,
     exchanges: &[tessera::provider::Exchange],
     fetched_at: &str,
 ) -> Result<()> {
+    let probed: std::collections::HashMap<String, (String, String)> = {
+        let mut statement = connection.prepare(
+            "SELECT code, resolutions, resolutions_probed_at FROM provider_exchanges
+             WHERE source_id = ?1 AND resolutions_probed_at IS NOT NULL",
+        )?;
+        let rows = statement.query_map([source_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
     let tx = connection.transaction()?;
     tx.execute(
         "DELETE FROM provider_exchanges WHERE source_id = ?1",
@@ -5321,17 +5349,22 @@ fn store_exchanges(
     {
         let mut insert = tx.prepare(
             "INSERT OR REPLACE INTO provider_exchanges
-             (source_id, code, name, country, resolutions, fetched_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (source_id, code, name, country, resolutions, fetched_at, resolutions_probed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for exchange in exchanges {
+            let (resolutions, resolutions_probed_at) = match probed.get(&exchange.code) {
+                Some((found, at)) => (found.clone(), Some(at.clone())),
+                None => (serde_json::to_string(&exchange.resolutions)?, None),
+            };
             insert.execute(params![
                 source_id,
                 exchange.code,
                 exchange.name,
                 exchange.country,
-                serde_json::to_string(&exchange.resolutions)?,
-                fetched_at
+                resolutions,
+                fetched_at,
+                resolutions_probed_at
             ])?;
         }
     }
@@ -5339,6 +5372,108 @@ fn store_exchanges(
     Ok(())
 }
 
+/// The intraday resolutions an exchange row's claim is probed at, in the engine's names. Daily
+/// is never probed: it is the one resolution the exchanges list settles on its own.
+const PROBED_RESOLUTIONS: [&str; 3] = ["1m", "5m", "1h"];
+
+/// How far back a probe asks for bars. A few sessions are enough to tell an interval the account
+/// has from one it does not, and the window costs one request per resolution either way.
+const PROBE_WINDOW_DAYS: i64 = 7;
+
+/// Probes each intraday resolution of `exchange` once and records what the provider actually
+/// served on the row (DS-12), so the availability panel stops showing resolutions the account
+/// may not have. `symbols` are the exchange's listed symbols and the probe asks about the first
+/// of them. One request per resolution, charged to the source's budget (DS-07); a resolution the
+/// provider serves nothing for comes off the row, while a refusal or a transport failure says
+/// nothing about coverage and leaves the claim alone. A row already probed is left untouched, so
+/// expanding the exchange a second time makes no call.
+async fn probe_exchange_resolutions(
+    state: &AppState,
+    adapter: &SourceAdapter,
+    source_id: &str,
+    exchange: &str,
+    symbols: &[String],
+) -> Result<()> {
+    let Some(code) = symbols.first() else {
+        return Ok(()); // nothing listed on the exchange to probe with
+    };
+    // Listings carry the bare code; the provider's full symbol form is `<code>.<exchange>`.
+    let symbol = format!("{code}.{exchange}");
+    let claimed: Vec<String> = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        let row: Option<(String, Option<String>)> = connection
+            .query_row(
+                "SELECT resolutions, resolutions_probed_at FROM provider_exchanges
+                 WHERE source_id = ?1 AND code = ?2",
+                params![source_id, exchange],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((resolutions, probed_at)) = row else {
+            return Ok(());
+        };
+        if probed_at.is_some() {
+            return Ok(()); // already probed: the second expansion costs nothing
+        }
+        serde_json::from_str(&resolutions).unwrap_or_default()
+    };
+    let wanted: Vec<String> = claimed
+        .iter()
+        .filter(|name| PROBED_RESOLUTIONS.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    // Charge the probes to the source's budget before making them (DS-07): a probe that would
+    // eat into the reserve is left for the next run rather than made.
+    let source = match load_source_row(state, source_id) {
+        Ok(Some(source)) => source,
+        // A source that vanished under the refresh is the caller's to report, not the probe's.
+        _ => return Ok(()),
+    };
+    if let Some(mut budget) = budget_of(&source) {
+        let cost =
+            tessera::provider::budget::INTRADAY_CALL_COST.saturating_mul(wanted.len() as u64);
+        if budget.can_start(cost).is_err() {
+            return Ok(());
+        }
+        budget.charge(cost);
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection.execute(
+            "UPDATE data_sources SET requests_today = ?2 WHERE id = ?1",
+            params![source_id, budget.used],
+        )?;
+    }
+    let to = Utc::now();
+    let from = to - chrono::Duration::days(PROBE_WINDOW_DAYS);
+    // Kept in the order the exchanges list claimed, so the panel reads the same way; only the
+    // probed ones can come off.
+    let mut served: Vec<String> = Vec::new();
+    for resolution in &claimed {
+        if !PROBED_RESOLUTIONS.contains(&resolution.as_str()) {
+            served.push(resolution.clone());
+            continue;
+        }
+        match adapter.intraday(&symbol, resolution, from, to).await {
+            Ok(bars) if bars.is_empty() => {} // the account has no bars here: drop the claim
+            Ok(_) => served.push(resolution.clone()),
+            Err(_) => served.push(resolution.clone()),
+        }
+    }
+    let connection = state.database.lock().expect("database lock poisoned");
+    connection.execute(
+        "UPDATE provider_exchanges SET resolutions = ?3, resolutions_probed_at = ?4
+         WHERE source_id = ?1 AND code = ?2",
+        params![
+            source_id,
+            exchange,
+            serde_json::to_string(&served)?,
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
 /// Replaces the source's cached listing of `exchange` (the active or the delisted one) with
 /// `listings`, all stamped `fetched_at`.
 fn store_listings(
@@ -5467,8 +5602,8 @@ fn load_availability(connection: &Connection, source_id: &str) -> Result<Availab
     }
 
     let mut statement = connection.prepare(
-        "SELECT code, name, country, resolutions, fetched_at FROM provider_exchanges
-         WHERE source_id = ?1 ORDER BY code",
+        "SELECT code, name, country, resolutions, resolutions_probed_at, fetched_at
+         FROM provider_exchanges WHERE source_id = ?1 ORDER BY code",
     )?;
     let rows = statement
         .query_map([source_id], |row| {
@@ -5477,33 +5612,37 @@ fn load_availability(connection: &Connection, source_id: &str) -> Result<Availab
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut fetched_at: Option<String> = None;
     let exchanges = rows
         .into_iter()
-        .map(|(code, name, country, resolutions, fetched)| {
-            fetched_at.get_or_insert_with(|| fetched.clone());
-            let (listings_fetched_at, listed, types) =
-                listings.remove(&code).unwrap_or((None, 0, Vec::new()));
-            let (delisted_fetched_at, delisted) = delisted_listings
-                .remove(&code)
-                .map_or((None, 0), |(at, count)| (Some(at), count));
-            AvailableExchange {
-                resolutions: serde_json::from_str(&resolutions).unwrap_or_default(),
-                code,
-                name,
-                country,
-                fetched_at: fetched,
-                listings_fetched_at,
-                listed,
-                types,
-                delisted_fetched_at,
-                delisted,
-            }
-        })
+        .map(
+            |(code, name, country, resolutions, resolutions_probed_at, fetched)| {
+                fetched_at.get_or_insert_with(|| fetched.clone());
+                let (listings_fetched_at, listed, types) =
+                    listings.remove(&code).unwrap_or((None, 0, Vec::new()));
+                let (delisted_fetched_at, delisted) = delisted_listings
+                    .remove(&code)
+                    .map_or((None, 0), |(at, count)| (Some(at), count));
+                AvailableExchange {
+                    resolutions: serde_json::from_str(&resolutions).unwrap_or_default(),
+                    resolutions_probed_at,
+                    code,
+                    name,
+                    country,
+                    fetched_at: fetched,
+                    listings_fetched_at,
+                    listed,
+                    types,
+                    delisted_fetched_at,
+                    delisted,
+                }
+            },
+        )
         .collect();
     Ok(AvailabilityResponse {
         source_id: source_id.to_owned(),
@@ -5582,6 +5721,8 @@ async fn refresh_availability(
     }
 
     let mut failure: Option<String> = None;
+    // The first listed symbol of each exchange whose listings came back, for the DS-12 probe.
+    let mut probe_with: Vec<(String, String)> = Vec::new();
     'exchanges: for (code, with_delisted) in wanted {
         let lists: &[bool] = if with_delisted {
             &[false, true]
@@ -5591,6 +5732,11 @@ async fn refresh_availability(
         for &delisted in lists {
             match adapter.symbols(&code, delisted).await {
                 Ok(listings) => {
+                    if !delisted {
+                        if let Some(first) = listings.first() {
+                            probe_with.push((code.clone(), first.code.clone()));
+                        }
+                    }
                     let worker = state.clone();
                     let source_id = id.clone();
                     let stamp = attempted_at.clone();
@@ -5620,6 +5766,13 @@ async fn refresh_availability(
                 }
             }
         }
+    }
+    // DS-12: the exchanges list claims every intraday resolution for every exchange, so probe
+    // the ones this refresh touched and record what the provider actually served. An exchange
+    // already probed makes no call, so expanding it again is free.
+    for (code, symbol) in &probe_with {
+        probe_exchange_resolutions(&state, &adapter, &id, code, std::slice::from_ref(symbol))
+            .await?;
     }
     let worker = state.clone();
     let response = tokio::task::spawn_blocking(move || {
@@ -6323,6 +6476,24 @@ async fn create_dataset(
         _ => Path::new(&row.root).join(default_dataset_folder(&resolution)),
     };
     let folder = folder.display().to_string();
+
+    // DS-12: adding a dataset against an exchange is the other moment its claim is settled, so
+    // probe the resolutions the exchanges list claimed before checking the one being added.
+    {
+        let symbols: Vec<String> = {
+            let connection = state.database.lock().expect("database lock poisoned");
+            let mut statement = connection.prepare(
+                "SELECT code FROM provider_listings
+                 WHERE source_id = ?1 AND exchange = ?2 AND delisted = 0 ORDER BY code LIMIT 1",
+            )?;
+            let rows = statement.query_map(params![id, exchange], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !symbols.is_empty() {
+            let adapter = SourceAdapter::from_file(&state, &row)?;
+            probe_exchange_resolutions(&state, &adapter, &id, &exchange, &symbols).await?;
+        }
+    }
 
     let now = Utc::now();
     let dataset_id = format!("dataset-{}", now.format("%Y%m%dT%H%M%S%.6fZ"));
@@ -10689,6 +10860,8 @@ mod tests {
         #[derive(Clone)]
         struct Stub {
             down: Arc<AtomicBool>,
+            /// DS-12: how many intraday probes the stub has answered.
+            intraday_calls: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         /// The stub's refusals before any fixture is served: 503 while it is down, 401 for a
@@ -10781,6 +10954,33 @@ mod tests {
             }
         }
 
+        /// The DS-12 probe endpoint: LSE's `VOD.LSE` serves 5m bars and nothing at 1m or 1h, so
+        /// a probe of it keeps 5m and takes the others off the row; every other symbol answers a
+        /// row at every interval. Each call is counted.
+        async fn stub_intraday(
+            State(stub): State<Stub>,
+            AxumPath(symbol): AxumPath<String>,
+            AxumQuery(query): AxumQuery<Vec<(String, String)>>,
+        ) -> Response {
+            if let Some(refused) = gate(&stub, &query) {
+                return refused;
+            }
+            stub.intraday_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let interval = query
+                .iter()
+                .find(|(k, _)| k == "interval")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default();
+            let body = if symbol == "VOD.LSE" && interval != "5m" {
+                "[]".to_owned()
+            } else {
+                r#"[{"timestamp":1700000000,"gmtoffset":0,"datetime":"2026-01-02 09:30:00","open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":100}]"#
+                    .to_owned()
+            };
+            json_response(StatusCode::OK, body)
+        }
+
         async fn serve(router: Router) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -10789,15 +10989,21 @@ mod tests {
         }
 
         /// The DS-02 stub's `/api/user`, `/api/exchanges-list/`, and
-        /// `/api/exchange-symbol-list/{code}`, with a switch that makes every route answer 503.
-        async fn stub() -> (String, Arc<AtomicBool>) {
+        /// `/api/exchange-symbol-list/{code}`, plus the DS-12 intraday probe, with a switch that
+        /// makes every route answer 503. The third value counts the intraday calls it answered.
+        async fn stub() -> (String, Arc<AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
             let down = Arc::new(AtomicBool::new(false));
+            let intraday_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let router = Router::new()
                 .route("/api/user", get(stub_user))
                 .route("/api/exchanges-list/", get(stub_exchanges))
                 .route("/api/exchange-symbol-list/{exchange}", get(stub_symbols))
-                .with_state(Stub { down: down.clone() });
-            (serve(router).await, down)
+                .route("/api/intraday/{symbol}", get(stub_intraday))
+                .with_state(Stub {
+                    down: down.clone(),
+                    intraday_calls: intraday_calls.clone(),
+                });
+            (serve(router).await, down, intraday_calls)
         }
 
         /// A service over an in-memory catalog, a scratch root, and the stub as EODHD.
@@ -10818,6 +11024,82 @@ mod tests {
                 scans: Arc::new(Mutex::new(std::collections::HashSet::new())),
                 dataset_jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             }
+        }
+
+        /// DS-12: the exchanges list claims every intraday resolution for every exchange, so
+        /// expanding one probes each of them once and keeps only what the provider served; a
+        /// second expansion makes no further call.
+        #[tokio::test]
+        async fn expanding_an_exchange_probes_its_resolutions_once() {
+            let root = scratch_root("ds12-resolutions");
+            fs::create_dir_all(&root).unwrap();
+            let library = root.join("library");
+            fs::create_dir_all(&library).unwrap();
+            let (eodhd, _down, intraday) = stub().await;
+            let state = test_state(&root, &eodhd);
+            let api = serve(api_router().with_state(state.clone())).await;
+            let client = reqwest::Client::new();
+            let (status, card, text) = call(client.post(format!("{api}/api/sources")).json(
+                &serde_json::json!({
+                    "kind": "eodhd", "name": "EODHD", "root": library,
+                    "catalog_dir": library.join("catalog"), "token": TOKEN
+                }),
+            ))
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{text}");
+            let id = card["id"].as_str().unwrap().to_owned();
+
+            // Expanding LSE: the list claims 1m, 5m, and 1h there, and the probe finds 5m only.
+            assert_eq!(intraday.load(Ordering::SeqCst), 0);
+            let (status, _, text) = call(
+                client
+                    .post(format!("{api}/api/sources/{id}/availability/refresh"))
+                    .json(&serde_json::json!({ "exchange": "LSE", "delisted": false })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            let body = client
+                .get(format!("{api}/api/sources/{id}/availability"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let availability: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let lse = availability["exchanges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["code"] == "LSE")
+                .expect("the LSE row");
+            let resolutions: Vec<&str> = lse["resolutions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+            assert!(resolutions.contains(&"5m"), "{lse}");
+            assert!(!resolutions.contains(&"1m"), "{lse}");
+            assert!(!resolutions.contains(&"1h"), "{lse}");
+            assert!(lse["resolutions_probed_at"].is_string(), "{lse}");
+            // One probe per intraday resolution: 1m, 5m, and 1h.
+            assert_eq!(intraday.load(Ordering::SeqCst), 3);
+
+            // A second expansion makes no further call: the row is settled.
+            let (status, _, text) = call(
+                client
+                    .post(format!("{api}/api/sources/{id}/availability/refresh"))
+                    .json(&serde_json::json!({ "exchange": "LSE", "delisted": false })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            assert_eq!(
+                intraday.load(Ordering::SeqCst),
+                3,
+                "the second expansion probed again"
+            );
+            let _ = fs::remove_dir_all(&root);
         }
 
         fn source_count(state: &AppState) -> i64 {
@@ -10843,7 +11125,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_registered_sources_token_and_file_stay_out_of_every_response() {
-            let (eodhd, down) = stub().await;
+            let (eodhd, down, _intraday) = stub().await;
             let root = scratch_root("service");
             let library = root.join("library");
             fs::create_dir_all(&library).unwrap();
@@ -11076,7 +11358,7 @@ mod tests {
         /// with its source.
         #[tokio::test]
         async fn the_providers_availability_is_cached_and_an_outage_keeps_the_rows() {
-            let (eodhd, down) = stub().await;
+            let (eodhd, down, _intraday) = stub().await;
             let root = scratch_root("availability");
             let library = root.join("library");
             fs::create_dir_all(&library).unwrap();
@@ -11153,7 +11435,13 @@ mod tests {
             assert!(us["delisted_fetched_at"].is_null(), "{us}");
             let lse = exchanges.iter().find(|e| e["code"] == "LSE").unwrap();
             assert_eq!(lse["country"], "UK");
-            assert_eq!(lse["resolutions"], serde_json::json!(["daily", "1h", "5m"]));
+            // DS-12: every exchange claims the same resolutions until it is expanded and probed,
+            // and this refresh named US, so LSE still carries the claim.
+            assert_eq!(
+                lse["resolutions"],
+                serde_json::json!(["daily", "1h", "5m", "1m"])
+            );
+            assert!(lse["resolutions_probed_at"].is_null(), "{lse}");
             assert_eq!(lse["listed"], 0);
             assert_eq!(lse["types"], serde_json::json!([]));
             assert!(lse["listings_fetched_at"].is_null(), "{lse}");
@@ -11920,6 +12208,7 @@ mod tests {
                     .route("/api/exchange-symbol-list/{exchange}", get(stub_symbols))
                     .with_state(Stub {
                         down: Arc::new(AtomicBool::new(false)),
+                        intraday_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     })
                     .merge(
                         Router::new()
@@ -12796,7 +13085,7 @@ mod tests {
             #[tokio::test]
             async fn datasets_are_scanned_in_the_background_and_the_figures_outlive_a_missing_folder()
              {
-                let (eodhd, down) = stub().await;
+                let (eodhd, down, _intraday) = stub().await;
                 let root = scratch_root("datasets");
                 let library = root.join("library");
                 let eod = library.join("eod");
