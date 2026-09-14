@@ -14,7 +14,13 @@
 //   5. a name the library already holds disables Save with the reason beside it;
 //   6. a POST answered 400 renders the service's message above the buttons with the dialog
 //      still open and every field holding what was typed;
-//   7. Save posts the model's fields, closes the dialog, and the new profile joins the grid.
+//   7. Save posts the model's fields, closes the dialog, and the new profile joins the table;
+// the profiles themselves are one sortable table (UI-13, decision 0024): one row per profile in
+// the order the API returned, ENTRY/EXIT/ROUND TRIP/TICK/MIN COMM in the model's own unit with
+// a dash where the model has no value, the profile id as the NAME cell's tooltip, every header
+// sorting with a second click reversing it, Duplicate opening the dialog under "<name> copy"
+// with the whole name selected, and an empty library showing the panel's empty state with New
+// profile still in its title bar.
 // Every other API path proxies to the console at LAYOUT_CONSOLE when one answers and returns
 // 503 otherwise. Needs a Playwright-compatible Chromium like the layout check; without one, or
 // without a built bundle, it reports that it skipped and exits 0.
@@ -78,6 +84,10 @@ if (!existsSync(join(distDir, "index.html"))) {
 const profiles = JSON.parse(readFileSync(fixturePath, "utf8"));
 /** Profiles the page posted, in order. */
 const posted = [];
+/** The profiles a POST created, as a later GET sees them: the service keeps them, so the
+ *  fixture does too — the console polls /api/cost-profiles every three seconds, and a poll
+ *  landing just after a save must not wipe the row the save added. */
+const created = [];
 const json = (body, status = 200) => ({ status, type: "application/json", body: JSON.stringify(body) });
 const fixtureApi = async (pathname, req) => {
   if (pathname === "/api/cost-profiles" && req.method === "POST") {
@@ -85,18 +95,17 @@ const fixtureApi = async (pathname, req) => {
     posted.push(body);
     if (String(body?.name ?? "").trim() === REFUSED) return json({ error: REFUSAL }, 400);
     const seed = profiles.find((profile) => profile.model === body.model) ?? profiles[0];
-    return json(
-      {
-        ...seed,
-        ...body,
-        id: `cost-fixture-${posted.length}`,
-        created_at: new Date().toISOString(),
-        builtin: false,
-      },
-      201,
-    );
+    const record = {
+      ...seed,
+      ...body,
+      id: `cost-fixture-${posted.length}`,
+      created_at: new Date().toISOString(),
+      builtin: false,
+    };
+    created.push(record);
+    return json(record, 201);
   }
-  if (pathname === "/api/cost-profiles") return json(profiles);
+  if (pathname === "/api/cost-profiles") return json([...created, ...profiles]);
   if (pathname === "/api/jobs") return json([]);
   if (pathname === "/api/runs") return json([]);
   if (pathname === "/api/automations") return json([]);
@@ -106,7 +115,42 @@ const fixtureApi = async (pathname, req) => {
   return null;
 };
 
+/** The nine columns that sort, in wireframe order; a tenth holds the row's Duplicate. */
+const COLUMNS = ["name", "origin", "asset_class", "model", "entry", "exit", "round_trip", "tick", "min_comm"];
+const DASH = "—";
+/** The row Duplicate is proven on: the custom profile, since every one of its values is the
+ *  desk's own rather than a zero, so a carried value cannot pass by accident. */
+const duplicated = profiles.find((profile) => !profile.builtin) ?? profiles[0];
 const dialog = "dialog.cost-dialog[open]";
+/** The profiles table: its sort keys, and per row every cell and the NAME cell's tooltip. */
+const readTable = (page) =>
+  page.evaluate(() => {
+    const wrap = document.querySelector(".costs-table");
+    if (!wrap) return null;
+    return {
+      head: [...wrap.querySelectorAll("thead th")].map((th) => th.dataset.sort ?? ""),
+      rows: [...wrap.querySelectorAll("tbody tr")].map((tr) => {
+        const cells = [...tr.querySelectorAll("td")];
+        return {
+          cells: cells.map((td) => (td.textContent ?? "").trim()),
+          title: cells[0]?.getAttribute("title") ?? null,
+        };
+      }),
+    };
+  });
+/** The values in one column, top to bottom. */
+const column = (table, index) => table.rows.map((row) => row.cells[index]);
+/** A money or basis-point cell as a number; a dash as null. */
+const asNumber = (text) => {
+  if (!text || text === DASH) return null;
+  const parsed = Number(text.replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+/** Clicks a header and lets the table settle. */
+async function sortBy(page, key) {
+  await page.locator(`.costs-table th[data-sort="${key}"]`).first().click();
+  await page.waitForTimeout(150);
+}
 /** The fields the open dialog shows, in document order. */
 const readFields = (page) =>
   page.evaluate((sel) => [...document.querySelectorAll(`${sel} .field-grid [data-field]`)].map((el) => el.dataset.field), dialog);
@@ -128,6 +172,7 @@ const browser = await runtime.chromium.launch(LAUNCH);
 const failures = [];
 try {
   for (const mode of ["terminal", "modern"]) {
+    created.length = 0; // each mode starts from the fixture's library, not the last mode's saves
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     await context.addInitScript((m) => window.localStorage.setItem("bt-display-mode", m), mode);
     const page = await context.newPage();
@@ -144,7 +189,8 @@ try {
       await page.locator(".costs-workspace").waitFor({ timeout: 15000 });
       await page.waitForTimeout(200);
 
-      // 1. No create form on the page: every form on it is inside the dialog.
+      // 1. No create form on the page: every form on it is inside the dialog, and the profiles
+      //    are one table row each rather than a grid of cards (UI-13, decision 0024).
       const onPage = await page.evaluate(() => ({
         forms: [...document.querySelectorAll(".costs-workspace form")].filter((f) => !f.closest("dialog")).length,
         inputs: [...document.querySelectorAll(".costs-workspace input, .costs-workspace select")].filter((el) => !el.closest("dialog")).length,
@@ -152,7 +198,79 @@ try {
       }));
       if (onPage.forms) fail(`the Costs page still renders ${onPage.forms} create form(s) outside the dialog`);
       if (onPage.inputs) fail(`the Costs page still renders ${onPage.inputs} form control(s) outside the dialog`);
-      if (onPage.cards !== profiles.length) fail(`the Costs page shows ${onPage.cards} profile card(s), the fixture holds ${profiles.length}`);
+      if (onPage.cards) fail(`the Costs page still renders ${onPage.cards} profile card(s) instead of a table`);
+
+      // The table: one row per profile in the order the API returned, a dash where the model
+      // has no value, and the profile id as the NAME cell's tooltip.
+      const table = await readTable(page);
+      if (!table) fail("the Costs page shows no profiles table");
+      else {
+        if (verbose) console.log(`${mode}: table ${JSON.stringify(table)}`);
+        if (table.head.slice(0, COLUMNS.length).join("|") !== COLUMNS.join("|")) {
+          fail(`the table's sortable headers are ${JSON.stringify(table.head)}, not ${JSON.stringify(COLUMNS)}`);
+        }
+        if (table.rows.length !== profiles.length) fail(`the table shows ${table.rows.length} row(s), the fixture holds ${profiles.length}`);
+        profiles.forEach((profile, index) => {
+          const row = table.rows[index];
+          if (!row) return;
+          if (row.cells[0] !== profile.name) fail(`row ${index} is named ${JSON.stringify(row.cells[0])}, the fixture's ${index}th is ${JSON.stringify(profile.name)}`);
+          if (row.title !== profile.id) fail(`row ${index}'s NAME tooltip is ${JSON.stringify(row.title)}, not the id ${JSON.stringify(profile.id)}`);
+        });
+        const off = profiles.findIndex((profile) => profile.model === "none");
+        if (off >= 0) {
+          const values = table.rows[off]?.cells.slice(4, 9) ?? [];
+          if (values.join("|") !== new Array(5).fill(DASH).join("|")) {
+            fail(`the costs-off row reads ${JSON.stringify(values)}, not five dashes`);
+          }
+        } else fail("the fixture holds no costs-off profile to read dashes from");
+        const fixed = profiles.findIndex((profile) => profile.model === "fixed_tick_per_unit");
+        if (fixed >= 0 && table.rows[fixed]?.cells[7] !== "$0.01") {
+          fail(`the fixed-tick row's TICK reads ${JSON.stringify(table.rows[fixed]?.cells[7])}, not "$0.01"`);
+        }
+      }
+
+      // Sorting: NAME ascending, a second click reversing it; ROUND TRIP the same.
+      await sortBy(page, "name");
+      const byName = column(await readTable(page), 0);
+      const ascending = [...byName].sort((a, b) => a.localeCompare(b));
+      if (byName.join("|") !== ascending.join("|")) fail(`clicking NAME left ${JSON.stringify(byName)}, not ${JSON.stringify(ascending)}`);
+      await sortBy(page, "name");
+      const reversed = column(await readTable(page), 0);
+      if (reversed.join("|") !== [...ascending].reverse().join("|")) fail(`clicking NAME again left ${JSON.stringify(reversed)}, not the reverse of ${JSON.stringify(ascending)}`);
+      await sortBy(page, "round_trip");
+      const byCost = column(await readTable(page), 6).map(asNumber);
+      const descending = [...byCost].sort((a, b) => (b ?? -Infinity) - (a ?? -Infinity));
+      if (byCost.join("|") !== descending.join("|")) fail(`clicking ROUND TRIP left ${JSON.stringify(byCost)}, not ${JSON.stringify(descending)}`);
+      await sortBy(page, "round_trip");
+      const ascendingCost = column(await readTable(page), 6).map(asNumber);
+      if (ascendingCost.join("|") !== [...descending].reverse().join("|")) fail(`clicking ROUND TRIP again left ${JSON.stringify(ascendingCost)}, not the reverse of ${JSON.stringify(descending)}`);
+
+      // Duplicate on a row opens the dialog carrying that row, under "<name> copy". The row is
+      // found by name: the sorts above have moved it off the top.
+      const source = duplicated;
+      const at = (await readTable(page)).rows.findIndex((row) => row.cells[0] === source.name);
+      if (at < 0) fail(`the table shows no row named ${JSON.stringify(source.name)} to duplicate`);
+      else {
+        await page.locator(".costs-table tbody tr").nth(at).locator(".cost-duplicate").first().click();
+        await page.locator(dialog).waitFor({ timeout: 10000 });
+        await page.waitForTimeout(150);
+        if ((await readValue(page, "name")) !== `${source.name} copy`) {
+          fail(`Duplicate opened with the name ${JSON.stringify(await readValue(page, "name"))}, not ${JSON.stringify(`${source.name} copy`)}`);
+        }
+        if ((await readValue(page, "model")) !== source.model) fail(`Duplicate opened with model ${JSON.stringify(await readValue(page, "model"))}, not ${JSON.stringify(source.model)}`);
+        if ((await readValue(page, "asset_class")) !== source.asset_class) fail(`Duplicate opened with asset class ${JSON.stringify(await readValue(page, "asset_class"))}`);
+        for (const [field, value] of Object.entries({ tick_size: source.tick_size, entry_slippage_ticks: source.entry_slippage_ticks, exit_slippage_ticks: source.exit_slippage_ticks, entry_commission_per_unit: source.entry_commission_per_unit, exit_commission_per_unit: source.exit_commission_per_unit, minimum_commission: source.minimum_commission })) {
+          const held = await readValue(page, field);
+          if (Number(held) !== value) fail(`Duplicate opened with ${field} = ${JSON.stringify(held)}, the row says ${JSON.stringify(value)}`);
+        }
+        const selected = await page.evaluate((sel) => {
+          const input = document.querySelector(`${sel} [data-field="name"] input`);
+          return input ? input.value.slice(input.selectionStart ?? 0, input.selectionEnd ?? 0) : "";
+        }, dialog);
+        if (selected !== `${source.name} copy`) fail(`Duplicate selected ${JSON.stringify(selected)}, not the whole copied name`);
+        await page.locator(`${dialog} .cost-dialog-cancel`).click();
+        await page.locator(dialog).waitFor({ state: "hidden", timeout: 5000 }).catch(() => fail("Cancel did not close the dialog"));
+      }
 
       // 2. New profile opens a native modal dialog.
       if (await page.locator(dialog).count()) fail("the dialog is open before New profile is clicked");
@@ -267,9 +385,45 @@ try {
         }
         if (body.tick_size <= 0) fail(`Save sent tick_size ${JSON.stringify(body.tick_size)}, which the service refuses`);
       }
-      const after = await page.locator(".costs-workspace .cost-profile-card").count();
-      if (after !== profiles.length + 1) fail(`after Save the grid shows ${after} card(s), not ${profiles.length + 1}`);
+      // The saved profile joins the table at once, or with the console's next poll of
+      // /api/cost-profiles (every three seconds), which the fixture answers with what was
+      // created: a poll in flight when the save landed is answered from the old library.
+      const expected = profiles.length + 1;
+      let after = await page.locator(".costs-table tbody tr").count();
+      for (let attempt = 0; attempt < 20 && after !== expected; attempt += 1) {
+        await page.waitForTimeout(250);
+        after = await page.locator(".costs-table tbody tr").count();
+      }
+      if (after !== expected) fail(`after Save the table shows ${after} row(s), not ${expected}`);
       for (const error of errors) fail(`console error: ${error.split("\n")[0]}`);
+    } catch (error) {
+      fail(String(error).split("\n")[0]);
+    }
+    await context.close();
+  }
+  // An empty library: the panel's empty state, no broken table, New profile still offered.
+  for (const mode of ["terminal", "modern"]) {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    await context.addInitScript((m) => window.localStorage.setItem("bt-display-mode", m), mode);
+    await context.route("**/api/cost-profiles", (route) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
+    );
+    const page = await context.newPage();
+    const fail = (text) => failures.push(`${mode}: ${text}`);
+    try {
+      await page.goto(served.url, { waitUntil: "domcontentloaded" });
+      await page.locator(".app-shell").waitFor({ timeout: 15000 });
+      await page.getByRole("button", { name: /^Costs$/ }).first().click();
+      await page.locator(".costs-workspace").waitFor({ timeout: 15000 });
+      await page.waitForTimeout(200);
+      const empty = await page.evaluate(() => ({
+        table: document.querySelectorAll(".costs-table").length,
+        state: (document.querySelector(".costs-workspace .empty-state")?.textContent ?? "").trim(),
+        open: document.querySelectorAll(".cost-dialog-open").length,
+      }));
+      if (empty.table) fail("an empty library still renders a profiles table");
+      if (!empty.state) fail("an empty library shows no empty state in the panel");
+      if (empty.open !== 1) fail(`an empty library offers ${empty.open} New profile button(s), not 1`);
     } catch (error) {
       fail(String(error).split("\n")[0]);
     }
@@ -286,5 +440,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `costs-check: ok (web/fixtures/cost-profiles.json with ${profiles.length} profiles, terminal and modern; ${MODELS.map((m) => m.fields.length).join("/")} fields per model, ${DUPLICATE} refused before sending, ${REFUSED} answered 400 and rendered above the buttons with the fields kept, ${FRESH} saved; ${posted.length} profile(s) posted, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `costs-check: ok (web/fixtures/cost-profiles.json with ${profiles.length} profiles, terminal and modern; ${MODELS.map((m) => m.fields.length).join("/")} fields per model, ${DUPLICATE} refused before sending, ${REFUSED} answered 400 and rendered above the buttons with the fields kept, ${FRESH} saved; ${COLUMNS.length} sortable columns over ${profiles.length} rows with the id as the NAME tooltip, NAME and ROUND TRIP reversed on a second click, ${JSON.stringify(duplicated.name)} duplicated as "${duplicated.name} copy", an empty library keeping New profile; ${posted.length} profile(s) posted, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );

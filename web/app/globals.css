@@ -347,40 +347,19 @@ a { color: inherit; text-decoration: inherit; }
   overflow: hidden;
 }
 
-.cost-profile-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 1px;
-  padding: 1px;
-  background: var(--line);
-}
-.cost-profile-card {
-  min-width: 0;
-  padding: 16px;
-  background: var(--panel);
-}
-.cost-profile-card h3 {
-  margin: 14px 0 8px;
-  font-size: 17px;
-}
-.cost-profile-card > strong {
-  color: var(--accent);
-  text-transform: uppercase;
+/* The profiles table (UI-13, decision 0024): one dense row per profile. */
+.cost-profiles-panel .terminal-panel-title em {
+  margin-left: auto;
+  color: var(--muted);
+  font-style: normal;
   font-size: 12px;
 }
-.cost-profile-card dl {
-  margin: 14px 0;
-}
-.cost-profile-card dl div {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 7px 0;
-  border-bottom: 1px solid var(--line);
-}
-.cost-profile-card dt,
-.cost-profile-card small {
+.cost-profiles-sort {
   color: var(--muted);
+  font: 700 10px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 .correlation-table-ui th,
 .correlation-table-ui td {
@@ -4827,6 +4806,80 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
 }
 .app-shell[data-theme="terminal"] .run-dialog-foot p {
   color: #a5a5a5;
+}
+
+/* The profiles table (UI-13, decision 0024): one dense row per profile, ten columns. Denser
+   than the console's other tables (22px here, 18px in terminal, from rules further up that
+   these have to out-specify), and laid out fixed so the columns are shares of the panel rather
+   than of their own content: the table is then exactly as wide as its wrapper at any width, and
+   a long name is cut with an ellipsis instead of pushing the row out of the panel — macOS hides
+   the scrollbar, so a table wider than its wrapper just looks cut off, which is what the
+   layout check fails on. */
+.app-shell .costs-workspace .costs-table table {
+  width: 100%;
+  table-layout: fixed;
+  font-size: 13px;
+}
+.app-shell .costs-workspace .costs-table th,
+.app-shell .costs-workspace .costs-table td {
+  padding: 8px 7px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.app-shell .costs-workspace .costs-table th {
+  color: var(--muted);
+  font: 700 10px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+}
+.app-shell .costs-workspace .costs-table th:hover {
+  color: var(--ink);
+}
+.app-shell .costs-workspace .costs-table .cost-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.app-shell .costs-workspace .costs-table .cost-col-duplicate,
+.app-shell .costs-workspace .costs-table .cost-duplicate-cell {
+  text-align: right;
+}
+.app-shell .costs-workspace .costs-table .cost-name {
+  font-weight: 600;
+}
+/* The shares: a number is never cut, so the five value columns hold the widest value a model
+   can carry ("1000.00 bps", the service's 500 cap on either side), and NAME — the one column
+   where an ellipsis loses nothing you cannot get back — takes what is left. */
+.app-shell .costs-workspace .costs-table .cost-col-name {
+  width: 22%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-origin {
+  width: 7%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-asset_class {
+  width: 11%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-model {
+  width: 9%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-entry,
+.app-shell .costs-workspace .costs-table .cost-col-exit {
+  width: 9%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-round_trip {
+  width: 10%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-tick {
+  width: 6%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-min_comm {
+  width: 8%;
+}
+.app-shell .costs-workspace .costs-table .cost-col-duplicate {
+  width: 9%;
 }
 
 /* The cost-profile dialog (UI-12, decisions 0003 and 0024): the console's second modal, opened

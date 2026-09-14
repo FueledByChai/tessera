@@ -240,6 +240,23 @@ at 5 and 5 it reads $100.00 and 10.00 bps with no reference-price control; with 
 it reads "No modeled cost."; and a minimum commission above the per-unit figure is the
 figure the line uses.
 
+### UI-15 A created record survives the poll that was already in flight
+The console re-reads `/api/cost-profiles` every three seconds (`refresh` in
+`web/app/page.tsx`) and a save puts the created profile at the front of the list before the
+service is asked again. A poll whose request was already in flight when the save landed is
+answered from the library as it was, and its answer replaces the list the save had just
+updated, so for up to three seconds the profile the user created is not in the table — the
+row comes back with the poll after that. Found while proving UI-13, whose check counts the
+rows after a save and saw seven instead of eight in one run of two. The same shape covers
+anything else the console both polls and writes: either keep the record a save created when a
+poll that began before it is applied, or ignore a poll that began before a local write.
+Serves BT-1104.
+**Done when:** `web/scripts/costs-check.mjs` fails unless, with `/api/cost-profiles` answered
+only after a delay long enough for a save to land while the poll is in flight, the row that
+save added is still in the table once the answer is applied — the fixture holding the list a
+request in flight was answered from, and the check reading the row count after the poll has
+landed rather than straight after the save.
+
 ## Feature workbench (Studies page)
 
 ### WB-01 Feature expression grammar
