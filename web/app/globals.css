@@ -4829,6 +4829,158 @@ tr.catalog-row.archived td, .status.archived { opacity: 0.55; }
   color: #a5a5a5;
 }
 
+/* The cost-profile dialog (UI-12, decisions 0003 and 0024): the console's second modal, opened
+   from New profile in the Costs page's head, the create form that used to sit under the profile
+   cards. The terminal look of the Configure run dialog — an amber title bar with black text, a
+   body that scrolls only if a model ever needs more room, a foot with Cancel and Save — and,
+   above the buttons, the service's refusal when it will not save the profile, so a refused save
+   is read where it happened with the fields still holding what was typed. The reason Save is
+   disabled (a name the library already holds) sits beside the buttons, not in their place.
+   web/scripts/costs-check.mjs drives it; web/scripts/layout-check.mjs opens it at 1280x800 in
+   both display modes for each of the three field sets and fails when it passes the viewport. */
+.cost-dialog {
+  box-sizing: border-box;
+  width: min(880px, calc(100vw - 48px));
+  max-height: calc(100vh - 24px);
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  overflow: hidden;
+}
+.cost-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.cost-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.72);
+}
+.cost-dialog form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.cost-dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 4px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.cost-dialog-head h2 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: -0.025em;
+}
+/* The chosen model named in the title bar, so the field set below it is never a surprise. */
+.cost-dialog-note {
+  margin-left: auto;
+  color: var(--muted);
+  font: 700 12px var(--font-geist-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.cost-dialog-close {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  width: 30px;
+  height: 30px;
+  cursor: pointer;
+  font: 700 18px var(--font-geist-mono);
+  line-height: 1;
+}
+.cost-dialog-close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cost-dialog-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.cost-dialog .form-section {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 10px 14px;
+  align-items: start;
+  padding: 8px 18px;
+}
+.cost-dialog .form-section > h3 {
+  margin: 0;
+  padding-top: 4px;
+}
+.cost-dialog .form-section > :not(h3) {
+  grid-column: 2;
+}
+/* The service's refusal, above the buttons and inside the dialog, not the page's error banner. */
+.cost-dialog-error {
+  margin: 0;
+  padding: 8px 18px;
+  border-top: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--danger);
+  font: 700 12px var(--font-geist-mono);
+}
+.cost-dialog-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 18px;
+  border-top: 1px solid var(--line);
+}
+.cost-dialog-foot p {
+  margin: 0 auto 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.cost-dialog-reason {
+  color: var(--danger);
+  font: 700 11px var(--font-geist-mono);
+  letter-spacing: 0.04em;
+}
+.cost-dialog-foot .secondary-action,
+.cost-dialog-foot .primary-action {
+  padding: 5px 14px;
+}
+/* Terminal mode: the amber title bar with black text every panel head wears (decision 0003). */
+.app-shell[data-theme="terminal"] .cost-dialog {
+  border-color: var(--accent);
+  background: #050505;
+}
+.app-shell[data-theme="terminal"] .cost-dialog-head {
+  min-height: 30px;
+  padding: 4px 10px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #000;
+}
+.app-shell[data-theme="terminal"] .cost-dialog-head h2,
+.app-shell[data-theme="terminal"] .cost-dialog-note {
+  color: #000;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.app-shell[data-theme="terminal"] .cost-dialog-close {
+  border-color: #000;
+  color: #000;
+}
+.app-shell[data-theme="terminal"] .cost-dialog-close:hover {
+  background: #000;
+  color: var(--accent);
+}
+.app-shell[data-theme="terminal"] .cost-dialog .form-section,
+.app-shell[data-theme="terminal"] .cost-dialog-error,
+.app-shell[data-theme="terminal"] .cost-dialog-foot {
+  padding-left: 10px;
+  padding-right: 10px;
+}
+.app-shell[data-theme="terminal"] .cost-dialog-foot p {
+  color: #a5a5a5;
+}
+
 /* The collapsed left menu (UI-08, decision 0019): a 56px icon rail, the same width in both
    display modes, keeping the brand mark, the ten glyphs, and the engine dot, with the labels
    and the foot's text not rendered and each label surfaced as a hover tooltip. Only the toggle
