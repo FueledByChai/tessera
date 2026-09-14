@@ -5072,9 +5072,15 @@ async fn list_sources(
     let rows = tokio::task::spawn_blocking(move || load_source_rows(&worker))
         .await
         .context("sources task failed")??;
-    for row in &rows {
-        refresh_source_usage(&state, row, force).await?;
-    }
+    // DS-13: ask every source at once, so a provider that hangs costs the listing its own
+    // timeout rather than that timeout per source. Each source records its own `unreachable`.
+    futures::future::join_all(
+        rows.iter()
+            .map(|row| Box::pin(refresh_source_usage(&state, row, force))),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
     let worker = state.clone();
     let sources = tokio::task::spawn_blocking(move || -> Result<Vec<SourceCard>> {
         let rows = load_source_rows(&worker)?;
@@ -11738,7 +11744,13 @@ mod tests {
             struct UsageStub {
                 down: Arc<AtomicBool>,
                 requests: Arc<AtomicU64>,
+                /// DS-13: while set, `HANG_TOKEN`'s `/api/user` never answers.
+                hang: Arc<AtomicBool>,
             }
+
+            /// A second token whose `/api/user` hangs once `hang` is set, so a test can have one
+            /// source answer and another hold the listing (DS-13).
+            const HANG_TOKEN: &str = "hang-token";
 
             /// The DS-02 fixture's `/api/user` with `apiRequests` taken from the counter.
             async fn stub_user(
@@ -11753,7 +11765,11 @@ mod tests {
                     .iter()
                     .find(|(k, _)| k == "api_token")
                     .map(|(_, v)| v.as_str());
-                if token != Some(TOKEN) {
+                if stub.hang.load(Ordering::SeqCst) && token == Some(HANG_TOKEN) {
+                    // Never answers, so the caller has to give up on its own timeout (DS-13).
+                    std::future::pending::<()>().await;
+                }
+                if token != Some(TOKEN) && token != Some(HANG_TOKEN) {
                     return (StatusCode::UNAUTHORIZED, "Unauthenticated").into_response();
                 }
                 let body = fs::read_to_string(format!(
@@ -11768,17 +11784,19 @@ mod tests {
                 (StatusCode::OK, [("content-type", "application/json")], body).into_response()
             }
 
-            async fn usage_stub() -> (String, Arc<AtomicBool>, Arc<AtomicU64>) {
+            async fn usage_stub() -> (String, Arc<AtomicBool>, Arc<AtomicU64>, Arc<AtomicBool>) {
                 let down = Arc::new(AtomicBool::new(false));
                 let requests = Arc::new(AtomicU64::new(1234));
+                let hang = Arc::new(AtomicBool::new(false));
                 let router =
                     Router::new()
                         .route("/api/user", get(stub_user))
                         .with_state(UsageStub {
                             down: down.clone(),
                             requests: requests.clone(),
+                            hang: hang.clone(),
                         });
-                (serve(router).await, down, requests)
+                (serve(router).await, down, requests, hang)
             }
 
             fn usage_calls(state: &AppState, id: &str) -> (Option<u64>, Option<String>) {
@@ -11786,9 +11804,84 @@ mod tests {
                 (row.requests_today, row.usage_checked_at)
             }
 
+            /// DS-13: a source whose provider never answers costs the Inventory listing its own
+            /// short timeout rather than the adapter's general one, and the sources are asked at
+            /// once, so the listing returns as soon as the slowest gives up.
+            #[tokio::test]
+            async fn a_hanging_source_does_not_hold_the_listing() {
+                let (eodhd, _down, _requests, hang) = usage_stub().await;
+                let root = scratch_root("ds13-hang");
+                let answering_root = root.join("answering");
+                let hanging_root = root.join("hanging");
+                fs::create_dir_all(&answering_root).unwrap();
+                fs::create_dir_all(&hanging_root).unwrap();
+                let state = test_state(&root, &eodhd);
+                let api = serve(api_router().with_state(state.clone())).await;
+                let client = reqwest::Client::new();
+
+                // Both sources register while the stub still answers, so each has usage on file.
+                let mut ids: Vec<String> = Vec::new();
+                for (name, path, token) in [
+                    ("Answering", &answering_root, TOKEN),
+                    ("Hanging", &hanging_root, HANG_TOKEN),
+                ] {
+                    let response = client
+                        .post(format!("{api}/api/sources"))
+                        .json(&serde_json::json!({
+                            "kind": "eodhd", "name": name, "root": path,
+                            "catalog_dir": path.join("catalog"), "token": token
+                        }))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::CREATED);
+                    let card: serde_json::Value =
+                        serde_json::from_str(&response.text().await.unwrap()).unwrap();
+                    assert_eq!(card["usage"]["requests_today"], 1234, "{card}");
+                    assert!(card["usage"]["checked_at"].is_string(), "{card}");
+                    ids.push(card["id"].as_str().unwrap().to_owned());
+                }
+
+                // The second source's usage call now hangs rather than refusing.
+                hang.store(true, Ordering::SeqCst);
+                let started = std::time::Instant::now();
+                let response = client
+                    .get(format!("{api}/api/sources?refresh=1"))
+                    .send()
+                    .await
+                    .unwrap();
+                let elapsed = started.elapsed();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(
+                    elapsed < std::time::Duration::from_secs(10),
+                    "the listing took {elapsed:?}"
+                );
+                let list: serde_json::Value =
+                    serde_json::from_str(&response.text().await.unwrap()).unwrap();
+                let card = |id: &str| {
+                    list["sources"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|card| card["id"] == id)
+                        .expect("the source's card")
+                        .clone()
+                };
+                let answering = card(&ids[0]);
+                let hanging = card(&ids[1]);
+                assert_eq!(answering["verify_state"], "connected", "{answering}");
+                assert_eq!(hanging["verify_state"], "unreachable", "{hanging}");
+                // Both keep the usage they last saw, with its time.
+                for card in [&answering, &hanging] {
+                    assert_eq!(card["usage"]["requests_today"], 1234, "{card}");
+                    assert!(card["usage"]["checked_at"].is_string(), "{card}");
+                }
+                let _ = fs::remove_dir_all(&root);
+            }
+
             #[tokio::test]
             async fn the_card_shows_the_providers_usage_and_keeps_the_last_value_while_down() {
-                let (eodhd, down, requests) = usage_stub().await;
+                let (eodhd, down, requests, _hang) = usage_stub().await;
                 let root = scratch_root("credits");
                 let library = root.join("library");
                 fs::create_dir_all(&library).unwrap();
