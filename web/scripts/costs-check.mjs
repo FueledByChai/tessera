@@ -21,6 +21,9 @@
 // sorting with a second click reversing it, Duplicate opening the dialog under "<name> copy"
 // with the whole name selected, and an empty library showing the panel's empty state with New
 // profile still in its title bar.
+// And a save survives the poll that was already in flight (UI-15): with every GET of
+// /api/cost-profiles parked holding the library as it stood when the request arrived, the row a
+// save added is still in the table once the parked answer — one profile short of it — is applied.
 // Every other API path proxies to the console at LAYOUT_CONSOLE when one answers and returns
 // 503 otherwise. Needs a Playwright-compatible Chromium like the layout check; without one, or
 // without a built bundle, it reports that it skipped and exits 0.
@@ -65,6 +68,8 @@ const REFUSED = "Service refuses this one";
 const REFUSAL = "a cost profile with that name already exists";
 /** A name nothing holds, so the save goes through. */
 const FRESH = "Desk override · new version";
+/** A name nothing holds either, saved while a poll of the library is in flight (UI-15). */
+const SAVED_LATE = "Desk override · saved during a poll";
 /** What the check types, so a model switch can be proven to keep it. */
 const TYPED = {
   all_in_bps: { entry_bps: "7.5", exit_bps: "2.5" },
@@ -458,6 +463,55 @@ try {
       line = await priceLine(page);
       if (line !== PRICE.off) fail(`costs off the line reads ${JSON.stringify(line)}, not ${JSON.stringify(PRICE.off)}`);
       if (await hasReference(page)) fail("costs off still offers a reference price it does not use");
+      // 9. A created record survives the poll that was already in flight (UI-15). Every GET of
+      //    /api/cost-profiles is parked holding the library as it stood when the request
+      //    arrived, so the answer the parked poll is finally given is one profile short of what
+      //    the save has just added. The check waits for a poll to be in flight before it saves,
+      //    and parks every poll after that unanswered so no later, fresh answer can put the row
+      //    back and hide the fact that the in-flight one dropped it.
+      const polls = { parked: 0, sizes: [], waiters: [], block: false };
+      await context.route("**/api/cost-profiles", async (route, request) => {
+        try {
+          if (request.method() !== "GET") {
+            await route.fallback();
+            return;
+          }
+          const snapshot = JSON.stringify([...created, ...profiles]);
+          polls.parked += 1;
+          polls.sizes.push(JSON.parse(snapshot).length);
+          if (polls.block) return; // left unanswered on purpose: no later poll may restore the row
+          await new Promise((resolve) => polls.waiters.push(resolve));
+          await route.fulfill({ status: 200, contentType: "application/json", body: snapshot });
+        } catch {
+          // The context closing under a parked request is not a failure of the page.
+        }
+      });
+      for (let attempt = 0; attempt < 100 && !polls.parked; attempt += 1) await page.waitForTimeout(100);
+      if (!polls.parked) fail("no poll of /api/cost-profiles was in flight when the profile was saved");
+      const beforeLate = await page.locator(".costs-table tbody tr").count();
+      await fill(page, "name", SAVED_LATE);
+      await page.waitForTimeout(120);
+      await page.locator(`${dialog} .cost-dialog-save`).click();
+      await page.locator(dialog).waitFor({ state: "hidden", timeout: 10000 }).catch(() => fail("Save did not close the dialog"));
+      const savedRow = await page.locator(".costs-table tbody tr").count();
+      if (savedRow !== beforeLate + 1) fail(`the save added no row: the table shows ${savedRow} row(s), not ${beforeLate + 1}`);
+      polls.block = true;
+      for (const resolve of polls.waiters.splice(0)) resolve();
+      await page.waitForTimeout(600);
+      const afterPoll = await readTable(page);
+      if (!polls.sizes.every((size) => size === beforeLate)) {
+        fail(`the answer in flight held ${JSON.stringify(polls.sizes)} profile(s), not ${beforeLate} in every one`);
+      }
+      if (!afterPoll) fail("the Costs page shows no profiles table after the poll landed");
+      else {
+        if (afterPoll.rows.length !== beforeLate + 1) {
+          fail(`once the poll that was in flight was answered the table shows ${afterPoll.rows.length} row(s), not ${beforeLate + 1}`);
+        }
+        if (!afterPoll.rows.some((row) => row.cells[0] === SAVED_LATE)) {
+          fail(`once that poll was answered the table holds no row named ${JSON.stringify(SAVED_LATE)}`);
+        }
+      }
+      await context.unroute("**/api/cost-profiles");
       for (const error of errors) fail(`console error: ${error.split("\n")[0]}`);
     } catch (error) {
       fail(String(error).split("\n")[0]);
@@ -503,5 +557,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(
-  `costs-check: ok (web/fixtures/cost-profiles.json with ${profiles.length} profiles, terminal and modern; ${MODELS.map((m) => m.fields.length).join("/")} fields per model, ${DUPLICATE} refused before sending, ${REFUSED} answered 400 and rendered above the buttons with the fields kept, ${FRESH} saved; ${COLUMNS.length} sortable columns over ${profiles.length} rows with the id as the NAME tooltip, NAME and ROUND TRIP reversed on a second click, ${JSON.stringify(duplicated.name)} duplicated as "${duplicated.name} copy", an empty library keeping New profile; the line pricing 1 tick and $0.005 a share at $100.00 as ${JSON.stringify(PRICE.at100)}, at $50.00 as ${JSON.stringify(PRICE.at50)}, over a $20 minimum as ${JSON.stringify(PRICE.minimum)}, all-in at 5 and 5 as ${JSON.stringify(PRICE.allIn)}, and costs off as ${JSON.stringify(PRICE.off)}; ${posted.length} profile(s) posted, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
+  `costs-check: ok (web/fixtures/cost-profiles.json with ${profiles.length} profiles, terminal and modern; ${MODELS.map((m) => m.fields.length).join("/")} fields per model, ${DUPLICATE} refused before sending, ${REFUSED} answered 400 and rendered above the buttons with the fields kept, ${FRESH} saved; ${COLUMNS.length} sortable columns over ${profiles.length} rows with the id as the NAME tooltip, NAME and ROUND TRIP reversed on a second click, ${JSON.stringify(duplicated.name)} duplicated as "${duplicated.name} copy", an empty library keeping New profile; ${JSON.stringify(SAVED_LATE)} saved while a poll was in flight and still in the table once that poll was answered; the line pricing 1 tick and $0.005 a share at $100.00 as ${JSON.stringify(PRICE.at100)}, at $50.00 as ${JSON.stringify(PRICE.at50)}, over a $20 minimum as ${JSON.stringify(PRICE.minimum)}, all-in at 5 and 5 as ${JSON.stringify(PRICE.allIn)}, and costs off as ${JSON.stringify(PRICE.off)}; ${posted.length} profile(s) posted, shell ${upstream ? "on the console" : "offline"}) via ${runtime.from}`,
 );
