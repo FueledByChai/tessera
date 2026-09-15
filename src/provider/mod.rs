@@ -7,7 +7,8 @@
 //! one symbol's intraday bars for a window of time. A second provider is another module
 //! behind the same trait and nothing else. The first adapter is [`eodhd`]; [`budget`] is the
 //! call budget every job checks against the usage a provider reports (decision 0022), and
-//! [`jobs`] holds the jobs themselves, written against the trait alone.
+//! [`jobs`] holds the jobs themselves, written against the trait alone, and [`clock`] says
+//! what today is where an exchange is (DS-15).
 //!
 //! Every method fails with a [`ProviderError`] whose three variants are what a caller acts on:
 //! the token is wrong (ask for another), the provider cannot be reached (try later), or the
@@ -15,6 +16,7 @@
 //! An error's text never carries the token: it is the only thing the service will log.
 
 pub mod budget;
+pub mod clock;
 pub mod eodhd;
 pub mod jobs;
 

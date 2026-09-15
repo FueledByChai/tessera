@@ -39,11 +39,15 @@ pub struct Estimate {
 }
 
 impl Estimate {
-    /// An EOD job: one bulk call per session plus one splits call per session are mandatory;
-    /// one history call per symbol to backfill is optional.
-    pub fn eod(sessions: u64, backfills: u64) -> Self {
+    /// An EOD job: one bulk call per session plus one splits call per session are mandatory,
+    /// and so is a split allowance on top of them — a split costs the history call that
+    /// refetches the symbol's file (DS-15), at `splits_per_session` a session over every
+    /// session planned, and at least one a session whatever the dataset has recorded. One
+    /// history call per symbol to backfill is optional.
+    pub fn eod(sessions: u64, backfills: u64, splits_per_session: u64) -> Self {
+        let allowance = sessions.saturating_mul(splits_per_session.max(1));
         Estimate {
-            mandatory: sessions.saturating_mul(2),
+            mandatory: sessions.saturating_mul(2).saturating_add(allowance),
             optional: backfills,
         }
     }
@@ -249,10 +253,34 @@ mod tests {
         assert_eq!(CallBudget::new(10, 12, 1).available(), 0);
     }
 
+    /// A split costs the history call that refetches the symbol's file (DS-15), so a night's
+    /// estimate carries an allowance for them: the dataset's splits per session over its
+    /// recorded jobs, at least one, over every session the run plans.
+    #[test]
+    fn the_eod_estimate_carries_a_split_allowance() {
+        // Three sessions: six for the bulk and splits calls, plus a split a session at two.
+        let two_a_session = Estimate::eod(3, 40, 2);
+        assert_eq!(
+            (
+                two_a_session.mandatory,
+                two_a_session.optional,
+                two_a_session.total()
+            ),
+            (12, 40, 52)
+        );
+        // A dataset with no recorded jobs still allows one split a session.
+        let none_recorded = Estimate::eod(3, 40, 0);
+        assert_eq!((none_recorded.mandatory, none_recorded.total()), (9, 49));
+        // No sessions, no allowance: an all-backfill run is unaffected by it.
+        assert_eq!(Estimate::eod(0, 40, 7).mandatory, 0);
+        // The allowance saturates with the rest rather than wrapping.
+        assert_eq!(Estimate::eod(u64::MAX, 0, 2).mandatory, u64::MAX);
+    }
+
     #[test]
     fn estimates_follow_the_call_rules() {
-        let eod = Estimate::eod(3, 40);
-        assert_eq!((eod.mandatory, eod.optional, eod.total()), (6, 40, 46));
+        let eod = Estimate::eod(3, 40, 0);
+        assert_eq!((eod.mandatory, eod.optional, eod.total()), (9, 40, 49));
         let intraday = Estimate::intraday(4, 25);
         assert_eq!((intraday.mandatory, intraday.optional), (500, 0));
         let windows = Estimate::intraday_windows(3, 2);
@@ -261,8 +289,8 @@ mod tests {
             (15, 10, 25)
         );
         assert_eq!(Estimate::intraday_windows(u64::MAX, 0).mandatory, u64::MAX);
-        assert_eq!(Estimate::eod(u64::MAX, 1).mandatory, u64::MAX);
-        assert_eq!(Estimate::eod(u64::MAX, 1).total(), u64::MAX);
+        assert_eq!(Estimate::eod(u64::MAX, 1, 0).mandatory, u64::MAX);
+        assert_eq!(Estimate::eod(u64::MAX, 1, 0).total(), u64::MAX);
         let budget = CallBudget::new(100_000, 99_600, 5_000);
         assert!(budget.can_start(eod.mandatory).is_err());
         assert!(

@@ -22,9 +22,11 @@ use tessera::portfolio::{
     CapitalMode, PortfolioComponentConfig, PortfolioConfig, RebalanceMethod, combine_portfolio,
 };
 use tessera::provider::budget::{CallBudget, Estimate};
+use tessera::provider::clock;
 use tessera::provider::eodhd::Eodhd;
 use tessera::provider::jobs::eod::{
-    self as eod_job, DEFAULT_MIN_BULK_ROWS, DatasetSymbol, EodJobInput, JobState, Skipped,
+    self as eod_job, DEFAULT_MIN_BULK_ROWS, DEFAULT_SKIP_RETRY_DAYS, DatasetSymbol, EodJobInput,
+    JobState, Skipped, SymbolSkip,
 };
 use tessera::provider::jobs::intraday::{self as intraday_job, IntradayJobInput};
 use tessera::provider::{Account, Listing, Provider, ProviderError};
@@ -1097,6 +1099,14 @@ fn migrate(connection: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_dataset_jobs_dataset_created
          ON dataset_jobs(dataset_id, created_at DESC);
+         CREATE TABLE IF NOT EXISTS dataset_skips (
+             dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+             symbol TEXT NOT NULL,
+             reason TEXT NOT NULL,
+             first_seen TEXT NOT NULL,
+             retry_after TEXT NOT NULL,
+             PRIMARY KEY (dataset_id, symbol)
+         );
          CREATE TABLE IF NOT EXISTS automation_runs (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              schedule_id TEXT NOT NULL REFERENCES automation_schedules(id) ON DELETE CASCADE,
@@ -1175,6 +1185,28 @@ fn migrate(connection: &Connection) -> Result<()> {
         "min_bulk_rows",
         &format!("INTEGER NOT NULL DEFAULT {DEFAULT_MIN_BULK_ROWS}"),
     )?;
+    // DS-15: what a finished job refetched for splits, and over how many sessions, so the
+    // next run's estimate can allow for them.
+    ensure_column(
+        connection,
+        "dataset_jobs",
+        "splits",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        connection,
+        "dataset_jobs",
+        "sessions",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // DS-15: the days a symbol the provider has no history for is held before it is asked
+    // again.
+    ensure_column(
+        connection,
+        "datasets",
+        "skip_retry_days",
+        &format!("INTEGER NOT NULL DEFAULT {DEFAULT_SKIP_RETRY_DAYS}"),
+    )?;
     ensure_column(
         connection,
         "provider_listings",
@@ -1204,6 +1236,9 @@ fn migrate(connection: &Connection) -> Result<()> {
         "resolutions_probed_at",
         "TEXT",
     )?;
+    // DS-15: the IANA timezone an exchange's sessions are dated in, from its country; null
+    // for one the map does not carry, which then keeps New York's date.
+    ensure_column(connection, "provider_exchanges", "timezone", "TEXT")?;
     connection.execute_batch("PRAGMA optimize;")?;
     Ok(())
 }
@@ -5377,8 +5412,9 @@ fn store_exchanges(
     {
         let mut insert = tx.prepare(
             "INSERT OR REPLACE INTO provider_exchanges
-             (source_id, code, name, country, resolutions, fetched_at, resolutions_probed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (source_id, code, name, country, timezone, resolutions, fetched_at,
+              resolutions_probed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for exchange in exchanges {
             let (resolutions, resolutions_probed_at) = match probed.get(&exchange.code) {
@@ -5390,6 +5426,10 @@ fn store_exchanges(
                 exchange.code,
                 exchange.name,
                 exchange.country,
+                // DS-15: what today is at this exchange, from the country the provider
+                // names; nothing for a country the map does not carry, which then keeps
+                // New York's date.
+                clock::timezone_for_country(&exchange.country),
                 resolutions,
                 fetched_at,
                 resolutions_probed_at
@@ -5852,6 +5892,9 @@ struct CreateDatasetRequest {
     /// The row count a bulk day must reach before the EOD job accepts it (DS-08, decision
     /// 0022); omitted, 10,000, a US session's order of magnitude.
     min_bulk_rows: Option<u64>,
+    /// The days the EOD job holds a symbol the provider has no history for before asking
+    /// again (DS-15); omitted, 30.
+    skip_retry_days: Option<u64>,
 }
 
 /// A dataset's figures from its last scan. The state lives on the row beside it.
@@ -5881,6 +5924,9 @@ struct DatasetRow {
     include_delisted: bool,
     /// A bulk day under this many rows is refused by the EOD job.
     min_bulk_rows: u64,
+    /// The days the EOD job holds a symbol the provider has no history for before it asks
+    /// again (DS-15).
+    skip_retry_days: u64,
     created_at: String,
     /// Current, Updating, Stale, Partial, Failed, Unknown, or Unavailable.
     state: String,
@@ -5906,7 +5952,8 @@ struct ScanAccepted {
 
 const DATASET_COLUMNS: &str = "d.id, d.source_id, d.exchange, d.types_json, d.resolution, \
      d.from_date, d.folder, d.include_delisted, d.created_at, s.scanned_at, s.listed, \
-     s.on_disk, s.latest_date, s.current_count, s.bytes, s.state, s.error, d.min_bulk_rows";
+     s.on_disk, s.latest_date, s.current_count, s.bytes, s.state, s.error, d.min_bulk_rows, \
+     d.skip_retry_days";
 
 fn map_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetRow> {
     let types_json: String = row.get(3)?;
@@ -5935,6 +5982,7 @@ fn map_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetRow> {
         folder: row.get(6)?,
         include_delisted: row.get::<_, i64>(7)? != 0,
         min_bulk_rows: row.get::<_, i64>(17)?.max(0) as u64,
+        skip_retry_days: row.get::<_, i64>(18)?.max(0) as u64,
         created_at: row.get(8)?,
         state: state.unwrap_or_else(|| STATE_UNKNOWN.to_owned()),
         scan,
@@ -6592,8 +6640,8 @@ async fn create_dataset(
         connection.execute(
             "INSERT INTO datasets
              (id, source_id, exchange, types_json, resolution, from_date, folder,
-              include_delisted, created_at, min_bulk_rows)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              include_delisted, created_at, min_bulk_rows, skip_retry_days)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 dataset_id,
                 id,
@@ -6605,6 +6653,7 @@ async fn create_dataset(
                 include_delisted,
                 now.to_rfc3339(),
                 request.min_bulk_rows.unwrap_or(DEFAULT_MIN_BULK_ROWS) as i64,
+                request.skip_retry_days.unwrap_or(DEFAULT_SKIP_RETRY_DAYS) as i64,
             ],
         )?;
     }
@@ -6764,6 +6813,11 @@ struct JobOutcome {
     updated: u64,
     skipped: Vec<Skipped>,
     error: Option<String>,
+    /// Split refetches the job made (DS-15), and the sessions it appended.
+    splits: u64,
+    sessions: u64,
+    /// The dataset's skip list as the job leaves it (DS-15).
+    skips: Vec<SymbolSkip>,
 }
 
 impl From<eod_job::Outcome> for JobOutcome {
@@ -6776,6 +6830,9 @@ impl From<eod_job::Outcome> for JobOutcome {
             updated: outcome.updated,
             skipped: outcome.skipped,
             error: outcome.error,
+            splits: outcome.splits,
+            sessions: outcome.sessions.len() as u64,
+            skips: outcome.skips,
         }
     }
 }
@@ -6790,6 +6847,11 @@ impl From<intraday_job::Outcome> for JobOutcome {
             updated: outcome.updated,
             skipped: outcome.skipped,
             error: outcome.error,
+            // The intraday job refetches nothing for splits and counts no sessions; only the
+            // EOD job's figures feed the split allowance (DS-15).
+            splits: 0,
+            sessions: 0,
+            skips: outcome.skips,
         }
     }
 }
@@ -6824,12 +6886,16 @@ struct DatasetJobRecord {
     resolution: String,
     /// `scheduled` when a schedule's run queued the job (DS-10), else `manual`.
     trigger: String,
+    /// Split refetches the job made (DS-15): what the next run's split allowance averages.
+    splits: u64,
+    /// Sessions the job appended (DS-15): what that average is per session.
+    sessions: u64,
 }
 
 const DATASET_JOB_COLUMNS: &str = "j.id, j.dataset_id, d.source_id, j.kind, j.state, \
      j.percent, j.created_at, j.started_at, j.finished_at, j.calls, j.added, j.updated, \
      j.skipped_json, j.estimate_json, j.error, j.log_path, d.exchange, d.resolution, \
-     EXISTS (SELECT 1 FROM automation_runs r WHERE r.job_id = j.id)";
+     EXISTS (SELECT 1 FROM automation_runs r WHERE r.job_id = j.id), j.splits, j.sessions";
 
 /// The most jobs `GET /api/datasets/jobs` lists (`?limit=` asks for fewer, or up to 500).
 const DATASET_JOBS_LISTED: usize = 50;
@@ -6852,6 +6918,8 @@ fn map_dataset_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetJobRecord
         updated: row.get::<_, i64>(11)?.max(0) as u64,
         skipped: serde_json::from_str(&skipped_json).unwrap_or_default(),
         estimate: estimate_json.and_then(|text| serde_json::from_str(&text).ok()),
+        splits: row.get::<_, i64>(19)?.max(0) as u64,
+        sessions: row.get::<_, i64>(20)?.max(0) as u64,
         error: row.get(14)?,
         log_path: row.get(15)?,
         exchange: row.get(16)?,
@@ -7014,13 +7082,23 @@ fn calendar_code_for(calendar_symbol: &str, exchange: &str) -> Option<String> {
     (suffix == exchange && !code.is_empty()).then(|| code.to_owned())
 }
 
-/// The last session a run fetches: today in New York, where the exchanges the console
-/// serves close; a session the provider has not published yet answers with no bars and is
-/// skipped, so asking a day early costs one call and nothing else.
-fn today_in_new_york() -> NaiveDate {
-    Utc::now()
-        .with_timezone(&chrono_tz::America::New_York)
-        .date_naive()
+/// The last session a run fetches: today where the exchange is (DS-15), which for an
+/// exchange east of New York is a day ahead of the console's own date. A session the
+/// provider has not published yet answers with no bars and is skipped, so asking a day
+/// early costs one call and nothing else.
+fn today_at_the_exchange(state: &AppState, source_id: &str, exchange: &str) -> NaiveDate {
+    let timezone = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        connection
+            .query_row(
+                "SELECT timezone FROM provider_exchanges WHERE source_id = ?1 AND code = ?2",
+                params![source_id, exchange],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+    };
+    clock::today_in(timezone.as_deref())
 }
 
 /// Queues the dataset's download job: 202 with the record, the job running in the
@@ -7173,7 +7251,7 @@ fn record_job_outcome(
     connection.execute(
         "UPDATE dataset_jobs
          SET state = ?2, finished_at = ?3, calls = ?4, added = ?5, updated = ?6,
-             skipped_json = ?7, estimate_json = ?8, error = ?9,
+             skipped_json = ?7, estimate_json = ?8, error = ?9, splits = ?10, sessions = ?11,
              percent = CASE WHEN ?2 = 'Complete' THEN 100 ELSE percent END
          WHERE id = ?1",
         params![
@@ -7189,9 +7267,123 @@ fn record_job_outcome(
                 .map(|estimate| serde_json::to_string(&estimate))
                 .transpose()?,
             outcome.error,
+            outcome.splits as i64,
+            outcome.sessions as i64,
         ],
     )?;
     Ok(())
+}
+
+/// The epoch second a current file's last bar reaches for `dataset` (DS-15): the expected
+/// session's close less one bar's length, the measure the scan judges currency by. `None` for
+/// daily bars, and for a source with no calendar file to set the session, in which case the
+/// intraday job asks about every file as it used to.
+fn expected_close_for(state: &AppState, dataset: &DatasetRow) -> Option<i64> {
+    let daily_folders: Vec<PathBuf> = {
+        let connection = state.database.lock().expect("database lock poisoned");
+        let mut statement = connection
+            .prepare("SELECT folder FROM datasets WHERE source_id = ?1 AND resolution = 'daily'")
+            .ok()?;
+        statement
+            .query_map(params![dataset.source_id], |row| row.get::<_, String>(0))
+            .ok()?
+            .flatten()
+            .map(PathBuf::from)
+            .collect()
+    };
+    let session = calendar_file(state, Path::new(&dataset.folder), &daily_folders)
+        .and_then(|path| last_csv_row_date(&path))
+        .and_then(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok())?;
+    match ExpectedSession::for_resolution(session, &dataset.resolution) {
+        ExpectedSession::Close { epoch, .. } => Some(epoch),
+        ExpectedSession::Date(_) => None,
+    }
+}
+
+/// The dataset's skip list (DS-15): the symbols the job is holding, and the date each may be
+/// asked again. A row whose dates no longer parse is left out rather than failing the run —
+/// it costs one call and is held again.
+fn dataset_skips(database: &Mutex<Connection>, dataset_id: &str) -> Vec<SymbolSkip> {
+    let connection = database.lock().expect("database lock poisoned");
+    let Ok(mut statement) = connection.prepare(
+        "SELECT symbol, reason, first_seen, retry_after FROM dataset_skips
+         WHERE dataset_id = ?1 ORDER BY symbol",
+    ) else {
+        return Vec::new();
+    };
+    let rows = statement.query_map(params![dataset_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    });
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|(symbol, reason, first_seen, retry_after)| {
+            let first_seen = NaiveDate::parse_from_str(&first_seen, "%Y-%m-%d").ok()?;
+            let retry_after = NaiveDate::parse_from_str(&retry_after, "%Y-%m-%d").ok()?;
+            Some(SymbolSkip {
+                symbol,
+                reason,
+                first_seen,
+                retry_after,
+            })
+        })
+        .collect()
+}
+
+/// Replaces the dataset's skip list with the one a run left (DS-15): a symbol the provider
+/// answered for this time has no hold and simply drops out.
+fn save_dataset_skips(
+    database: &Mutex<Connection>,
+    dataset_id: &str,
+    skips: &[SymbolSkip],
+) -> Result<()> {
+    let connection = database.lock().expect("database lock poisoned");
+    connection.execute(
+        "DELETE FROM dataset_skips WHERE dataset_id = ?1",
+        params![dataset_id],
+    )?;
+    for skip in skips {
+        connection.execute(
+            "INSERT INTO dataset_skips (dataset_id, symbol, reason, first_seen, retry_after)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                dataset_id,
+                skip.symbol,
+                skip.reason,
+                skip.first_seen.to_string(),
+                skip.retry_after.to_string(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// The dataset's average splits per session over its finished jobs (DS-15): what the next
+/// run's estimate allows for, rounded up so a part of a split still counts as one. Zero
+/// when the dataset has no finished job with a session, which the estimate reads as one a
+/// session anyway.
+fn average_splits_per_session(database: &Mutex<Connection>, dataset_id: &str) -> u64 {
+    let connection = database.lock().expect("database lock poisoned");
+    let (splits, sessions): (i64, i64) = connection
+        .query_row(
+            "SELECT COALESCE(SUM(splits), 0), COALESCE(SUM(sessions), 0)
+             FROM dataset_jobs
+             WHERE dataset_id = ?1 AND state = 'Complete'",
+            params![dataset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    if sessions <= 0 {
+        return 0;
+    }
+    // Rounded up, so a part of a split over the whole run still counts as one.
+    ((splits.max(0) + sessions - 1) / sessions) as u64
 }
 
 /// Runs the job over the adapter and records it; a failure of the service's own steps
@@ -7209,7 +7401,12 @@ async fn run_dataset_job(
     let outcome = execute_dataset_job(&state, &job_id, &dataset, &source, &adapter, budget).await;
     let finished_at = Utc::now().to_rfc3339();
     let recorded = match outcome {
-        Ok(outcome) => record_job_outcome(&state, &job_id, &outcome, &finished_at),
+        Ok(outcome) => {
+            // The run's own list is the dataset's from here: a hold it did not renew is
+            // over, and a symbol it held anew is one the next run will not pay for (DS-15).
+            let saved = save_dataset_skips(&state.database, &dataset.id, &outcome.skips);
+            record_job_outcome(&state, &job_id, &outcome, &finished_at).and(saved)
+        }
         Err(error) => {
             let connection = state.database.lock().expect("database lock poisoned");
             connection
@@ -7308,6 +7505,9 @@ async fn execute_dataset_job(
             folder: PathBuf::from(&dataset.folder),
             from_date,
             through: Utc::now(),
+            expected_close: expected_close_for(state, &dataset),
+            skips: dataset_skips(&state.database, &dataset.id),
+            skip_retry_days: dataset.skip_retry_days,
             symbols,
         };
         return Ok(
@@ -7321,8 +7521,11 @@ async fn execute_dataset_job(
         folder: PathBuf::from(&dataset.folder),
         catalog_dir: PathBuf::from(&source.catalog_dir),
         from_date,
-        through: today_in_new_york(),
+        through: today_at_the_exchange(&state, &dataset.source_id, &dataset.exchange),
         min_bulk_rows: dataset.min_bulk_rows,
+        splits_per_session: average_splits_per_session(&state.database, &dataset.id),
+        skips: dataset_skips(&state.database, &dataset.id),
+        skip_retry_days: dataset.skip_retry_days,
         calendar_code: calendar_code_for(&state.local.data.calendar_symbol, &dataset.exchange),
         symbols,
         catalog,
@@ -12577,11 +12780,23 @@ mod tests {
                     skipped: Vec::new(),
                     error: None,
                     backfills_left: 0,
+                    skips: vec![SymbolSkip {
+                        symbol: "NORO.US".into(),
+                        reason: "backfill: no bars from the provider".into(),
+                        first_seen: NaiveDate::from_ymd_opt(2025, 12, 2).unwrap(),
+                        retry_after: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                    }],
                 }
                 .into();
                 assert_eq!(outcome.state, JobState::Complete);
                 assert_eq!((outcome.calls, outcome.added, outcome.updated), (15, 1, 2));
                 assert_eq!(outcome.estimate, Some(Estimate::intraday_windows(2, 1)));
+                assert_eq!(outcome.skips.len(), 1, "the skip list is carried through");
+                assert_eq!(outcome.skips[0].symbol, "NORO.US");
+                assert_eq!(
+                    outcome.skips[0].retry_after,
+                    NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+                );
             }
 
             #[test]
@@ -12594,9 +12809,13 @@ mod tests {
                 );
                 assert_eq!(calendar_code_for("SPY", "US"), None);
                 assert_eq!(calendar_code_for(".US", "US"), None);
-                let today = today_in_new_york();
-                let utc = Utc::now().date_naive();
-                assert!(today == utc || today == utc.pred_opt().unwrap());
+                // New York's date, which is what an exchange with no timezone keeps.
+                assert_eq!(
+                    clock::today_in(Some(clock::NEW_YORK)),
+                    Utc::now()
+                        .with_timezone(&chrono_tz::America::New_York)
+                        .date_naive()
+                );
             }
 
             /// DS-08 (decisions 0020, 0022): `POST /api/datasets/{id}/update` queues the EOD
@@ -13947,5 +14166,62 @@ mod tests {
                 assert_eq!(listed_symbols(&connection, &rows[1]).unwrap(), ["SPY"]);
             }
         }
+    }
+    /// DS-15: a dataset's skip list is kept in the catalog, so the symbols a run held are
+    /// still held after the service restarts, and the retry interval is per dataset with
+    /// thirty days for one that asks for nothing else.
+    #[test]
+    fn a_datasets_skip_list_is_kept_in_the_catalog() {
+        let database = Mutex::new(Connection::open_in_memory().unwrap());
+        migrate(&database.lock().unwrap()).unwrap();
+        {
+            let connection = database.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO data_sources (id, name, kind, root, catalog_dir, created_at)
+                     VALUES ('src', 'src', 'provider', '/tmp/src', '/tmp/cat', 'now')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO datasets
+                     (id, source_id, exchange, types_json, resolution, from_date, folder,
+                      created_at)
+                     VALUES ('ds', 'src', 'US', '[\"Common Stock\"]', '1d', '2020-01-01',
+                             '/tmp/eod', 'now')",
+                    [],
+                )
+                .unwrap();
+            // A dataset created without one keeps the default interval.
+            let days: i64 = connection
+                .query_row(
+                    "SELECT skip_retry_days FROM datasets WHERE id = 'ds'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(days as u64, DEFAULT_SKIP_RETRY_DAYS);
+        }
+        assert!(dataset_skips(&database, "ds").is_empty());
+
+        let skip = SymbolSkip {
+            symbol: "YHOO.US".to_owned(),
+            reason: "backfill: no history from the provider".to_owned(),
+            first_seen: NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            retry_after: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+        };
+        save_dataset_skips(&database, "ds", &[skip.clone()]).unwrap();
+        assert_eq!(dataset_skips(&database, "ds"), vec![skip.clone()]);
+
+        // Saving twice replaces rather than adds, so the list cannot grow a duplicate hold,
+        // and a run that was answered for the symbol leaves nothing held.
+        save_dataset_skips(&database, "ds", &[skip.clone()]).unwrap();
+        assert_eq!(dataset_skips(&database, "ds"), vec![skip]);
+        save_dataset_skips(&database, "ds", &[]).unwrap();
+        assert!(dataset_skips(&database, "ds").is_empty());
+
+        // Another dataset's holds are its own.
+        assert!(dataset_skips(&database, "other").is_empty());
     }
 }

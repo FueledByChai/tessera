@@ -25,6 +25,9 @@
 //!
 //! Progress and the log go to the callbacks the caller passes; the outcome carries the
 //! state, the counts, the symbols skipped with their reasons, and the error.
+//!
+//! The through-date is the exchange's own local date, not the console's: see
+//! [`crate::provider::clock`] (DS-15).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CString;
@@ -80,6 +83,15 @@ pub struct EodJobInput {
     pub through: NaiveDate,
     /// A bulk day with fewer rows is refused.
     pub min_bulk_rows: u64,
+    /// The dataset's average splits per session over its recorded jobs: the split allowance
+    /// the estimate carries (DS-15). Zero on a dataset with none recorded, which the estimate
+    /// reads as one a session.
+    pub splits_per_session: u64,
+    /// The symbols this dataset is holding, and when each may be asked again (DS-15); a run
+    /// asks nothing of one whose `retry_after` is after its through-date.
+    pub skips: Vec<SymbolSkip>,
+    /// The days a symbol whose history comes back empty is held for (DS-15).
+    pub skip_retry_days: u64,
     /// The calendar symbol's code when it is listed on this exchange: a bulk day without it
     /// is refused, and its file's last date is the dataset's latest date.
     pub calendar_code: Option<String>,
@@ -118,6 +130,26 @@ impl JobState {
 pub struct Skipped {
     pub symbol: String,
     pub reason: String,
+}
+
+/// The days a symbol the provider has no history for is left alone before it is asked again
+/// (DS-15): a delisted name stays delisted, and thousands of them asked nightly would burn
+/// the budget on calls that cannot succeed.
+pub const DEFAULT_SKIP_RETRY_DAYS: u64 = 30;
+
+/// A symbol the dataset has stopped asking for, and the date it may be asked again (DS-15).
+/// The service keeps one list per dataset and hands it to every run; a run that asks nothing
+/// of a held symbol carries it forward, and one that is answered empty again dates the hold
+/// from the day it was first seen, not from the retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolSkip {
+    /// `<CODE>.<EXCHANGE>`, as [`Skipped`] names it.
+    pub symbol: String,
+    pub reason: String,
+    /// The run's own through-date when the symbol was first held.
+    pub first_seen: NaiveDate,
+    /// Ask again on or after this date.
+    pub retry_after: NaiveDate,
 }
 
 /// What a run has done so far, reported after each unit of work.
@@ -161,8 +193,14 @@ pub struct Outcome {
     pub error: Option<String>,
     /// The sessions whose rows were appended.
     pub sessions: Vec<NaiveDate>,
+    /// The split refetches the run made, one call each (DS-15): what the next run's split
+    /// allowance is averaged from.
+    pub splits: u64,
     /// Symbols left to backfill when the run stopped at the reserve; zero otherwise.
     pub backfills_left: u64,
+    /// The dataset's skip list as this run leaves it (DS-15): the entries it held, carried
+    /// forward, plus the symbols it held anew.
+    pub skips: Vec<SymbolSkip>,
 }
 
 /// The file a symbol's bars live in.
@@ -443,7 +481,14 @@ pub fn plan(input: &EodJobInput) -> Result<Plan, String> {
     let sessions = latest_date
         .map(|latest| sessions_after(latest, input.through))
         .unwrap_or_default();
-    let estimate = Estimate::eod(sessions.len() as u64, missing.len() as u64);
+    // A held symbol costs no call at all, so it is not part of what a run would spend (DS-15).
+    // Without this a dataset with a long skip list refuses to run for calls it will never
+    // make: the backfill is optional, but the refusal counts it against the reserve.
+    let backfills = missing
+        .iter()
+        .filter(|code| held(input, code).is_none())
+        .count() as u64;
+    let estimate = Estimate::eod(sessions.len() as u64, backfills, input.splits_per_session);
     Ok(Plan {
         latest_date,
         sessions,
@@ -451,6 +496,16 @@ pub fn plan(input: &EodJobInput) -> Result<Plan, String> {
         missing,
         estimate,
     })
+}
+
+/// The dataset's hold on `code`'s symbol when the hold covers the run's through-date (DS-15),
+/// and so the run will ask nothing of it; `None` when the symbol may be asked.
+pub fn held<'a>(input: &'a EodJobInput, code: &str) -> Option<&'a SymbolSkip> {
+    let symbol = format!("{code}.{}", input.exchange);
+    input
+        .skips
+        .iter()
+        .find(|skip| skip.symbol == symbol && skip.retry_after > input.through)
 }
 
 /// Whether a provider error ends the run (the provider is gone, or the token is) or only
@@ -470,6 +525,12 @@ struct Runner<'a, P: Provider> {
     calls: u64,
     added: u64,
     updated: u64,
+    /// Split refetches, one call each (DS-15).
+    splits: u64,
+    /// The dataset's skip list as this run leaves it (DS-15): the holds that still cover the
+    /// through-date, carried forward whatever this run asked of them, plus the symbols it
+    /// held anew.
+    skips: Vec<SymbolSkip>,
     skipped: Vec<Skipped>,
 }
 
@@ -528,15 +589,26 @@ impl<P: Provider> Runner<'_, P> {
             skipped: self.skipped,
             error,
             sessions,
+            splits: self.splits,
             backfills_left,
+            skips: self.skips,
         }
     }
 
     /// One symbol's history from the from-date, charged; `Ok(None)` when the provider
-    /// answered but not with a history (the symbol is skipped with the reason recorded),
-    /// `Err` when the run must end.
+    /// answered but not with a history (the symbol is skipped with the reason recorded, and
+    /// held for the dataset's retry interval so it is not asked again tomorrow), and when the
+    /// dataset is holding it. `Err` when the run must end.
     async fn history(&mut self, code: &str, what: &str) -> Result<Option<Vec<Bar>>, String> {
         let symbol = self.symbol(code);
+        // A held symbol costs nothing at all: this is the call the skip list exists to save.
+        if let Some(hold) = held(self.input, code) {
+            self.skip(
+                &symbol,
+                format!("{what}: held until {} ({})", hold.retry_after, hold.reason),
+            );
+            return Ok(None);
+        }
         let fetched = self
             .provider
             .eod_history(&symbol, self.input.from_date)
@@ -544,7 +616,9 @@ impl<P: Provider> Runner<'_, P> {
         self.charge();
         match fetched {
             Ok(bars) if bars.is_empty() => {
-                self.skip(&symbol, format!("{what}: no history from the provider"));
+                let reason = format!("{what}: no history from the provider");
+                self.skip(&symbol, reason.clone());
+                self.hold(&symbol, reason);
                 Ok(None)
             }
             Ok(bars) => Ok(Some(bars)),
@@ -562,6 +636,36 @@ impl<P: Provider> Runner<'_, P> {
             symbol: symbol.to_owned(),
             reason,
         });
+    }
+
+    /// Puts a symbol on the dataset's skip list for the retry interval from this run's
+    /// through-date (DS-15). A symbol the provider refuses again keeps the date it was first
+    /// held, so the list says how long the dataset has been without it, but is held for a
+    /// fresh interval: dated from `first_seen` instead it would be asked every run after the
+    /// first one past it, which is the nightly cost the list exists to avoid.
+    fn hold(&mut self, symbol: &str, reason: String) {
+        let first_seen = self
+            .input
+            .skips
+            .iter()
+            .find(|skip| skip.symbol == symbol)
+            .map(|skip| skip.first_seen)
+            .unwrap_or(self.input.through);
+        let days = self.input.skip_retry_days as i64;
+        let entry = SymbolSkip {
+            symbol: symbol.to_owned(),
+            reason,
+            first_seen,
+            retry_after: self.input.through + chrono::Duration::days(days),
+        };
+        match self
+            .skips
+            .iter_mut()
+            .find(|skip| skip.symbol == entry.symbol)
+        {
+            Some(place) => *place = entry,
+            None => self.skips.push(entry),
+        }
     }
 }
 
@@ -586,6 +690,13 @@ pub async fn run<P: Provider>(
         calls: 0,
         added: 0,
         updated: 0,
+        splits: 0,
+        skips: input
+            .skips
+            .iter()
+            .filter(|skip| skip.retry_after > input.through)
+            .cloned()
+            .collect(),
         skipped: Vec::new(),
     };
     let exchange = input.exchange.clone();
@@ -723,6 +834,7 @@ pub async fn run<P: Provider>(
     for code in &plan.present {
         let path = input.folder.join(file_name(code, &exchange));
         if split_codes.contains(code) {
+            runner.splits += 1;
             match runner.history(code, "split refetch").await {
                 Ok(Some(bars)) => {
                     if let Err(error) = write_history(&path, &bars) {
@@ -875,6 +987,7 @@ pub async fn run<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::clock;
 
     fn day(text: &str) -> NaiveDate {
         NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
@@ -900,6 +1013,71 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// DS-15: a run fetches through the exchange's own local date, so an exchange whose day
+    /// has already turned while New York's has not plans the session New York's date would
+    /// have left for tomorrow.
+    #[test]
+    fn an_exchange_whose_local_date_is_ahead_of_new_york_plans_the_extra_session() {
+        let dir = scratch("exchange-local-date");
+        let folder = dir.join("eod");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join("SPY.US.csv"),
+            format!("{DAILY_HEADER}\n2026-09-14,1,1,1,1,1,1\n"),
+        )
+        .unwrap();
+        let mut input = EodJobInput {
+            exchange: "US".into(),
+            folder: folder.clone(),
+            catalog_dir: dir.join("catalog"),
+            from_date: day("2020-01-01"),
+            through: day("2026-09-14"),
+            min_bulk_rows: 3,
+            splits_per_session: 0,
+            skips: Vec::new(),
+            skip_retry_days: DEFAULT_SKIP_RETRY_DAYS,
+            calendar_code: Some("SPY".into()),
+            symbols: vec![DatasetSymbol {
+                listing: Listing {
+                    code: "SPY".into(),
+                    name: String::new(),
+                    kind: "ETF".into(),
+                    currency: "USD".into(),
+                    country: String::new(),
+                    venue: String::new(),
+                },
+                delisted: false,
+            }],
+            catalog: Vec::new(),
+            delisted_catalog: Vec::new(),
+        };
+        // 02:30 UTC on the 15th: still the evening of the 14th in New York, already the
+        // morning of the 15th in Tokyo.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-15T02:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // New York's date is the one every exchange was given before, and it plans nothing:
+        // the file already holds the 14th.
+        input.through = clock::local_date(now, Some(clock::NEW_YORK));
+        assert_eq!(input.through, day("2026-09-14"));
+        assert!(super::plan(&input).unwrap().sessions.is_empty());
+
+        // Tokyo's date is the 15th, and that session is asked for now rather than tomorrow.
+        input.through = clock::local_date(now, Some("Asia/Tokyo"));
+        assert_eq!(input.through, day("2026-09-15"));
+        assert_eq!(
+            super::plan(&input).unwrap().sessions,
+            vec![day("2026-09-15")]
+        );
+
+        // An exchange the map has no timezone for keeps New York's date, and so its old plan.
+        input.through = clock::local_date(now, None);
+        assert!(super::plan(&input).unwrap().sessions.is_empty());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1089,6 +1267,9 @@ mod tests {
             from_date: day("2020-01-01"),
             through: day("2026-09-15"),
             min_bulk_rows: 3,
+            splits_per_session: 0,
+            skips: Vec::new(),
+            skip_retry_days: DEFAULT_SKIP_RETRY_DAYS,
             calendar_code: Some("SPY".into()),
             symbols: vec![
                 symbol("AAPL", false),
@@ -1123,7 +1304,15 @@ mod tests {
         );
         assert_eq!(plan.present, vec!["AAPL", "SPY"]);
         assert_eq!(plan.missing, vec!["NVDA", "YHOO"]);
-        assert_eq!(plan.estimate, Estimate::eod(4, 2));
+        // Four sessions: eight for the bulk and splits calls, plus one split a session
+        // allowed even on a dataset with nothing recorded yet (DS-15).
+        assert_eq!(plan.estimate, Estimate::eod(4, 2, 0));
+        input.splits_per_session = 3;
+        assert_eq!(
+            super::plan(&input).unwrap().estimate,
+            Estimate::eod(4, 2, 3)
+        );
+        input.splits_per_session = 0;
 
         // Without the calendar symbol on this exchange, the files' latest date rules.
         input.calendar_code = None;
@@ -1138,7 +1327,26 @@ mod tests {
         assert_eq!(plan.latest_date, None);
         assert!(plan.sessions.is_empty());
         assert_eq!(plan.missing.len(), 4);
-        assert_eq!(plan.estimate, Estimate::eod(0, 4));
+        assert_eq!(plan.estimate, Estimate::eod(0, 4, 0));
+
+        // A held symbol costs no call, so it is not one of the backfills the estimate counts
+        // (DS-15); a hold that has run out is, and is asked again.
+        input.skips = vec![SymbolSkip {
+            symbol: "NVDA.US".into(),
+            reason: "no history from the provider".into(),
+            first_seen: day("2026-09-01"),
+            retry_after: day("2026-10-15"),
+        }];
+        assert_eq!(
+            super::plan(&input).unwrap().estimate,
+            Estimate::eod(0, 3, 0)
+        );
+        input.skips[0].retry_after = day("2026-09-15");
+        assert_eq!(
+            super::plan(&input).unwrap().estimate,
+            Estimate::eod(0, 4, 0)
+        );
+        input.skips = Vec::new();
 
         fs::remove_dir_all(&folder).unwrap();
         assert!(super::plan(&input).unwrap_err().contains("missing"));

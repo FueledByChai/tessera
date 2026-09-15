@@ -30,7 +30,8 @@ use tessera::provider::Listing;
 use tessera::provider::budget::{CallBudget, Estimate};
 use tessera::provider::eodhd::Eodhd;
 use tessera::provider::jobs::eod::{
-    self, DAILY_HEADER, DatasetSymbol, EodJobInput, JobState, Outcome, Progress,
+    self, DAILY_HEADER, DEFAULT_SKIP_RETRY_DAYS, DatasetSymbol, EodJobInput, JobState, Outcome,
+    Progress, SymbolSkip,
 };
 
 /// A placeholder, never a real token.
@@ -199,6 +200,9 @@ struct Scenario {
     stub: Stub,
     provider: Eodhd,
     symbols: Vec<DatasetSymbol>,
+    /// The dataset's skip list, as the service would hand it to every run (DS-15).
+    skips: Vec<SymbolSkip>,
+    skip_retry_days: u64,
     log: String,
     progress: Vec<Progress>,
 }
@@ -238,6 +242,8 @@ impl Scenario {
             stub,
             provider: Eodhd::new(&base, TOKEN),
             symbols,
+            skips: Vec::new(),
+            skip_retry_days: DEFAULT_SKIP_RETRY_DAYS,
             log: String::new(),
             progress: Vec::new(),
         }
@@ -263,6 +269,9 @@ impl Scenario {
             from_date: day("2020-01-01"),
             through: day(through),
             min_bulk_rows: 4,
+            splits_per_session: 0,
+            skips: self.skips.clone(),
+            skip_retry_days: self.skip_retry_days,
             calendar_code: Some("SPY".into()),
             symbols: self.symbols.clone(),
             catalog: self.symbols.iter().map(|s| s.listing.clone()).collect(),
@@ -471,7 +480,7 @@ async fn two_sessions_are_appended_a_missing_symbol_is_backfilled_and_a_rerun_wr
     );
     assert!(outcome.skipped.is_empty(), "{outcome:?}");
     assert_eq!(outcome.backfills_left, 0);
-    assert_eq!(outcome.estimate, Some(Estimate::eod(2, 1)));
+    assert_eq!(outcome.estimate, Some(Estimate::eod(2, 1, 0)));
     assert_eq!(budget.used, 1_234 + 5, "every call was charged");
     assert_eq!(
         s.calls(),
@@ -736,7 +745,7 @@ async fn the_reserve_stops_the_backfill_cleanly_and_the_rerun_continues_from_the
     assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
     assert_eq!((outcome.calls, outcome.added, outcome.updated), (1, 1, 0));
     assert_eq!(outcome.backfills_left, 1, "{outcome:?}");
-    assert_eq!(outcome.estimate, Some(Estimate::eod(0, 2)));
+    assert_eq!(outcome.estimate, Some(Estimate::eod(0, 2, 0)));
     assert!(budget.at_reserve());
     assert_eq!(s.calls(), ["/api/eod/NVDA.US?from=2020-01-01&period=d"]);
     assert!(s.file("NVDA").is_file());
@@ -764,8 +773,8 @@ async fn the_reserve_stops_the_backfill_cleanly_and_the_rerun_continues_from_the
     );
     s.no_part_files();
 
-    // Two sessions need four mandatory calls; three available is a refusal with both
-    // numbers and no call.
+    // Two sessions need four mandatory calls and two of split allowance (DS-15) on a dataset
+    // with nothing recorded: six; three available is a refusal with both numbers and no call.
     s.take_calls();
     s.set_bulk("2026-09-10", &["AAPL", "SPY", "MSFT", "NVDA"], 110.0);
     s.set_bulk("2026-09-11", &["AAPL", "SPY", "MSFT", "NVDA"], 111.0);
@@ -774,9 +783,9 @@ async fn the_reserve_stops_the_backfill_cleanly_and_the_rerun_continues_from_the
     assert_eq!(outcome.state, JobState::Failed, "{outcome:?}");
     assert_eq!(
         outcome.error.as_deref(),
-        Some("needs 4 calls, 3 available above the reserve of 5")
+        Some("needs 6 calls, 3 available above the reserve of 5")
     );
-    assert_eq!(outcome.estimate, Some(Estimate::eod(2, 0)));
+    assert_eq!(outcome.estimate, Some(Estimate::eod(2, 0, 0)));
     assert_eq!(outcome.calls, 0);
     assert!(s.calls().is_empty(), "{:?}", s.calls());
     assert_eq!(budget.used, 2);
@@ -876,4 +885,88 @@ async fn a_provider_failure_mid_run_fails_the_job_and_keeps_the_files_whole() {
     assert_eq!((outcome.calls, outcome.added, outcome.updated), (1, 1, 0));
     assert_eq!(s.calls(), ["/api/eod/NVDA.US?from=2020-01-01&period=d"]);
     s.cleanup();
+}
+
+/// DS-15: a symbol the provider has no history for is not asked again every night. The first
+/// run spends one call on it and holds it; the second, handed that hold, spends nothing at
+/// all and carries it forward; a run whose through-date has reached the retry date asks once
+/// more. Thousands of delisted names asked nightly would burn the budget on calls that
+/// cannot succeed.
+#[tokio::test]
+async fn a_no_history_symbol_costs_one_call_then_none_then_one_again() {
+    let mut s = Scenario::new("skip-list").await;
+    s.skip_retry_days = 2;
+    // NVDA is the only symbol without a file, and through is the seeded last session, so
+    // there is no bulk call and the backfill is the whole run.
+    s.set_history("NVDA.US", Vec::new());
+
+    let outcome = s.run("2026-09-09", &mut plenty()).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        history_calls(&s, "NVDA.US"),
+        1,
+        "run 1: {outcome:?}\n{}",
+        s.log
+    );
+    assert_eq!(outcome.calls, 1, "{outcome:?}\n{}", s.log);
+    let held = outcome.skips.clone();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].symbol, "NVDA.US");
+    assert_eq!(held[0].first_seen, day("2026-09-09"));
+    assert_eq!(held[0].retry_after, day("2026-09-11"));
+    assert!(
+        held[0].reason.contains("no history from the provider"),
+        "{held:?}"
+    );
+
+    // The second run: the hold covers the through-date, so nothing at all is asked, and the
+    // hold survives a run that asked nothing of it.
+    s.skips = held;
+    s.take_calls();
+    let outcome = s.run("2026-09-09", &mut plenty()).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(outcome.calls, 0, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        s.calls(),
+        Vec::<String>::new(),
+        "run 2 asked: {:?}",
+        s.calls()
+    );
+    assert_eq!(outcome.skips, s.skips, "the hold was not carried forward");
+
+    // The third run: the through-date has reached the retry date, so the symbol is asked
+    // again, and answered empty it is held a fresh interval from this run's date while
+    // keeping the date it was first held.
+    s.take_calls();
+    s.set_bulk("2026-09-10", &["AAPL", "SPY", "MSFT"], 101.0);
+    s.set_bulk("2026-09-11", &["AAPL", "SPY", "MSFT"], 102.0);
+    let outcome = s.run("2026-09-11", &mut plenty()).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        history_calls(&s, "NVDA.US"),
+        1,
+        "run 3: {outcome:?}\n{}",
+        s.log
+    );
+    let held = &outcome.skips;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(
+        held[0].first_seen,
+        day("2026-09-09"),
+        "the first-seen date moved on a retry"
+    );
+    assert_eq!(held[0].retry_after, day("2026-09-13"), "{held:?}");
+    assert!(!s.file("NVDA").exists());
+    s.no_part_files();
+    s.cleanup();
+}
+
+/// The calls the run made for one symbol's history.
+fn history_calls(scenario: &Scenario, symbol: &str) -> usize {
+    let path = format!("/api/eod/{symbol}");
+    scenario
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with(&path))
+        .count()
 }
