@@ -44,7 +44,10 @@
 # blocks, and those blocks carry the ticket's text with them, so their `Serves` lines are read
 # back: a story whose tickets have all been archived reads done rather than unticketed, and
 # --show <story> lists them as done with the date they were archived. A missing changelog is
-# simply no archived tickets.
+# simply no archived tickets. The changelog is the working tree's, so an archived ticket counts
+# as done only when the commit its block names is reachable from the ref being judged: at a ref
+# before that commit the ticket had not shipped, and marking it done reports a story finished
+# at a ref where it was not.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REF="$("$ROOT/scripts/loop-config.sh" default_branch)"
@@ -106,7 +109,7 @@ status() {
   fi
   git log --reverse --date=short --format='%h %ad %s' "$ref" -- 2>/dev/null \
     | perl -e '
-      my ($backlog, $mode, $claimed, $sprint, $stories_file, $changelog, $want, $section_filter) = @ARGV;
+      my ($backlog, $mode, $claimed, $sprint, $stories_file, $changelog, $want, $section_filter, $judged_ref) = @ARGV;
       my %claimed = map { $_ => 1 } grep { length } split /,/, $claimed;
       my @sprint = grep { length } split /,/, $sprint;
       my %sprint; my $pos = 0; $sprint{$_} //= ++$pos for @sprint;
@@ -151,17 +154,31 @@ status() {
         my $text = join " ", @{ $t->{body} };
         while ($text =~ /\bserves\s+([A-Z]+-\d+(?:\s*,\s*[A-Z]+-\d+)*)/gi) { push @{ $t->{serves} }, split /\s*,\s*/, $1; }
       }
+      # Every commit reachable from the ref being judged, so an archived ticket can be judged
+      # by whether its own commit is one of them. `git rev-list` failing (an unresolvable ref)
+      # leaves the list empty, and then nothing is judged and the changelog is taken at its word
+      # rather than every archived ticket turning todo.
+      my @reachable = split /\n/, `git rev-list "$judged_ref" 2>/dev/null`;
+      my %reachable;
+      my $landed_archived = sub {
+        my $sha = shift;
+        return 1 unless @reachable;
+        return $reachable{$sha} //= (grep { index($_, $sha) == 0 } @reachable) ? 1 : 0;
+      };
       # Tickets that have left the file. release-notes.sh --archive writes each as
       # `#### <id> <title> — <date> · <sha>` with its own text underneath, so the `Serves` lines
       # come back with them; a heading ends the block, and a missing changelog is no archived
       # tickets. They are kept out of @tickets so the tables and --open stay the file contents.
+      # A block whose commit the judged ref does not reach is a ticket that had not shipped yet
+      # there, so it reads todo: the story it serves was still open at that ref.
       my @archived;
       if ($changelog ne "" && open my $cf, "<", $changelog) {
         my $a;
         while (my $line = <$cf>) {
           chomp $line;
           if ($line =~ /^#### ([A-Z]+-\d+) (.*?) — (\d{4}-\d{2}-\d{2}) · ([0-9a-f]{4,40})/) {
-            $a = { id => $1, title => $2, date => $3, sha => $4, state => "done", claim => "",
+            $a = { id => $1, title => $2, date => $3, sha => $4,
+                   state => ($landed_archived->($4) ? "done" : "todo"), claim => "",
                    archived => 1, section => "", heading => $line, body => [], serves => [] };
             push @archived, $a; next;
           }
@@ -289,7 +306,7 @@ status() {
           scalar(@rows), $n{done} // 0, $ready_n, ($n{claimed} // 0) + ($n{doing} // 0),
           scalar(@rows) - ($n{done} // 0) - $ready_n - ($n{claimed} // 0) - ($n{doing} // 0);
       }
-    ' "$backlog" "$mode" "$claimed" "$sprint" "$stories" "$changelog" "$WANT" "$SECTION"
+    ' "$backlog" "$mode" "$claimed" "$sprint" "$stories" "$changelog" "$WANT" "$SECTION" "$ref"
 }
 
 self_test() {
@@ -425,6 +442,13 @@ EOF2
     out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD --stories-file "$PWD/PRODUCT.md" --show BT-1 2>&1)"
     echo "$out" | grep -q "^ticket: AA-01  done (archived $archive_date) " || { echo "self-test: --show BT-1 should list AA-01 as done with its archive date:"; echo "$out"; exit 1; }
     echo "$out" | grep -q "^ticket: AA-02  done (archived $archive_date) " || { echo "self-test: --show BT-1 should list AA-02 the same way:"; echo "$out"; exit 1; }
+    # The changelog is the working tree's, so at a ref before the commits it names the tickets
+    # had not shipped: they must not read done, and the story they serve must not either.
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD~2 --stories-file "$PWD/PRODUCT.md" --stories 2>&1)"
+    echo "$out" | grep -q '^BT-1 *open 0/2 ' || { echo "self-test: BT-1 must not read done at a ref before its archived tickets landed:"; echo "$out"; exit 1; }
+    out="$("$ROOT/scripts/backlog-status.sh" --backlog BACKLOG.md --ref HEAD~2 --stories-file "$PWD/PRODUCT.md" --show BT-1 2>&1)"
+    echo "$out" | grep -q "^ticket: AA-01  todo " || { echo "self-test: --show BT-1 at HEAD~2 should list AA-01 as todo:"; echo "$out"; exit 1; }
+    echo "$out" | grep -q "^ticket: AA-02  todo " || { echo "self-test: --show BT-1 at HEAD~2 should list AA-02 as todo:"; echo "$out"; exit 1; }
     git reset -q --hard HEAD~2
     git checkout -q -- BACKLOG.md; rm -f PRODUCT.md sprint.toml CHANGELOG.md
     # AA-01 lands while its line still says doing: git wins, with the commit's date and sha.
