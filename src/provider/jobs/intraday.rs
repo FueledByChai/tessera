@@ -25,6 +25,11 @@
 //!    symbols left are counted, and the next run, planning from the files again, picks them
 //!    up.
 //!
+//! Two costs DS-09 left are paid by the same means as the EOD job's (DS-15): a file whose
+//! last bar already reaches the expected session's close is asked nothing at all — it has
+//! nothing to fetch until the next session — and a symbol the provider has no bars for
+//! joins the dataset's skip list instead of being asked again on the next run.
+//!
 //! Files keep the layout the engine reads (`docs/DATA_SOURCES.md`):
 //! `Timestamp,Gmtoffset,Datetime,Open,High,Low,Close,Volume`, the timestamp as UTC epoch
 //! seconds, the datetime as that instant in UTC, one file per symbol named
@@ -39,8 +44,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 
 use super::eod::{
-    DatasetSymbol, JobState, Progress, Skipped, check_folder, ends_the_run, file_name, tail_of,
-    write_part_then_rename,
+    DatasetSymbol, JobState, Progress, Skipped, SymbolSkip, check_folder, ends_the_run, file_name,
+    tail_of, write_part_then_rename,
 };
 use crate::provider::budget::{CallBudget, Estimate, INTRADAY_CALL_COST};
 use crate::provider::{IntradayBar, Provider};
@@ -61,6 +66,16 @@ pub struct IntradayJobInput {
     pub from_date: NaiveDate,
     /// The instant a run fetches through (now, from the service).
     pub through: DateTime<Utc>,
+    /// The epoch second a file's last bar must reach for the file to count as current: the
+    /// expected session's close less one bar's length, as the scan judges currency (DS-15).
+    /// A file at or past it has nothing left to fetch until the next session, so it is not
+    /// asked; `None` when the dataset has no expected session, and then every file is asked.
+    pub expected_close: Option<i64>,
+    /// The symbols this dataset is holding, and when each may be asked again (DS-15); a run
+    /// asks nothing of one whose `retry_after` is after its through-date.
+    pub skips: Vec<SymbolSkip>,
+    /// The days a symbol the provider has no bars for is held for (DS-15).
+    pub skip_retry_days: u64,
     /// The dataset's symbols: the listing of its types, delisted ones included when the
     /// dataset includes them.
     pub symbols: Vec<DatasetSymbol>,
@@ -94,6 +109,9 @@ pub struct Plan {
     pub backfills: Vec<SymbolWindows>,
     /// Files whose last row carries no timestamp: left as they are and skipped.
     pub unreadable: Vec<String>,
+    /// Files whose last bar already reaches the expected session's close (DS-15): asked
+    /// nothing at all, which for a dataset that is current is the whole run.
+    pub current: Vec<String>,
     pub estimate: Estimate,
 }
 
@@ -115,6 +133,9 @@ pub struct Outcome {
     pub error: Option<String>,
     /// Symbols left to backfill when the run stopped at the reserve; zero otherwise.
     pub backfills_left: u64,
+    /// The dataset's skip list as this run leaves it (DS-15): the holds that still cover the
+    /// through-date, carried forward, plus the symbols it held anew.
+    pub skips: Vec<SymbolSkip>,
 }
 
 /// The windows covering `from..=to` in spans of `window_days` (at least one day), oldest
@@ -239,6 +260,7 @@ pub fn plan(input: &IntradayJobInput, window_days: u32) -> Result<Plan, String> 
     let mut increments = Vec::new();
     let mut backfills = Vec::new();
     let mut unreadable = Vec::new();
+    let mut current = Vec::new();
     for symbol in &input.symbols {
         let code = &symbol.listing.code;
         let path = input.folder.join(file_name(code, &input.exchange));
@@ -246,7 +268,18 @@ pub fn plan(input: &IntradayJobInput, window_days: u32) -> Result<Plan, String> 
             if symbol.delisted {
                 continue;
             }
-            match last_timestamp_of(&path).and_then(|last| Utc.timestamp_opt(last, 0).single()) {
+            let last = last_timestamp_of(&path);
+            // A file already at the expected session's close is current: the next session's
+            // bars do not exist yet, so the request that would read its last bar back is
+            // five calls spent on nothing (DS-15).
+            if input
+                .expected_close
+                .is_some_and(|close| last.is_some_and(|last| last >= close))
+            {
+                current.push(code.clone());
+                continue;
+            }
+            match last.and_then(|last| Utc.timestamp_opt(last, 0).single()) {
                 Some(last) => increments.push(SymbolWindows {
                     code: code.clone(),
                     windows: windows(last, input.through, window_days),
@@ -267,6 +300,7 @@ pub fn plan(input: &IntradayJobInput, window_days: u32) -> Result<Plan, String> 
         increments,
         backfills,
         unreadable,
+        current,
         estimate,
     })
 }
@@ -298,6 +332,8 @@ struct Runner<'a, P: Provider> {
     calls: u64,
     added: u64,
     updated: u64,
+    /// The dataset's skip list as this run leaves it (DS-15).
+    skips: Vec<SymbolSkip>,
     skipped: Vec<Skipped>,
 }
 
@@ -362,6 +398,45 @@ impl<P: Provider> Runner<'_, P> {
             skipped: self.skipped,
             error,
             backfills_left,
+            skips: self.skips,
+        }
+    }
+
+    /// The dataset's hold on `code`'s symbol when the hold covers the run's through-date
+    /// (DS-15), and so the run will ask nothing of it; `None` when the symbol may be asked.
+    fn held(&self, code: &str) -> Option<&SymbolSkip> {
+        let symbol = self.symbol(code);
+        let through = self.input.through.date_naive();
+        self.input
+            .skips
+            .iter()
+            .find(|skip| skip.symbol == symbol && skip.retry_after > through)
+    }
+
+    /// Puts a symbol on the dataset's skip list for the retry interval from this run's date
+    /// (DS-15): a symbol the provider has no bars for will have none tomorrow either.
+    fn hold(&mut self, symbol: &str, reason: String) {
+        let today = self.input.through.date_naive();
+        let first_seen = self
+            .input
+            .skips
+            .iter()
+            .find(|skip| skip.symbol == symbol)
+            .map(|skip| skip.first_seen)
+            .unwrap_or(today);
+        let entry = SymbolSkip {
+            symbol: symbol.to_owned(),
+            reason,
+            first_seen,
+            retry_after: today + chrono::Duration::days(self.input.skip_retry_days as i64),
+        };
+        match self
+            .skips
+            .iter_mut()
+            .find(|skip| skip.symbol == entry.symbol)
+        {
+            Some(place) => *place = entry,
+            None => self.skips.push(entry),
         }
     }
 
@@ -376,6 +451,14 @@ impl<P: Provider> Runner<'_, P> {
         stop_at_reserve: bool,
     ) -> Result<Fetched, String> {
         let symbol = self.symbol(code);
+        // A held symbol costs nothing at all: this is the call the skip list exists to save.
+        if let Some(hold) = self.held(code) {
+            self.skip(
+                &symbol,
+                format!("{what}: held until {} ({})", hold.retry_after, hold.reason),
+            );
+            return Ok(Fetched::Skipped);
+        }
         let mut bars = Vec::new();
         for (index, window) in windows.iter().enumerate() {
             if stop_at_reserve && self.budget.at_reserve() {
@@ -414,14 +497,13 @@ impl<P: Provider> Runner<'_, P> {
             let (Some(first), Some(last)) = (windows.first(), windows.last()) else {
                 unreachable!("a symbol with no windows is never fetched")
             };
-            self.skip(
-                &symbol,
-                format!(
-                    "{what}: no bars from the provider between {} and {}",
-                    first.from.format("%Y-%m-%dT%H:%M:%SZ"),
-                    last.to.format("%Y-%m-%dT%H:%M:%SZ")
-                ),
+            let reason = format!(
+                "{what}: no bars from the provider between {} and {}",
+                first.from.format("%Y-%m-%dT%H:%M:%SZ"),
+                last.to.format("%Y-%m-%dT%H:%M:%SZ")
             );
+            self.skip(&symbol, reason.clone());
+            self.hold(&symbol, reason);
             return Ok(Fetched::Skipped);
         }
         Ok(Fetched::Bars(normalized(bars)))
@@ -450,6 +532,12 @@ pub async fn run<P: Provider>(
         calls: 0,
         added: 0,
         updated: 0,
+        skips: input
+            .skips
+            .iter()
+            .filter(|skip| skip.retry_after > input.through.date_naive())
+            .cloned()
+            .collect(),
         skipped: Vec::new(),
     };
     let exchange = input.exchange.clone();
@@ -470,6 +558,12 @@ pub async fn run<P: Provider>(
     let estimate = plan.estimate;
     let increment_windows: u64 = plan.increments.iter().map(|s| s.windows.len() as u64).sum();
     let backfill_windows: u64 = plan.backfills.iter().map(|s| s.windows.len() as u64).sum();
+    if !plan.current.is_empty() {
+        runner.log(&format!(
+            "{} file(s) already reach the expected session close and are asked nothing (DS-15)",
+            plan.current.len()
+        ));
+    }
     runner.log(&format!(
         "dataset {} on {exchange} at {resolution}: {} symbols, {} with a file ({} windows to fetch), {} to backfill ({} windows), windows of {} days through {}",
         input.folder.display(),
@@ -630,7 +724,7 @@ pub async fn run<P: Provider>(
 mod tests {
     use super::*;
     use crate::provider::Listing;
-    use crate::provider::jobs::eod::part_path;
+    use crate::provider::jobs::eod::{DEFAULT_SKIP_RETRY_DAYS, part_path};
 
     fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
@@ -797,6 +891,9 @@ mod tests {
             folder: folder.clone(),
             from_date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
             through: at("2025-12-02T14:30:00Z"),
+            expected_close: None,
+            skips: Vec::new(),
+            skip_retry_days: DEFAULT_SKIP_RETRY_DAYS,
             symbols: vec![
                 symbol("SPY", false),
                 symbol("AAPL", false),

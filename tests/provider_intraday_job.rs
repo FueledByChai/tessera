@@ -31,7 +31,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 use tessera::provider::Listing;
 use tessera::provider::budget::{CallBudget, Estimate, INTRADAY_CALL_COST};
 use tessera::provider::eodhd::Eodhd;
-use tessera::provider::jobs::eod::{DatasetSymbol, JobState, Progress};
+use tessera::provider::jobs::eod::{
+    DEFAULT_SKIP_RETRY_DAYS, DatasetSymbol, JobState, Progress, SymbolSkip,
+};
 use tessera::provider::jobs::intraday::{
     self, INTRADAY_HEADER, IntradayJobInput, Outcome, Window, windows,
 };
@@ -183,6 +185,13 @@ struct Scenario {
     stub: Stub,
     provider: Eodhd,
     symbols: Vec<DatasetSymbol>,
+    /// The epoch second a file's last bar must reach to be current (DS-15); `None` until a
+    /// test sets it, and then every file is asked.
+    expected_close: Option<i64>,
+    /// The dataset's skip list as the service would have stored it from earlier runs
+    /// (DS-15); a test carries a run's outcome forward with `carry_skips`.
+    skips: Vec<SymbolSkip>,
+    skip_retry_days: u64,
     log: String,
     progress: Vec<Progress>,
 }
@@ -211,6 +220,9 @@ impl Scenario {
                     delisted: false,
                 })
                 .collect(),
+            expected_close: None,
+            skips: Vec::new(),
+            skip_retry_days: DEFAULT_SKIP_RETRY_DAYS,
             log: String::new(),
             progress: Vec::new(),
         }
@@ -244,8 +256,16 @@ impl Scenario {
             folder: self.folder(),
             from_date: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
             through: at(through),
+            expected_close: self.expected_close,
+            skips: self.skips.clone(),
+            skip_retry_days: self.skip_retry_days,
             symbols: self.symbols.clone(),
         }
+    }
+
+    /// Stores a run's skip list the way the service does, so the next run sees it (DS-15).
+    fn carry_skips(&mut self, outcome: &Outcome) {
+        self.skips = outcome.skips.clone();
     }
 
     fn calls(&self) -> Vec<String> {
@@ -823,5 +843,164 @@ async fn a_provider_failure_mid_run_fails_the_job_and_keeps_the_files_whole() {
             line(FROM_DATE_EPOCH + 3_600, 10.0)
         )
     );
+    s.cleanup();
+}
+
+/// A file whose last bar already reaches the expected session's close is current: the next
+/// session's bars do not exist yet, so the run asks nothing of it at all - the request the
+/// increment would otherwise spend reading that same bar back and appending nothing (DS-15).
+/// The same file with no close to judge by is asked, which is what makes the field the
+/// difference rather than the run happening to have nothing to do.
+#[tokio::test]
+async fn a_current_file_costs_no_request() {
+    let mut s = Scenario::new("current", &["AAPL"]).await;
+    let close = THROUGH - 3_600;
+    s.seed("AAPL", &[close - 300, close]);
+    s.set_rows("AAPL", vec![row(close, 101.0)]);
+    let before = s.read("AAPL");
+
+    // No close to judge by: the file's last bar is an hour behind the instant, so the
+    // increment runs, the provider hands back the bar the file already holds, and nothing is
+    // written - a request spent to learn the file was current.
+    let mut budget = plenty();
+    let outcome = s.run(THROUGH, &mut budget).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        (
+            outcome.requests,
+            outcome.calls,
+            outcome.added,
+            outcome.updated
+        ),
+        (1, 5, 0, 0),
+        "{outcome:?}\n{}",
+        s.log
+    );
+    assert_eq!(s.calls(), [call("AAPL", close, THROUGH)]);
+    assert_eq!(s.read("AAPL"), before, "the file was rewritten");
+    assert!(s.log.contains("is current; nothing appended"), "{}", s.log);
+
+    // Told the session's close, the same file is current and the run asks nothing at all.
+    s.take_calls();
+    s.expected_close = Some(close);
+    let plan = intraday::plan(&s.input(THROUGH), 600).unwrap();
+    assert_eq!(plan.current, ["AAPL"]);
+    assert!(plan.increments.is_empty(), "{plan:?}");
+    assert_eq!(plan.estimate, Estimate::intraday_windows(0, 0));
+
+    let mut budget = plenty();
+    let outcome = s.run(THROUGH, &mut budget).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        (
+            outcome.requests,
+            outcome.calls,
+            outcome.added,
+            outcome.updated
+        ),
+        (0, 0, 0, 0),
+        "{outcome:?}\n{}",
+        s.log
+    );
+    assert_eq!(outcome.estimate, Some(Estimate::intraday_windows(0, 0)));
+    assert!(
+        s.calls().is_empty(),
+        "a current file was asked: {:?}",
+        s.calls()
+    );
+    assert_eq!(budget.used, 1_234, "a current file was charged something");
+    assert_eq!(s.read("AAPL"), before, "the file was rewritten");
+    assert!(
+        s.log.contains("already reach the expected session close"),
+        "{}",
+        s.log
+    );
+    s.no_part_files();
+    s.cleanup();
+}
+
+/// A symbol the provider has no bars for is held, and the next run asks nothing of it: the
+/// backfill's windows are not spent again to be told the same thing (DS-15). The hold runs
+/// from the run's own date for the retry interval, past it the symbol is asked again, and its
+/// first-seen date stays the one it was first seen on.
+#[tokio::test]
+async fn a_no_bars_symbol_is_not_asked_again_on_the_next_run() {
+    let mut s = Scenario::new("held", &["NORO"]).await;
+    s.set_rows("NORO", Vec::new());
+
+    let mut budget = plenty();
+    let outcome = s.run(THROUGH, &mut budget).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        (outcome.requests, outcome.calls, outcome.added),
+        (2, 10, 0),
+        "{outcome:?}\n{}",
+        s.log
+    );
+    assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.skips,
+        [SymbolSkip {
+            symbol: "NORO.US".into(),
+            reason: "backfill: no bars from the provider between 2024-01-01T00:00:00Z and 2025-12-02T14:30:00Z".into(),
+            first_seen: NaiveDate::from_ymd_opt(2025, 12, 2).unwrap(),
+            retry_after: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        }],
+        "{outcome:?}"
+    );
+
+    // The next run, a day on, asks nothing of it and leaves the hold as it found it.
+    s.carry_skips(&outcome);
+    s.take_calls();
+    let mut budget = plenty();
+    let outcome = s.run(THROUGH + DAY, &mut budget).await;
+    assert_eq!(outcome.state, JobState::Complete, "{outcome:?}\n{}", s.log);
+    assert_eq!(
+        (outcome.requests, outcome.calls),
+        (0, 0),
+        "{outcome:?}\n{}",
+        s.log
+    );
+    assert!(
+        s.calls().is_empty(),
+        "a held symbol was asked: {:?}",
+        s.calls()
+    );
+    assert_eq!(budget.used, 1_234, "a held symbol was charged something");
+    assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
+    assert_eq!(outcome.skipped[0].symbol, "NORO.US");
+    assert!(
+        outcome.skipped[0]
+            .reason
+            .starts_with("backfill: held until 2026-01-01 ("),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.skips, s.skips, "the hold was not carried forward");
+
+    // Past the retry date the symbol is asked again, and first-seen is the date it was
+    // first seen rather than the day the hold ran out.
+    s.carry_skips(&outcome);
+    s.take_calls();
+    let mut budget = plenty();
+    let outcome = s.run(THROUGH + 30 * DAY, &mut budget).await;
+    assert_eq!(
+        (outcome.requests, outcome.calls),
+        (2, 10),
+        "{outcome:?}\n{}",
+        s.log
+    );
+    assert_eq!(outcome.skips.len(), 1, "{outcome:?}");
+    assert_eq!(
+        outcome.skips[0].first_seen,
+        NaiveDate::from_ymd_opt(2025, 12, 2).unwrap(),
+        "first-seen moved with the re-hold"
+    );
+    assert_eq!(
+        outcome.skips[0].retry_after,
+        NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+        "{outcome:?}"
+    );
+    assert!(!s.file("NORO").exists());
+    s.no_part_files();
     s.cleanup();
 }
