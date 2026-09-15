@@ -663,6 +663,46 @@ run and none on the second, and a call again after the interval; a budget unit t
 split allowance is in the mandatory estimate; a job test on an exchange whose local date is ahead
 of New York plans the extra session.; `tests/provider_intraday_job.rs` proves a current 5m file costs no request and a no-bars symbol is not asked again on the next run.
 
+### DS-16 The adapter tolerates the nulls a provider sends, and reports what it dropped
+Expanding GBOND on the Inventory page fails with `malformed provider response:
+/api/exchange-symbol-list/GBOND: invalid type: null, expected a string at line 1 column 6006`.
+Every payload struct in `src/provider/eodhd.rs` (`ListingRow`, `ExchangeRow`, `BulkRow`,
+`SplitRow`, `BarRow`) declares its string fields as `String` with `#[serde(default)]`, and
+`serde`'s `default` covers an **absent** field but not an explicit `null`, so one null anywhere in
+a six-thousand-row listing rejects the whole exchange — and the same null in a bulk day or a
+splits row fails an unattended night's job. The structs move to a shared deserializer that reads
+null and absent alike, so a null becomes an absent value and never a failed response; a row whose
+**key** is null or empty is dropped with a reason and counted (`code` on a listing, bulk, or split
+row; `date` on a bar or split row; `split` on a split row), while a descriptive field becomes
+blank (`name`, `country`, `currency`, `Type`, `exchange`, `exchange_short_name`); a body that is
+not a JSON list still fails loudly as before. The trait's listing call stops returning
+`Vec<Listing>` alone and carries the dropped rows with their reasons, and the service's call sites
+log what was dropped so no slice is silent. Serves BT-1208. Decisions: 0020, 0026.
+**Done when:** a new `tests/fixtures/eodhd/` fixture in GBOND's shape parses, a unit test in
+`eodhd.rs` proves null and absent behave alike and that an empty string is not a null, and
+`exchanges_and_symbols_parse_the_recorded_lists` in `tests/provider_eodhd.rs` still passes.
+
+### DS-17 The dropped rows show on the exchange row — Blocked by DS-16
+A refresh whose symbol list dropped rows says nothing about it: `refresh_availability` in
+`src/bin/tessera_ui.rs` stores what the adapter returned and the Available-from table in
+`web/app/page.tsx` renders the row as though the list were complete, so a provider quietly
+omitting a field on some instruments looks identical to a healthy one. The refresh response
+carries the dropped rows, and the table renders the count under the exchange that asked for them
+("12 rows dropped, no Code"). Serves BT-1208. Decisions: 0013, 0026. Wireframe: BT-1208.
+**Done when:** a service test over the stub whose symbol list carries a row with a null `Code` and
+a row with a null `Name` asserts the refresh answers 200, the cached rows hold the named row and
+not the keyless one, and the response reports a dropped count of 1.
+
+### DS-18 The download jobs record the rows they dropped — Blocked by DS-16
+The bulk, history, and splits paths take what the adapter returns and write it, so a row the
+adapter dropped is absent from the output with nothing saying so — while the bar path already
+records a row missing its price in `outcome.skipped` with a reason. Those paths put each dropped
+row into the same `skipped` list with its reason, so the job record the Updates table renders and
+the job's own log both carry the loss. Serves BT-1208. Decisions: 0022, 0026.
+**Done when:** a job test in `tests/provider_eod_job.rs` whose stub bulk day carries a row with a
+null `Code` and a row with a null `Name` asserts the keyless row is absent from the written file
+and present in `outcome.skipped` with its reason, and the named row is written with a blank name.
+
 ## Housekeeping
 
 ### HK-43 The scratch console from a worktree finds the engine that was just built

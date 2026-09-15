@@ -28,3 +28,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0023](0023-the-feature-decay-job-rescores-only-the-features-promoted-fr.md) The feature-decay job rescores only the features promoted from a study — accepted
 - [0024](0024-a-console-list-of-records-is-a-dense-sortable-table-not-a-ca.md) A console list of records is a dense sortable table, not a card grid — accepted
 - [0025](0025-a-poll-that-began-before-a-local-write-is-dropped-not-merged.md) A poll that began before a local write is dropped, not merged into it — accepted
+- [0026](0026-a-provider-payload-tolerates-a-null-field-a-row-missing-its-.md) A provider payload tolerates a null field; a row missing its key is dropped and counted — accepted
