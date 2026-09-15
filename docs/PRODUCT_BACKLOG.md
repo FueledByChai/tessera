@@ -1368,6 +1368,41 @@ with its last runs so that one scheduler runs the downloads and shows whether th
 +-------------------------------------------------------------------------------------+
 ```
 
+### BT-1208 — A provider payload survives the nulls the provider actually sends
+
+**Status:** Proposed  
+**User story:** As a user, I want the console to survive the nulls a provider actually returns, so
+that one incomplete row does not cost me the whole exchange.
+
+**Acceptance criteria:**
+
+- A `null` or absent string field in any provider payload is an absent value, never a failed
+  response: the adapter parses the row rather than rejecting the list. An explicit `null` and a
+  missing field behave identically.
+- A row whose key is null or absent is dropped, not kept blank: `code` on a listing, bulk, or
+  split row; `date` on a bar or split row; `split` on a split row. A descriptive field that is
+  null or absent becomes blank: `name`, `country`, `currency`, `Type`, `exchange`,
+  `exchange_short_name`.
+- A body that is not a JSON list — an object, `null`, an HTML page — still fails as `malformed
+  provider response`. Only nulls inside well-formed rows are tolerated.
+- An empty string is not a null: an empty `code` drops the row, an empty `name` is kept as a
+  blank name.
+- Expanding an exchange whose symbol list dropped rows shows the count beside that row, so a
+  partial answer is visible where it was asked for.
+- A download job that dropped rows records one `skipped` entry per row with its reason, and the
+  count in its log.
+
+**Wireframe** (the Available-from table; the added line marked):
+
+```
++ AVL AVAILABLE FROM EODHD  listed 09-15 13:22 [Refresh] filter [     ] +
+| EXCHANGE NAME         COUNTRY TYPES (listed)             RES      HERE |
+| GBOND    Global Bonds -       Bond 6,0xx                 EOD         - |
+|          -> 12 rows dropped, no Code                <-- ADDED         |
+| US       USA Stocks   USA     Comm Stock 17,906 . ETF .. EOD 5m 1m   2 |
++----------------------------------------------------------------------+
+```
+
 ## Recommended delivery milestones
 
 ### Completed foundation — Event-driven SDK steps 1–6
