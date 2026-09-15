@@ -74,7 +74,10 @@ fixed tick only: all-in basis points prices itself from its bps and costs off re
 modeled cost." Switching model and back keeps what was
 typed, a name the library already holds disables Save with the reason beside it, and a save
 the service refuses is reported above the buttons with the dialog open and every field
-intact. The
+intact. A saved profile joins the table at once and stays in it even when a poll of the
+library was already in flight when the save landed: an answer that began before a local write
+is dropped rather than applied, so the record the save added is not taken back out for the
+three seconds until the next poll (decision 0025). The
 current fixed-tick strategy adapters require symmetric entry/exit tick and per-unit assumptions and do not yet support a minimum commission; all-in basis-point profiles may store different entry and exit estimates because the engines consume their exact sum.
 
 ## One-file strategies (Strategy SDK)

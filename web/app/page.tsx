@@ -7466,7 +7466,15 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
+  // A poll whose request was already in flight when a local write landed is answered from the
+  // library as it was, so applying it would drop the record the write had just added (UI-15).
+  // Every write into a collection this poll also refreshes stamps it here; refresh reads the
+  // stamps before it asks and leaves any collection written since alone, so the record stays
+  // until the next poll — three seconds later — which does hold it.
+  const localWrites = useRef({ dashboard: 0, costs: 0, automations: 0 });
+
   const refresh = useCallback(async () => {
+    const stamps = { ...localWrites.current };
     try {
       const [dashboardResponse, costResponse, automationResponse] = await Promise.all([
         fetch(`${API}/dashboard`, { cache: "no-store" }),
@@ -7474,9 +7482,9 @@ export default function Home() {
         fetch(`${API}/automations`, { cache: "no-store" }),
       ]);
       if (!dashboardResponse.ok) throw new Error();
-      setDashboard(await dashboardResponse.json());
-      if (costResponse.ok) setCostProfiles(await costResponse.json());
-      if (automationResponse.ok) setAutomations(await automationResponse.json());
+      if (localWrites.current.dashboard === stamps.dashboard) setDashboard(await dashboardResponse.json());
+      if (costResponse.ok && localWrites.current.costs === stamps.costs) setCostProfiles(await costResponse.json());
+      if (automationResponse.ok && localWrites.current.automations === stamps.automations) setAutomations(await automationResponse.json());
       setConnected(true);
     } catch {
       setConnected(false);
@@ -7609,6 +7617,7 @@ export default function Home() {
           ? { ...current, run: { ...current.run, starred: body.starred } }
           : current,
       );
+      localWrites.current.dashboard += 1;
       setDashboard((current) => ({
         ...current,
         recent_runs: current.recent_runs.map(patch),
@@ -8069,6 +8078,7 @@ export default function Home() {
           ? body.error
           : `the service refused the profile (${response.status})`;
       }
+      localWrites.current.costs += 1;
       setCostProfiles((current) => [body, ...current]);
       setNotice(`Cost profile “${body.name}” saved as an immutable version.`);
       return "";
@@ -8086,6 +8096,7 @@ export default function Home() {
       const response = await fetch(`${API}/automations/${encodeURIComponent(id)}/${action}`, { method: "POST" });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error);
+      localWrites.current.automations += 1;
       setAutomations((current) => current.map((item) => item.id === body.id ? body : item));
       setNotice(action === "run" ? `${body.name} started.` : `${body.name} is now ${body.enabled ? "active" : "paused"}.`);
     } catch (caught) {
@@ -8106,6 +8117,7 @@ export default function Home() {
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.error);
+      localWrites.current.automations += 1;
       setAutomations((current) => [...current, body]);
       setNotice(`Automation “${body.name}” saved.`);
     } catch (caught) {
