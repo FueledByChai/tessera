@@ -11,12 +11,21 @@
 #                                                     an empty catalog instead: no engine link, so
 #                                                     no strategies sync, and nothing seeded (the
 #                                                     layout check's skip path, HK-08)
+#   scripts/scratch-console.sh root  [--port 8787]    (re)build the root and print it, start
+#                                                     nothing; it removes an existing root
 #   scripts/scratch-console.sh stop  [--port 8787]    stop it and remove the root
 #   scripts/scratch-console.sh url   [--port 8787]    print the console origin
+#   scripts/scratch-console.sh --self-test            a fixture checkout proves the root's `target`
+#                                                     link is the directory the binaries were
+#                                                     built into (HK-43)
 #
-# Needs target/release/tessera and target/release/tessera-ui (cargo build --release).
+# Needs target/release/tessera and target/release/tessera-ui, from the checkout's own `target/`
+# or the shared one `scripts/check.sh` points CARGO_TARGET_DIR at from a worktree (cargo build
+# --release).
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# The checkout the root is built from. --self-test points this at a fixture; nothing else sets it.
+ROOT="${TESSERA_SCRATCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 PORT=8787
 EMPTY=0
 COMMAND="${1:-}"
@@ -56,8 +65,79 @@ wait_for() {  # a python3 predicate over the JSON at path, polled for up to 300 
   return 1
 }
 
+# Builds the scratch root: every link points at the checkout, except `target`, which has to be
+# the directory the binaries were actually built into. The service resolves the engine it syncs
+# SDK strategies with at `<root>/target/release/tessera`, and scripts/check.sh builds a
+# worktree's binaries into the shared CARGO_TARGET_DIR instead (HK-27) — so linking the
+# checkout's own `target/` there found no engine at all, and `start` waited out its timeout for
+# a catalog that could never sync (HK-43). The `--empty` root takes no engine link on purpose.
+prepare_scratch() {
+  rm -rf "$SCRATCH"
+  mkdir -p "$SCRATCH/data/ui" "$SCRATCH/artifacts"
+  local links="examples src target web" link
+  [ "$EMPTY" = 1 ] && links="examples src web"
+  for link in $links; do
+    case "$link" in
+      target) ln -s "$TARGET_DIR" "$SCRATCH/target" ;;
+      *) ln -s "$ROOT/$link" "$SCRATCH/$link" ;;
+    esac
+  done
+}
+
+# A fixture checkout in the shape scripts/check.sh leaves a worktree in (HK-27): its own
+# `target/` holds no binaries, the shared directory does. `root` builds the root and starts
+# nothing, which is the step HK-43 was wrong in.
+self_test() {
+  [ -n "${TESSERA_SCRATCH_TRACE:-}" ] && set -x
+  # A global, not a `local`: the EXIT trap fires after this function has returned, and `set -u`
+  # would make the trap itself the failure.
+  SELF_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tessera-scratch-console.XXXXXX")"
+  trap 'rm -rf "$SELF_TEST_DIR"' EXIT
+  local dir="$SELF_TEST_DIR" binary root
+  mkdir -p "$dir/checkout/target" "$dir/checkout/examples" "$dir/checkout/src" \
+           "$dir/checkout/web" "$dir/shared/release"
+  for binary in tessera tessera-ui; do
+    printf '#!/bin/sh\nexit 0\n' > "$dir/shared/release/$binary"
+    chmod +x "$dir/shared/release/$binary"
+  done
+  root_of() {  # <shared target dir, or "" for none> [extra flags] - prints the root it built
+    local shared="$1"; shift
+    if [ -n "$shared" ]; then
+      TESSERA_SCRATCH_ROOT="$dir/checkout" CARGO_TARGET_DIR="$shared" \
+        bash "$SCRIPT" root --port 8793 "$@"
+    else
+      # `env -u`: scripts/check.sh exports CARGO_TARGET_DIR for a worktree, and this case is the
+      # main checkout's shape, where it is not set at all.
+      env -u CARGO_TARGET_DIR TESSERA_SCRATCH_ROOT="$dir/checkout" \
+        bash "$SCRIPT" root --port 8793 "$@"
+    fi
+  }
+
+  # 1. A worktree with the shared target dir: the engine the service resolves is the built one.
+  root="$(root_of "$dir/shared")"
+  [ "$root" = "$dir/checkout/target/scratch-console-8793" ] || { echo "self-test: the root is $root"; exit 1; }
+  [ "$(readlink "$root/target")" = "$dir/shared" ] || { echo "self-test: the root's target link is $(readlink "$root/target"), not the shared target directory the binaries were built into"; exit 1; }
+  for binary in tessera tessera-ui; do
+    [ -x "$root/target/release/$binary" ] || { echo "self-test: no engine at $root/target/release/$binary, which is where the service looks for it"; exit 1; }
+  done
+  [ "$(readlink "$root/examples")" = "$dir/checkout/examples" ] || { echo "self-test: the root's examples link left the checkout"; exit 1; }
+
+  # 2. No CARGO_TARGET_DIR - the main checkout's shape, which is what CI starts: its own target.
+  root="$(root_of "")"
+  [ "$(readlink "$root/target")" = "$dir/checkout/target" ] || { echo "self-test: without CARGO_TARGET_DIR the root's target link is $(readlink "$root/target"), not the checkout's own target/"; exit 1; }
+
+  # 3. --empty takes no engine link at all, so the skip path is unchanged (HK-08).
+  root="$(root_of "$dir/shared" --empty)"
+  [ ! -e "$root/target" ] || { echo "self-test: --empty linked an engine"; exit 1; }
+  [ -L "$root/web" ] || { echo "self-test: --empty did not link the checkout"; exit 1; }
+
+  echo "scratch-console self-test passed"
+}
+
 case "$COMMAND" in
+  --self-test) self_test ;;
   url) echo "$ORIGIN/" ;;
+  root) prepare_scratch; echo "$SCRATCH" ;;
   start)
     for binary in tessera tessera-ui; do
       [ -x "$TARGET_DIR/release/$binary" ] || { echo "scratch console: build $TARGET_DIR/release/$binary first" >&2; exit 1; }
@@ -66,11 +146,7 @@ case "$COMMAND" in
       echo "scratch console: something already answers on $ORIGIN" >&2
       exit 1
     fi
-    rm -rf "$SCRATCH"
-    mkdir -p "$SCRATCH/data/ui" "$SCRATCH/artifacts"
-    links="examples src target web"
-    [ "$EMPTY" = 1 ] && links="examples src web"
-    for link in $links; do ln -s "$ROOT/$link" "$SCRATCH/$link"; done
+    prepare_scratch
     (
       cd "$SCRATCH"
       TESSERA_ROOT="$SCRATCH" TESSERA_ADDR="127.0.0.1:$PORT" nohup "$TARGET_DIR/release/tessera-ui" > "$SCRATCH/api.log" 2>&1 &
