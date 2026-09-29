@@ -344,6 +344,29 @@ impl Ctx {
     ) {
         self.enter(Side::Sell, size, exec, stop, target);
     }
+    /// Scale into the open position on its side, sized like an entry. Ignored when flat,
+    /// warming up, or once an exit is requested. The position's entry price becomes the
+    /// quantity-weighted blend, `on_fill` hears `Fill::Opened` with it, and the round trip
+    /// stays one trade.
+    pub fn add_to_position(&mut self, size: Size, exec: Exec) {
+        if self.warming_up || self.screening || !self.holds_position() {
+            return;
+        }
+        if self.last_price < self.sizing.min_price {
+            return;
+        }
+        let side = self.position.as_ref().expect("held position").side;
+        let quantity = self.quantity_for(size, self.last_price);
+        if quantity <= 0.0 {
+            return;
+        }
+        self.orders.push(OrderIntent::AddToPosition {
+            symbol: self.symbol.clone(),
+            side,
+            quantity,
+            timing: exec.into(),
+        });
+    }
     /// Rest a buy limit order for the day.
     pub fn buy_limit(&mut self, size: Size, order: LimitOrder) {
         self.enter_limit(Side::Buy, size, order);
@@ -955,6 +978,75 @@ mod tests {
     use super::*;
     use crate::event_engine::{EventStrategy, MarketBar, MarketEvent};
     use crate::sdk::manifest::Params;
+
+    fn ctx_holding(position: Option<Position>) -> Ctx {
+        Ctx {
+            symbol: "QQQ.US".to_owned(),
+            symbol_index: 0,
+            symbol_count: 1,
+            date: NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(),
+            time: NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            bar_index: 10,
+            warming_up: false,
+            screening: false,
+            next_session: None,
+            equity: 90_000.0,
+            realized_equity: 90_000.0,
+            position,
+            open_positions: 1,
+            last_price: 300.0,
+            sizing: SizingPolicy {
+                position_percent: 0.3,
+                min_price: 1.0,
+                fractional_units: false,
+            },
+            allows_short: false,
+            daily: Arc::new(Vec::new()),
+            daily_cursor: 0,
+            shared: Arc::new(Mutex::new(Shared::default())),
+            orders: Vec::new(),
+            tags: BTreeMap::new(),
+            exit_requested: false,
+        }
+    }
+
+    #[test]
+    fn add_to_position_needs_a_held_position_with_no_exit_requested() {
+        let mut flat = ctx_holding(None);
+        flat.add_to_position(Size::Default, Exec::ThisBarClose);
+        assert!(flat.orders.is_empty(), "flat: nothing to add to");
+
+        let long = Position {
+            side: Side::Buy,
+            quantity: 90.0,
+            entry_price: 310.0,
+            stop: None,
+            target: None,
+        };
+        let mut ctx = ctx_holding(Some(long.clone()));
+        ctx.buy(Size::Default);
+        assert!(ctx.orders.is_empty(), "buy stays one position per symbol");
+        ctx.add_to_position(Size::Default, Exec::ThisBarClose);
+        assert_eq!(
+            ctx.orders,
+            vec![OrderIntent::AddToPosition {
+                symbol: "QQQ.US".to_owned(),
+                side: Side::Buy,
+                quantity: 90.0,
+                timing: ExecutionTiming::ThisBarClose,
+            }]
+        );
+
+        let mut closing = ctx_holding(Some(long));
+        closing.close_with("exit", Exec::ThisBarClose);
+        closing.add_to_position(Size::Default, Exec::ThisBarClose);
+        assert_eq!(
+            closing.orders.len(),
+            1,
+            "only the exit: {:?}",
+            closing.orders
+        );
+    }
 
     /// Records what `on_bar` sees as the raw close.
     struct RawProbe;
