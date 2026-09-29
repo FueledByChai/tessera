@@ -703,6 +703,27 @@ the job's own log both carry the loss. Serves BT-1208. Decisions: 0022, 0026.
 null `Code` and a row with a null `Name` asserts the keyless row is absent from the written file
 and present in `outcome.skipped` with its reason, and the named row is written with a blank name.
 
+## Engine
+
+### EN-01 A strategy can add to its open position — `doing`
+The SDK allows one position per symbol: `Ctx::buy` is ignored while a position is held, and
+the simulated broker rejects any entry on a symbol that already has one ("zero quantity or
+existing position"). A scale-in rule (enter a third, add a third if the close falls below the
+last fill, add the last third below that, exit everything on one signal) cannot be written. Add
+an add-to-position order: `ctx.add_to_position(size, exec)` on the SDK, ignored when flat,
+warming up, or once an exit is requested; a new `OrderIntent::AddToPosition` the broker fills
+at the next open or this bar's close like an entry, through the same equity and buying-power
+guards, blending the position's entry price by quantity and adding the add's commission to the
+position's; the strategy hears it as `Fill::Opened` with the blended position. An add opens no
+new position, so the open-position cap does not apply to it. The round trip stays one trade row
+(its quantity the total, its entry price the blend) whose metadata records how many fills built
+it (`fills`). `docs/ADDING_A_STRATEGY.md` documents the call. Serves BT-801.
+**Done when:** broker tests in `src/event_engine.rs` show an add at the close blending the entry
+price, quantity, and commission, the exit writing one trade whose P&L equals the sum of the
+three tranches' P&L, and an add on a flat symbol or opposite side rejected; an SDK test in
+`src/sdk/strategy.rs` shows `add_to_position` ignored when flat and after `close`, and emitted
+while long.
+
 ## Housekeeping
 
 ### HK-43 The scratch console from a worktree finds the engine that was just built
