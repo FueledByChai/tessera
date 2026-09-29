@@ -705,7 +705,7 @@ and present in `outcome.skipped` with its reason, and the named row is written w
 
 ## Engine
 
-### EN-01 A strategy can add to its open position — `doing`
+### EN-01 A strategy can add to its open position
 The SDK allows one position per symbol: `Ctx::buy` is ignored while a position is held, and
 the simulated broker rejects any entry on a symbol that already has one ("zero quantity or
 existing position"). A scale-in rule (enter a third, add a third if the close falls below the
@@ -715,7 +715,7 @@ warming up, or once an exit is requested; a new `OrderIntent::AddToPosition` the
 at the next open or this bar's close like an entry, through the same equity and buying-power
 guards, blending the position's entry price by quantity and adding the add's commission to the
 position's; the strategy hears it as `Fill::Opened` with the blended position. An add opens no
-new position, so the open-position cap does not apply to it. The round trip stays one trade row
+new position, so the entry caps (open positions, entries per day) do not apply to it. The round trip stays one trade row
 (its quantity the total, its entry price the blend) whose metadata records how many fills built
 it (`fills`). `docs/ADDING_A_STRATEGY.md` documents the call. Serves BT-801.
 **Done when:** broker tests in `src/event_engine.rs` show an add at the close blending the entry

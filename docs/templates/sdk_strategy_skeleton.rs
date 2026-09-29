@@ -59,6 +59,7 @@ impl Strategy for __STRUCT_NAME__ {
         //   ctx.buy_with(Size::Percent(0.5), Exec::NextBarOpen, Some(stop), Some(target));
         //   ctx.sell_short(Size::Default);   // needs `.allows_short()` on the manifest
         //   ctx.set_stop(price);
+        //   ctx.add_to_position(Size::Percent(0.1), Exec::ThisBarClose); // scale in while held
         //   ctx.position(), ctx.equity(), ctx.bar_index(), ctx.date(), ctx.time()
         Ok(())
     }

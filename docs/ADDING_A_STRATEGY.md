@@ -16,6 +16,22 @@ compiles them in exactly like the bundled examples.
 `ConfiguredStrategy` in `src/strategy.rs` remains a compatibility boundary for batch-style
 strategies that predate the event engine. It should not be copied as the default design for new work.
 
+## Scaling in
+
+One symbol holds one position; `ctx.buy` is ignored while it is open. To add to it, call
+`ctx.add_to_position(size, exec)`: it is sized like an entry, fills at the next open or this
+bar's close through the same buying-power and equity guards, and is ignored when flat, while
+warming up, or once an exit is requested. The position's entry price becomes the
+quantity-weighted blend of its fills (`on_fill` hears `Fill::Opened` with it), the entry caps
+(open positions, entries per day) do not apply to an add, and one `close` exits everything as a
+single trade.
+
+```rust
+if ctx.is_long() && tranches < 3 && bar.close < last_fill {
+    ctx.add_to_position(Size::Percent(third), Exec::ThisBarClose);
+}
+```
+
 ## Preferred event-driven contract
 
 An `EventStrategy` declares either `PerInstrument` or `Portfolio` scope and handles causal

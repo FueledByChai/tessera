@@ -151,6 +151,15 @@ pub enum OrderIntent {
         time_exit: Option<TimeExit>,
         metadata: BTreeMap<String, String>,
     },
+    /// Add to the open position in `symbol` on the same side (scale in). Fills like an entry
+    /// and through the same account guards; the position's entry price becomes the
+    /// quantity-weighted blend and the round trip stays one trade. Rejected when flat.
+    AddToPosition {
+        symbol: String,
+        side: Side,
+        quantity: f64,
+        timing: ExecutionTiming,
+    },
     /// Attach or replace a time-based exit on an open position.
     SetTimeExit {
         symbol: String,
@@ -176,6 +185,7 @@ impl OrderIntent {
         match self {
             Self::EnterBracket { symbol, .. }
             | Self::EnterLimit { symbol, .. }
+            | Self::AddToPosition { symbol, .. }
             | Self::SetTimeExit { symbol, .. }
             | Self::CancelEntry { symbol }
             | Self::ExitPosition { symbol, .. }
@@ -516,6 +526,7 @@ pub struct SimulatedBroker {
     realized_equity: f64,
     positions: BTreeMap<String, SimulatedPosition>,
     pending_entries: Vec<OrderIntent>,
+    pending_adds: Vec<OrderIntent>,
     pending_limits: BTreeMap<String, PendingLimit>,
     pending_exits: HashMap<String, PendingExit>,
     completed_trades: Vec<CompletedTrade>,
@@ -537,6 +548,7 @@ impl SimulatedBroker {
             realized_equity: initial_equity,
             positions: BTreeMap::new(),
             pending_entries: Vec::new(),
+            pending_adds: Vec::new(),
             pending_limits: BTreeMap::new(),
             pending_exits: HashMap::new(),
             completed_trades: Vec::new(),
@@ -685,6 +697,108 @@ impl SimulatedBroker {
         }
     }
 
+    /// The buying-power cap: an order whose notional would take gross exposure past the cap
+    /// is cut to what remains, or refused when nothing does.
+    fn within_buying_power(
+        &self,
+        equity: f64,
+        entry_price: f64,
+        quantity: f64,
+    ) -> std::result::Result<f64, String> {
+        let Some(cap) = self.limits.max_gross_exposure else {
+            return Ok(quantity);
+        };
+        let available = equity * cap - self.gross_notional();
+        let notional = entry_price * quantity;
+        if notional <= available {
+            return Ok(quantity);
+        }
+        // Whole-unit orders are cut to whole units; fractional orders keep fractions.
+        let affordable = if available > 0.0 && entry_price > 0.0 {
+            let raw = available / entry_price;
+            if quantity.fract() == 0.0 {
+                raw.floor()
+            } else {
+                raw
+            }
+        } else {
+            0.0
+        };
+        if affordable <= 0.0 {
+            return Err(format!(
+                "insufficient buying power: {notional:.2} notional exceeds {available:.2} available at {cap}x equity"
+            ));
+        }
+        Ok(affordable)
+    }
+
+    /// Scales into the open position: the fill blends into the entry price by quantity and
+    /// its commission joins the position's, so the round trip closes as one trade.
+    fn add_to_position(&mut self, reference_price: f64, intent: OrderIntent) -> BrokerEvent {
+        let OrderIntent::AddToPosition {
+            symbol,
+            side,
+            quantity,
+            ..
+        } = intent
+        else {
+            unreachable!("add_to_position requires an add intent");
+        };
+        if !(quantity > 0.0 && quantity.is_finite()) {
+            return BrokerEvent::OrderRejected {
+                symbol,
+                reason: "zero quantity".to_owned(),
+            };
+        }
+        match self.positions.get(&symbol) {
+            Some(position) if position.snapshot.side == side => {}
+            Some(_) => {
+                return BrokerEvent::OrderRejected {
+                    symbol,
+                    reason: "add on the opposite side of the open position".to_owned(),
+                };
+            }
+            None => {
+                return BrokerEvent::OrderRejected {
+                    symbol,
+                    reason: "no open position to add to".to_owned(),
+                };
+            }
+        }
+        let slip = self.slippage(true);
+        let fill_price = self.round_tick(reference_price + side.sign() * slip);
+        let equity = self.total_equity();
+        if equity <= 0.0 {
+            return BrokerEvent::OrderRejected {
+                symbol,
+                reason: "account equity exhausted".to_owned(),
+            };
+        }
+        let quantity = match self.within_buying_power(equity, fill_price, quantity) {
+            Ok(quantity) => quantity,
+            Err(reason) => return BrokerEvent::OrderRejected { symbol, reason },
+        };
+        let commission = self.entry_commission_for(fill_price, quantity);
+        let position = self.positions.get_mut(&symbol).expect("open position");
+        let held = position.snapshot.quantity;
+        let total = held + quantity;
+        position.snapshot.entry_price =
+            (position.snapshot.entry_price * held + fill_price * quantity) / total;
+        position.snapshot.quantity = total;
+        position.entry_commission += commission;
+        let fills = position
+            .metadata
+            .get("fills")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        position
+            .metadata
+            .insert("fills".to_owned(), (fills + 1).to_string());
+        BrokerEvent::PositionOpened {
+            position: position.snapshot.clone(),
+        }
+    }
+
     fn open_position(
         &mut self,
         date: NaiveDate,
@@ -777,32 +891,10 @@ impl SimulatedBroker {
                 quantity = affordable;
             }
         }
-        if let Some(cap) = self.limits.max_gross_exposure {
-            let available = equity * cap - self.gross_notional();
-            let notional = entry_price * quantity;
-            if notional > available {
-                // Whole-unit orders are cut to whole units; fractional orders keep fractions.
-                let affordable = if available > 0.0 && entry_price > 0.0 {
-                    let raw = available / entry_price;
-                    if quantity.fract() == 0.0 {
-                        raw.floor()
-                    } else {
-                        raw
-                    }
-                } else {
-                    0.0
-                };
-                if affordable <= 0.0 {
-                    return BrokerEvent::OrderRejected {
-                        symbol,
-                        reason: format!(
-                            "insufficient buying power: {notional:.2} notional exceeds {available:.2} available at {cap}x equity"
-                        ),
-                    };
-                }
-                quantity = affordable;
-            }
-        }
+        let quantity = match self.within_buying_power(equity, entry_price, quantity) {
+            Ok(quantity) => quantity,
+            Err(reason) => return BrokerEvent::OrderRejected { symbol, reason },
+        };
         let stop = stop.or_else(|| {
             stop_percent.map(|percent| match side {
                 Side::Buy => entry_price * (1.0 - percent),
@@ -981,6 +1073,13 @@ impl SimulatedBroker {
                 symbol: intent.symbol().to_owned(),
                 reason: "daily_entry_cap".to_owned(),
             });
+        }
+        // Adds open no position, so the entry caps do not arbitrate them.
+        for intent in std::mem::take(&mut self.pending_adds) {
+            match prices.get(intent.symbol()) {
+                Some(open) => events.push(self.add_to_position(open.price, intent)),
+                None => self.pending_adds.push(intent),
+            }
         }
         let symbols = self.pending_exits.keys().cloned().collect::<Vec<_>>();
         for symbol in symbols {
@@ -1248,6 +1347,50 @@ impl BrokerAdapter for SimulatedBroker {
                     }
                     close_entries.push(intent);
                 }
+                OrderIntent::AddToPosition {
+                    timing: ExecutionTiming::NextBarOpen,
+                    ..
+                } => {
+                    let symbol = intent.symbol().to_owned();
+                    self.pending_adds.push(intent);
+                    events.push(BrokerEvent::OrderAccepted { symbol });
+                }
+                OrderIntent::AddToPosition {
+                    timing: ExecutionTiming::Immediate,
+                    ..
+                } => {
+                    let price = match event {
+                        MarketEvent::BarOpen { prices, .. } => {
+                            prices.get(intent.symbol()).map(|open| open.price)
+                        }
+                        _ => None,
+                    };
+                    match price {
+                        Some(price) => events.push(self.add_to_position(price, intent)),
+                        None => events.push(BrokerEvent::OrderRejected {
+                            symbol: intent.symbol().to_owned(),
+                            reason: "immediate adds require the symbol's bar open".to_owned(),
+                        }),
+                    }
+                }
+                OrderIntent::AddToPosition {
+                    timing: ExecutionTiming::ThisBarClose,
+                    ..
+                } => {
+                    let price = match event {
+                        MarketEvent::BarClose { bars, .. } => {
+                            bars.get(intent.symbol()).map(|bar| bar.close)
+                        }
+                        _ => None,
+                    };
+                    match price {
+                        Some(price) => events.push(self.add_to_position(price, intent)),
+                        None => events.push(BrokerEvent::OrderRejected {
+                            symbol: intent.symbol().to_owned(),
+                            reason: "this-bar-close adds require the symbol's bar close".to_owned(),
+                        }),
+                    }
+                }
                 OrderIntent::EnterLimit { .. } => {
                     let symbol = intent.symbol().to_owned();
                     if self.positions.contains_key(&symbol)
@@ -1270,10 +1413,12 @@ impl BrokerAdapter for SimulatedBroker {
                 }
                 OrderIntent::CancelEntry { symbol } => {
                     let removed = self.pending_limits.remove(&symbol).is_some();
-                    let before = self.pending_entries.len();
+                    let before = self.pending_entries.len() + self.pending_adds.len();
                     self.pending_entries
                         .retain(|pending| pending.symbol() != symbol);
-                    if removed || self.pending_entries.len() != before {
+                    self.pending_adds
+                        .retain(|pending| pending.symbol() != symbol);
+                    if removed || self.pending_entries.len() + self.pending_adds.len() != before {
                         events.push(BrokerEvent::OrderRejected {
                             symbol,
                             reason: "cancelled".to_owned(),
@@ -1425,6 +1570,7 @@ impl BrokerAdapter for SimulatedBroker {
 
     fn finalize_historical(&mut self) -> Result<Vec<BrokerEvent>> {
         self.pending_entries.clear();
+        self.pending_adds.clear();
         self.pending_limits.clear();
         self.pending_exits.clear();
         let symbols = self.positions.keys().cloned().collect::<Vec<_>>();
@@ -2032,6 +2178,171 @@ mod tests {
                 .get("H")
                 .is_some_and(|p| p.snapshot.side == Side::Sell)
         );
+    }
+
+    fn close_entry(symbol: &str, side: Side, quantity: f64) -> OrderIntent {
+        OrderIntent::EnterBracket {
+            symbol: symbol.to_owned(),
+            side,
+            quantity,
+            timing: ExecutionTiming::ThisBarClose,
+            stop: None,
+            target: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn close_add(symbol: &str, side: Side, quantity: f64) -> OrderIntent {
+        OrderIntent::AddToPosition {
+            symbol: symbol.to_owned(),
+            side,
+            quantity,
+            timing: ExecutionTiming::ThisBarClose,
+        }
+    }
+
+    /// Three thirds bought at three closes and sold at a fourth: one position whose entry
+    /// price is the quantity-weighted blend, closed as one trade whose P&L is the sum of the
+    /// three tranches' P&L (one tick of slippage and $0.005 a share each way).
+    #[test]
+    fn adds_at_the_close_blend_into_one_position_and_one_trade() {
+        let mut broker = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 3, d).unwrap();
+        broker
+            .submit(
+                &close_event(day(2), 100.0, "Q"),
+                vec![close_entry("Q", Side::Buy, 10.0)],
+            )
+            .unwrap();
+        broker
+            .submit(
+                &close_event(day(3), 98.0, "Q"),
+                vec![close_add("Q", Side::Buy, 10.0)],
+            )
+            .unwrap();
+        let events = broker
+            .submit(
+                &close_event(day(4), 96.0, "Q"),
+                vec![close_add("Q", Side::Buy, 10.0)],
+            )
+            .unwrap();
+        let position = events
+            .iter()
+            .find_map(|event| match event {
+                BrokerEvent::PositionOpened { position } => Some(position.clone()),
+                _ => None,
+            })
+            .expect("the add reports the blended position");
+        assert_eq!(position.quantity, 30.0);
+        assert!((position.entry_price - 98.01).abs() < 1e-9, "{position:?}");
+        let held = &broker.positions["Q"];
+        assert!((held.entry_commission - 0.15).abs() < 1e-9);
+        assert_eq!(
+            held.entry_date,
+            day(2),
+            "the round trip starts at the first fill"
+        );
+
+        let events = broker
+            .submit(
+                &close_event(day(5), 101.0, "Q"),
+                vec![OrderIntent::ExitPosition {
+                    symbol: "Q".to_owned(),
+                    timing: ExecutionTiming::ThisBarClose,
+                    reason: "above_ema".to_owned(),
+                }],
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BrokerEvent::PositionClosed { .. }))
+        );
+        let trades = broker.completed_trades();
+        assert_eq!(trades.len(), 1, "one trade for the whole round trip");
+        let trade = &trades[0];
+        assert_eq!(trade.quantity, 30.0);
+        assert_eq!(trade.metadata.get("fills").map(String::as_str), Some("3"));
+        let exit = 100.99;
+        let tranches = [100.01, 98.01, 96.01]
+            .iter()
+            .map(|entry| 10.0 * (exit - entry) - 2.0 * 10.0 * 0.005)
+            .sum::<f64>();
+        assert!(
+            (trade.pnl - tranches).abs() < 1e-9,
+            "{} vs {tranches}",
+            trade.pnl
+        );
+        assert!((broker.snapshot().realized_equity - (100_000.0 + tranches)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_add_needs_an_open_position_on_the_same_side() {
+        let mut broker = SimulatedBroker::new(100_000.0, guard_costs()).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 2).unwrap();
+        let events = broker
+            .submit(
+                &close_event(date, 50.0, "Z"),
+                vec![close_add("Z", Side::Buy, 5.0)],
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[..], [BrokerEvent::OrderRejected { reason, .. }] if reason == "no open position to add to"),
+            "{events:?}"
+        );
+        broker
+            .submit(
+                &close_event(date, 50.0, "Z"),
+                vec![close_entry("Z", Side::Buy, 5.0)],
+            )
+            .unwrap();
+        let events = broker
+            .submit(
+                &close_event(date, 49.0, "Z"),
+                vec![close_add("Z", Side::Sell, 5.0)],
+            )
+            .unwrap();
+        assert!(
+            matches!(&events[..], [BrokerEvent::OrderRejected { reason, .. }] if reason.contains("opposite side")),
+            "{events:?}"
+        );
+        assert_eq!(broker.positions["Z"].snapshot.quantity, 5.0);
+    }
+
+    /// A next-open add fills at the open with the entry caps left out: it opens no position.
+    #[test]
+    fn a_next_open_add_fills_at_the_open_past_the_position_cap() {
+        let mut broker = SimulatedBroker::new(100_000.0, SimulationCosts::default())
+            .unwrap()
+            .with_limits(EntryLimits {
+                max_open_positions: Some(1),
+                max_entries_per_day: Some(1),
+                ..EntryLimits::default()
+            });
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 3, d).unwrap();
+        broker
+            .submit(
+                &close_event(day(2), 20.0, "N"),
+                vec![close_entry("N", Side::Buy, 100.0)],
+            )
+            .unwrap();
+        broker
+            .submit(
+                &close_event(day(2), 20.0, "N"),
+                vec![OrderIntent::AddToPosition {
+                    symbol: "N".to_owned(),
+                    side: Side::Buy,
+                    quantity: 100.0,
+                    timing: ExecutionTiming::NextBarOpen,
+                }],
+            )
+            .unwrap();
+        broker
+            .on_market_event(&open_event(day(3), 18.0, "N"))
+            .unwrap();
+        let held = &broker.positions["N"].snapshot;
+        assert_eq!(held.quantity, 200.0);
+        assert!((held.entry_price - 19.0).abs() < 1e-9);
     }
 
     #[test]
